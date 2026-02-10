@@ -1,5 +1,3 @@
-#include <linux/types.h>
-#include <linux/stddef.h>
 #include <linux/compiler.h>
 #include <linux/debugfs.h>
 #include <linux/etherdevice.h>
@@ -20,11 +18,19 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/stddef.h>
 #include <linux/tcp.h>
 #include <linux/time64.h>
 #include <linux/timer.h>
-#include <linux/uaccess.h>
+#include <linux/types.h>
 #include <linux/udp.h>
+
+#include <asm/uaccess.h>
+#include <linux/atomic.h>
+#include <linux/in.h>
+#include <linux/net.h>
+#include <linux/socket.h>
+#include <net/sock.h>
 
 #define CONFIG_FILE_PATH "/etc/mymodule.conf"
 #define CONFIG_BUF_SIZE 256
@@ -118,6 +124,10 @@ static struct timespec64 last_mtime_allowed_file;
 static __be32 server_ip = 0;
 /** the port of the server. */
 static u16 server_port = 0;
+
+static __be32 prev_server_ip = 0;
+static u16 prev_server_port = 0;
+static DEFINE_MUTEX(client_ctrl_lock);
 
 /**
  * To clear the table for logged information.
@@ -429,6 +439,8 @@ static void config_timer_callback(struct timer_list *unused) {
               jiffies + msecs_to_jiffies(CONFIG_POLL_INTERVAL_MS));
 }
 
+static void restart_client_thread_if_needed(void);
+
 static void config_work_func(struct work_struct *work) {
     struct file *filp;
     struct timespec64 current_mtime_config_file;
@@ -458,6 +470,8 @@ static void config_work_func(struct work_struct *work) {
         pr_info("Config file modification response: %ld\n", ret);
         if (ret >= 0) {
             last_mtime_config_file = current_mtime_config_file;
+
+            restart_client_thread_if_needed();
 
             update_allowed_file = true;
         }
@@ -716,6 +730,185 @@ static const struct file_operations cfg_fops = {
     .read = cfg_read,
 };
 
+// ====================================================================================
+
+struct socket *conn_socket = NULL;
+static struct task_struct *client_thread = NULL;
+static bool thread_should_stop =
+    false; // simple flag (atomic_t better in production)
+
+static int tcp_client_send(struct socket *sock, const char *buf, size_t len,
+                           unsigned long flags) {
+    struct msghdr msg = {.msg_name = NULL,
+                         .msg_namelen = 0,
+                         .msg_control = NULL,
+                         .msg_controllen = 0,
+                         .msg_flags = flags};
+    struct kvec vec;
+    int written = 0;
+    int left = len;
+    int ret;
+
+    while (left > 0) {
+        vec.iov_base = (void *)(buf + written);
+        vec.iov_len = left;
+
+        ret = kernel_sendmsg(sock, &msg, &vec, 1, left);
+        if (ret < 0) {
+            if (ret == -ERESTARTSYS || (flags & MSG_DONTWAIT && ret == -EAGAIN))
+                continue; // retry on signal or would-block
+            pr_err("send failed: %d\n", ret);
+            return ret;
+        }
+
+        written += ret;
+        left -= ret;
+    }
+
+    return written;
+}
+
+static int tcp_client_receive(struct socket *sock, char *buf, size_t max_len,
+                              unsigned long flags) {
+    struct msghdr msg = {.msg_name = NULL,
+                         .msg_namelen = 0,
+                         .msg_control = NULL,
+                         .msg_controllen = 0,
+                         .msg_flags = flags};
+    struct kvec vec;
+    int ret;
+
+    vec.iov_base = buf;
+    vec.iov_len = max_len;
+
+    ret = kernel_recvmsg(sock, &msg, &vec, 1, max_len, flags);
+    if (ret < 0) {
+        if (ret == -EAGAIN || ret == -ERESTARTSYS)
+            return -EAGAIN; // caller can retry
+        pr_err("recv failed: %d\n", ret);
+        return ret;
+    }
+
+    if (ret < max_len)
+        buf[ret] = '\0'; // null-terminate if string
+
+    return ret;
+}
+
+static int tcp_client_thread(void *arg) {
+    if (server_ip == 0 || server_port == 0) {
+        return -1;
+    }
+    struct sockaddr_in saddr;
+    char send_buf[] = "HOLA";
+    char recv_buf[64];
+    int ret;
+
+    allow_signal(SIGTERM); // optional: allow kthread_stop to interrupt us
+
+    pr_info("client thread started\n");
+
+    ret = sock_create(PF_INET, SOCK_STREAM, IPPROTO_TCP, &conn_socket);
+    if (ret < 0) {
+        pr_err("sock_create failed: %d\n", ret);
+        goto out;
+    }
+
+    memset(&saddr, 0, sizeof(saddr));
+    saddr.sin_family = AF_INET;
+    saddr.sin_port = htons(server_port);
+    saddr.sin_addr.s_addr = server_ip;
+
+    conn_socket->sk->sk_rcvtimeo = msecs_to_jiffies(3000);
+    conn_socket->sk->sk_sndtimeo = msecs_to_jiffies(3000);
+
+    ret = conn_socket->ops->connect(conn_socket, (struct sockaddr *)&saddr,
+                                    sizeof(saddr), O_NONBLOCK);
+    if (ret < 0) {
+        pr_err("connect failed: %d\n", ret);
+        goto out_sock;
+    }
+
+    pr_info("connected to server\n");
+
+    // Main loop – example: send once, receive once, then idle/sleep
+    while (!kthread_should_stop() && !thread_should_stop) {
+        ret = tcp_client_send(conn_socket, send_buf, strlen(send_buf),
+                              MSG_DONTWAIT);
+        if (ret < 0) {
+            if (ret != -EAGAIN)
+                break;
+        } else {
+            pr_info("sent '%s'\n", send_buf);
+        }
+
+        memset(recv_buf, 0, sizeof(recv_buf));
+        ret = tcp_client_receive(conn_socket, recv_buf, sizeof(recv_buf) - 1,
+                                 MSG_DONTWAIT);
+        if (ret > 0) {
+            pr_info("received '%s' (%d bytes)\n", recv_buf, ret);
+        } else if (ret < 0 && ret != -EAGAIN) {
+            pr_err("receive error: %d\n", ret);
+            break;
+        }
+
+        // poll every 2s – replace with wait_event* for efficiency
+        msleep_interruptible(2000);
+    }
+
+out_sock:
+    if (conn_socket)
+        sock_release(conn_socket);
+    conn_socket = NULL;
+
+out:
+    pr_info("client thread exiting\n");
+    return 0;
+}
+
+static void restart_client_thread_if_needed(void) {
+    mutex_lock(&client_ctrl_lock);
+
+    if (server_ip == prev_server_ip && server_port == prev_server_port) {
+        mutex_unlock(&client_ctrl_lock);
+        return;
+    }
+
+    pr_info("Server config changed → restarting client thread\n");
+
+    /* Stop old thread */
+    if (client_thread) {
+        thread_should_stop = true;
+        kthread_stop(client_thread);
+        client_thread = NULL;
+    }
+
+    /* Close socket if still open */
+    if (conn_socket) {
+        sock_release(conn_socket);
+        conn_socket = NULL;
+    }
+
+    thread_should_stop = false;
+
+    /* Start new thread ONLY if config is valid */
+    if (server_ip != 0 && server_port != 0) {
+        client_thread = kthread_run(tcp_client_thread, NULL, "tcp-client");
+        if (IS_ERR(client_thread)) {
+            pr_err("Failed to restart client thread: %ld\n",
+                   PTR_ERR(client_thread));
+            client_thread = NULL;
+        } else {
+            pr_info("Client thread restarted\n");
+        }
+    }
+
+    prev_server_ip = server_ip;
+    prev_server_port = server_port;
+
+    mutex_unlock(&client_ctrl_lock);
+}
+
 /**
  * Module init/exit.
  */
@@ -762,11 +955,20 @@ static void __exit mynetfilter_exit(void) {
     nf_unregister_net_hook(&init_net, &netfilter_ops);
     debugfs_remove(dbg_file);
     del_timer_sync(&config_timer);
+    cancel_work_sync(&config_work);
     free_packet_list();
     /* free allowed_table entries */
     spin_lock(&allowed_lock);
     rhashtable_free_and_destroy(&allowed_table, allowed_free_fn, NULL);
     spin_unlock(&allowed_lock);
+
+    thread_should_stop = true; // optional extra signal
+
+    if (client_thread) {
+        kthread_stop(client_thread);
+        client_thread = NULL;
+    }
+
     pr_info("Netfilter module unloaded\n");
 }
 
