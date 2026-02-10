@@ -1,0 +1,8 @@
+.*
+kernel_module*
+!kernel_module.c
+Module.symvers
+modules.order
+
+compile_commands.json
+Makefile

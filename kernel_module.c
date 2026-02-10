@@ -1,13 +1,10 @@
 #include <linux/types.h>
 #include <linux/stddef.h>
-// #include <linux/byteorder/generic.h>
-#include <asm/byteorder.h>
 #include <linux/compiler.h>
 #include <linux/debugfs.h>
 #include <linux/etherdevice.h>
 #include <linux/file.h>
 #include <linux/fs.h>
-#include <linux/icmp.h>
 #include <linux/if_ether.h>
 #include <linux/inet.h>
 #include <linux/ip.h>
@@ -28,7 +25,6 @@
 #include <linux/timer.h>
 #include <linux/uaccess.h>
 #include <linux/udp.h>
-#include <linux/types.h>
 
 #define CONFIG_FILE_PATH "/etc/mymodule.conf"
 #define CONFIG_BUF_SIZE 256
@@ -496,36 +492,13 @@ static void config_work_func(struct work_struct *work) {
     }
 }
 
-bool is_router_noise(struct iphdr *ip, struct sk_buff *skb) {
+static bool is_router_noise(struct iphdr *ip, struct sk_buff *skb) {
 
-    struct udphdr *udp;
-
-    __be32 dip = ntohl(ip->daddr);
-    __be32 sip = ntohl(ip->saddr);
-
-    // UDP traffic on common router/service ports
-    if (ip->protocol == IPPROTO_UDP) {
-        u16 dport = ntohs(udp->dest);
-        if (dport == 53 || dport == 1900 || dport == 67 || dport == 68)
-            return true;
-    }
-
-    // Broadcast 255.255.255.255
-    if (ip->daddr == htonl(0xFFFFFFFF))
-        return true;
-
-    // Multicast 224.0.0.0/4
-    if ((dip & 0xF0000000) == 0xE0000000)
-        return true;
-
-    // Local broadcast for /24 subnet 192.168.0.x
-    // if ((dip & 0xFF) == 0xFF && (dip & 0xFFFFFF00) == 0xC0A80000)
-    //     return true;
-
-    if (dip == 0x7F000001 || sip == 0x7F000001) {
+    if (ipv4_is_loopback(ip->saddr)) {
         return true;
     }
-    return false; // keep everything else
+
+    return false;
 }
 
 /**
@@ -568,11 +541,6 @@ static unsigned int packet_hook(void *priv, struct sk_buff *skb,
     // Accept if its in disable mode.
     if (state == DISABLED)
         return NF_ACCEPT;
-
-    // if (is_lbcast(ip->daddr) ||
-    //     is_multicast(ip->daddr) || is_broadcast(ip->daddr)) {
-    //     return NF_ACCEPT;
-    // }
 
     // In your hook
     if (is_router_noise(ip, skb))
