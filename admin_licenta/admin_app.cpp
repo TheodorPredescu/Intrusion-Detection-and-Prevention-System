@@ -1,7 +1,3 @@
-// TODO: This is not yet edited. Its copy of v3
-// admin_app.cpp
-// Build: g++ admin_app.cpp -lglfw -lGL -lssh -lpthread -lm -std=c++11
-
 #include "imgui/backends/imgui_impl_glfw.h"
 #include "imgui/backends/imgui_impl_opengl3.h"
 #include "imgui/imgui.h"
@@ -26,7 +22,10 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
+
+#include "database_handle.h"
 
 // ============================================================================
 // DATA MODEL
@@ -63,6 +62,9 @@ struct RemotePC {
     bool configLoaded = false;
     bool editingMain = true;
     bool viewingLogs = false;
+
+    // TODO:
+    int db_pc_id = -1;
 };
 
 struct ExternalNode {
@@ -132,7 +134,7 @@ static std::set<std::string> parse_allowed_ips(const std::string &text) {
 }
 
 static ssh_session connect_to_host(const char *host, const char *user, const char *pass, const char *bind_ip) {
-    ssh_session session = ssh_new();
+    const ssh_session session = ssh_new();
     if (!session)
         return nullptr;
 
@@ -143,7 +145,7 @@ static ssh_session connect_to_host(const char *host, const char *user, const cha
         ssh_options_set(session, SSH_OPTIONS_BINDADDR, bind_ip);
     }
 
-    int strict = 0;
+    const int strict = 0;
     ssh_options_set(session, SSH_OPTIONS_STRICTHOSTKEYCHECK, &strict);
 
     if (ssh_connect(session) != SSH_OK)
@@ -161,8 +163,8 @@ fail:
     return nullptr;
 }
 
-static bool read_remote_log(ssh_session session, const char *cmd, std::string &out) {
-    ssh_channel ch = ssh_channel_new(session);
+static bool read_remote_log(const ssh_session session, const char *cmd, std::string &out) {
+    const ssh_channel ch = ssh_channel_new(session);
     if (!ch)
         return false;
 
@@ -201,10 +203,7 @@ static void start_log_thread(RemotePC *pc) {
     pc->logThread = std::thread([pc] {
         while (pc->running) {
             std::string tmp;
-            // TODO: I added cat to this command, so on the virtual machines it should stop working. Only on laptop is
-            // now valid untill fix.
-            // I need sudo permissions with no password required on the admin user.
-            bool success = read_remote_log(pc->session, "sudo cat /sys/kernel/debug/packet_logs", tmp);
+            const bool success = read_remote_log(pc->session, "sudo cat /sys/kernel/debug/packet_logs", tmp);
 
             {
                 std::lock_guard<std::mutex> lock(pc->logMutex);
@@ -236,9 +235,8 @@ static void start_log_thread(RemotePC *pc) {
 static std::string make_key(const std::string &name, const std::string &host) { return name + "|" + host; }
 
 static void update_ip_map_for_pc(RemotePC *pc) {
-    for (const auto &ip : pc->ips) {
-        // TODO:
-        //  ip_to_pc_map[ip] = pc;  // overwrites if exists — safe
+    for (const std::string &ip : pc->ips) {
+        // Add only the new elements info `ip_to_pc_map`
         ip_to_pc_map.emplace(ip, pc);
     }
 }
@@ -246,14 +244,6 @@ static void update_ip_map_for_pc(RemotePC *pc) {
 static RemotePC *find_pc_by_ip(const std::string &ip) {
     auto it = ip_to_pc_map.find(ip);
     return it != ip_to_pc_map.end() ? it->second : nullptr;
-}
-
-static bool is_multicast(const std::string &ip) {
-    unsigned int a, b, c, d;
-    if (sscanf(ip.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) != 4)
-        return false;
-    unsigned int addr = (a << 24) | (b << 16) | (c << 8) | d;
-    return addr >= (224U << 24) && addr <= ((239U << 24) | 0xFFFFFF);
 }
 
 static std::vector<std::pair<std::string, std::string>> parse_connections(const std::string &log) {
@@ -268,8 +258,7 @@ static std::vector<std::pair<std::string, std::string>> parse_connections(const 
             std::string src = match[1].str();
             std::string dst = match[2].str();
 
-            if (dst == "255.255.255.255" || is_multicast(dst) || dst == "127.0.0.1" || src == "127.0.0.1" ||
-                src == "0.0.0.0")
+            if (dst == "255.255.255.255" || dst == "127.0.0.1" || src == "127.0.0.1" || src == "0.0.0.0")
                 continue;
 
             connections.emplace_back(src, dst);
@@ -280,7 +269,7 @@ static std::vector<std::pair<std::string, std::string>> parse_connections(const 
 
 static bool load_file_from_ssh(const char *host, const char *user, const char *pass, const char *path,
                                std::string &out) {
-    ssh_session session = ssh_new();
+    const ssh_session session = ssh_new();
     if (!session)
         return false;
 
@@ -330,8 +319,8 @@ static bool load_file_from_ssh(const char *host, const char *user, const char *p
 }
 
 static bool remove_pc(const std::string &name, const std::string &host) {
-    std::string key = make_key(name, host);
-    auto it = pc_by_name_host.find(key);
+    const std::string key = make_key(name, host);
+    const auto it = pc_by_name_host.find(key);
     if (it == pc_by_name_host.end())
         return false; // PC not found
 
@@ -350,7 +339,7 @@ static bool remove_pc(const std::string &name, const std::string &host) {
     }
 
     // 3. Remove from IP → PC map
-    for (const auto &ip : pc->ips) {
+    for (const std::string &ip : pc->ips) {
         auto ip_it = ip_to_pc_map.find(ip);
         if (ip_it != ip_to_pc_map.end() && ip_it->second == pc) {
             ip_to_pc_map.erase(ip_it);
@@ -366,11 +355,11 @@ static bool remove_pc(const std::string &name, const std::string &host) {
 
 static bool remove_pc_by_ip(const std::string &ip) {
     std::cout << "Tracked IPs:\n";
-    for (const auto &pair : ip_to_pc_map) {
+    for (const std::pair<std::string, RemotePC *> &pair : ip_to_pc_map) {
         std::cout << "[" << pair.first << "] -> " << pair.second->name << " (" << pair.second->host << ")\n";
     }
 
-    RemotePC *pc = find_pc_by_ip(ip);
+    const RemotePC *pc = find_pc_by_ip(ip);
     if (!pc) {
         std::cout << "PC not found for IP: " << ip << "\n";
         return false;
@@ -390,7 +379,7 @@ static bool remove_pc_by_ip(const std::string &ip) {
 // ============================================================================
 static int save_file_to_ssh(const char *host, const char *user, const char *pass, const char *path,
                             const std::string &data) {
-    ssh_session session = ssh_new();
+    const ssh_session session = ssh_new();
     if (!session)
         return 0;
 
@@ -416,7 +405,7 @@ static int save_file_to_ssh(const char *host, const char *user, const char *pass
         return 0;
     }
 
-    sftp_file file = sftp_open(sftp, path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    const sftp_file file = sftp_open(sftp, path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
 
     if (!file) {
         sftp_free(sftp);
@@ -454,13 +443,13 @@ static int save_file_to_ssh(const char *host, const char *user, const char *pass
  * @param text represents the main buffer in which it is searched.
  */
 static std::string extract_allowed_file(const std::string &text) {
-    std::string key = "allowed_file ";
+    const std::string key = "allowed_file ";
     size_t pos = text.find(key);
     if (pos == std::string::npos)
         return "";
 
     pos += key.length();
-    size_t end = text.find_first_of("\r\n", pos);
+    const size_t end = text.find_first_of("\r\n", pos);
     return text.substr(pos, end - pos);
 }
 
@@ -477,7 +466,7 @@ static void discover_new_ips() {
             log_copy = pc->logBuffer;
         }
 
-        auto conns = parse_connections(log_copy);
+        std::vector<std::pair<std::string, std::string>> conns = parse_connections(log_copy);
 
         for (const auto &[_, dst_ip] : conns) {
             RemotePC *dst_pc = find_pc_by_ip(dst_ip);
@@ -509,7 +498,7 @@ static void discover_new_ips() {
 
 // Background connection function
 static void async_connect(PendingConnection *pending) {
-    ssh_session session = ssh_new();
+    const ssh_session session = ssh_new();
     if (!session) {
         pending->error_msg = "Failed to create SSH session";
         pending->success = false;
@@ -524,11 +513,11 @@ static void async_connect(PendingConnection *pending) {
         ssh_options_set(session, SSH_OPTIONS_BINDADDR, pending->bind_ip.c_str());
     }
 
-    int strict = 0;
+    const int strict = 0;
     ssh_options_set(session, SSH_OPTIONS_STRICTHOSTKEYCHECK, &strict);
 
     // Set timeout to avoid hanging forever
-    long timeout = 10; // 10 seconds
+    const long timeout = 10; // 10 seconds
     ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &timeout);
 
     if (ssh_connect(session) != SSH_OK) {
@@ -602,9 +591,11 @@ static void process_pending_connections(std::string &successMsg, std::string &er
             pc->ips.push_back(pending_connection->host);
             update_ip_map_for_pc(pc);
             successMsg = "Added IP " + pending_connection->host + " to existing PC " + pending_connection->name;
+
         } else {
             successMsg = "PC already exists with this configuration";
         }
+
         // Close the duplicate session
         ssh_disconnect(pending_connection->session);
         ssh_free(pending_connection->session);
@@ -645,8 +636,8 @@ static bool is_connection_pending() {
  */
 static void calculate_zoom_and_drag() {
 
-    ImGuiIO &io = ImGui::GetIO();
-    ImVec2 mouse = io.MousePos;
+    const ImGuiIO &io = ImGui::GetIO();
+    const ImVec2 mouse = io.MousePos;
 
     if (ImGui::IsWindowHovered() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
         topology_pan.x += io.MouseDelta.x;
@@ -654,7 +645,7 @@ static void calculate_zoom_and_drag() {
     }
 
     if (ImGui::IsWindowHovered() && io.MouseWheel != 0.0f) {
-        float zoom_factor = 1.0f + io.MouseWheel * 0.1f;
+        const float zoom_factor = 1.0f + io.MouseWheel * 0.1f;
         float new_zoom = topology_zoom * zoom_factor;
 
         new_zoom = std::clamp(new_zoom, ZOOM_MIN, ZOOM_MAX);
@@ -724,7 +715,7 @@ static void draw_add_pc() {
     ImGui::Spacing();
     ImGui::Spacing();
 
-    bool is_connecting = is_connection_pending();
+    const bool is_connecting = is_connection_pending();
 
     if (is_connecting) {
         ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(100, 100, 100, 255));
@@ -912,12 +903,11 @@ static void draw_topology() {
     }
 
     // Space between consecutive rings
-    float ring_spacing = std::min(canvas_size.x, canvas_size.y) * 0.20f;
-    // === 2. Position monitored PCs in center circle ===
-    size_t pc_count = monitored_pcs.size();
-    float inner_radius = std::min(canvas_size.x, canvas_size.y) * 0.25f;
+    const float ring_spacing = std::min(canvas_size.x, canvas_size.y) * 0.20f;
+    const float inner_radius = std::min(canvas_size.x, canvas_size.y) * 0.25f;
+    const size_t pc_count = monitored_pcs.size();
+    const int nodes_per_ring = 8;
     std::map<RemotePC *, int> pcs_total_rings;
-    int nodes_per_ring = 8;
 
     for (RemotePC *pc : monitored_pcs) {
         int total_nodes = pcs_to_ip[pc].size();
@@ -932,9 +922,9 @@ static void draw_topology() {
         if (pc_count <= 1) {
             monitored_pcs[i]->pos = center;
         } else {
-            float angle = i * (2.0f * M_PI / pc_count);
-            float extra_length = pcs_total_rings[monitored_pcs[i]] * ring_spacing;
-            float radius = inner_radius + extra_length;
+            const float angle = i * (2.0f * M_PI / pc_count);
+            const float extra_length = pcs_total_rings[monitored_pcs[i]] * ring_spacing;
+            const float radius = inner_radius + extra_length;
 
             monitored_pcs[i]->pos = ImVec2(center.x + radius * cosf(angle), center.y + radius * sinf(angle));
         }
@@ -943,7 +933,7 @@ static void draw_topology() {
     // === 4. Create and position external nodes ===
     std::map<std::string, ExternalNode> external_nodes;
     // Distance from the connected PC
-    float orbit_radius_base = std::min(canvas_size.x, canvas_size.y) * 0.20f;
+    const float orbit_radius_base = std::min(canvas_size.x, canvas_size.y) * 0.20f;
     /* Max nodes per orbital ring before adding another ring */
 
     // First, count how many external nodes connect to each PC
@@ -970,7 +960,6 @@ static void draw_topology() {
             // Connected to single PC - position around it
             RemotePC *target_pc = *connected_pcs.begin();
 
-            int total_nodes = nodes_per_pc[target_pc];
             int current_idx = current_index_per_pc[target_pc]++;
 
             int ring_number = 0;
@@ -985,9 +974,9 @@ static void draw_topology() {
                 nodes_in_ring += nodes_per_ring;
             }
 
-            int position_in_ring = current_idx - nodes_before;
+            const int position_in_ring = current_idx - nodes_before;
 
-            float orbit_radius = orbit_radius_base + ring_number * ring_spacing;
+            const float orbit_radius = orbit_radius_base + ring_number * ring_spacing;
             float angle = (2.0f * M_PI * position_in_ring) / nodes_in_ring;
 
             if (ring_number % 2 == 1)
@@ -1008,7 +997,7 @@ static void draw_topology() {
 
             // Offset slightly outward from center
             ImVec2 dir(centroid.x - center.x, centroid.y - center.y);
-            float len = std::hypot(dir.x, dir.y);
+            const float len = std::hypot(dir.x, dir.y);
             if (len > 1e-3f) {
                 dir.x /= len;
                 dir.y /= len;
@@ -1220,6 +1209,9 @@ static void draw_logs() {
     ImGui::EndChild();
 }
 
+// TODO: I can change the logs to not send all the data all the time, but change once its read (keeping the reading file
+// way smaller) and just add them continously untill I detect a change in the config file (might be able to detect even
+// if the mode was changed on each pc with a variable?).
 static void draw_config_editor() {
     static int selectedPC = -1;
     static int writing_succedded = -1;
