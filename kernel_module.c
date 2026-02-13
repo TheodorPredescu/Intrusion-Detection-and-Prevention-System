@@ -129,6 +129,8 @@ static __be32 prev_server_ip = 0;
 static u16 prev_server_port = 0;
 /** Used to block the reading of server_ip and server_port. */
 static DEFINE_MUTEX(client_server_info_mutex);
+static DECLARE_WAIT_QUEUE_HEAD(packet_wq);
+static LIST_HEAD(packet_list_sent);
 
 /**
  * To clear the table for logged information.
@@ -200,6 +202,38 @@ static void free_packet_list(void) {
         kfree(info);
     }
     spin_unlock(&list_lock);
+}
+
+static void free_packet_list_sent(void) {
+    struct packet_info *info, *tmp;
+
+    spin_lock(&list_lock);
+    list_for_each_entry_safe(info, tmp, &packet_list_sent, list) {
+        list_del(&info->list);
+        kfree(info);
+    }
+    spin_unlock(&list_lock);
+}
+/**
+ * Decide if this packet should be logged (same rules as dbg_show).
+ * Returns true if it should be added to packet_list / sent to server.
+ */
+static bool should_log_packet(const struct packet_info *info) {
+    bool in_allowed_ip_list = ip_is_in_allowed_table(info->saddr);
+    bool in_allowed_port_list = ip_allows_port(info->saddr, ntohs(info->dport));
+
+    // Same as dbg_show
+    if (in_allowed_ip_list && in_allowed_port_list &&
+        (state == MONITORING || state == REACTIVE))
+        return false;
+
+    if ((!in_allowed_ip_list || !in_allowed_port_list) && state == LISTENING)
+        return false;
+
+    if (state == DISABLED)
+        return false;
+
+    return true;
 }
 
 /**
@@ -428,8 +462,8 @@ static ssize_t load_config_from_file(void) {
     }
 
     /* Update last_mtime_config_file on successful read */
-    // last_mtime_config_file = inode_get_mtime(filp->f_inode);
-    last_mtime_config_file = filp->f_inode->i_mtime;
+    last_mtime_config_file = inode_get_mtime(filp->f_inode);
+    // last_mtime_config_file = filp->f_inode->i_mtime;
 
     filp_close(filp, NULL);
     return bytes;
@@ -465,8 +499,8 @@ static void config_work_func(struct work_struct *work) {
     }
 
     // Kernel version diff.
-    // current_mtime_config_file = inode_get_mtime(file_inode(filp));
-    current_mtime_config_file = file_inode(filp)->i_mtime;
+    current_mtime_config_file = inode_get_mtime(file_inode(filp));
+    // current_mtime_config_file = file_inode(filp)->i_mtime;
     filp_close(filp, NULL);
 
     if (timespec64_compare(&current_mtime_config_file,
@@ -494,8 +528,8 @@ static void config_work_func(struct work_struct *work) {
     }
 
     // Kernel version diff.
-    // current_mtime_allowed_file = inode_get_mtime(file_inode(filp));
-    current_mtime_allowed_file = file_inode(filp)->i_mtime;
+    current_mtime_allowed_file = inode_get_mtime(file_inode(filp));
+    // current_mtime_allowed_file = file_inode(filp)->i_mtime;
     filp_close(filp, NULL);
 
     if (timespec64_compare(&current_mtime_allowed_file,
@@ -521,6 +555,32 @@ static bool is_router_noise(struct iphdr *ip, struct sk_buff *skb) {
     return false;
 }
 
+static bool add_log_if_necessary(struct packet_info *info) {
+
+    if (!should_log_packet(info)) {
+        return false;
+    }
+    // === Add copy to permanent history (debugfs) ===
+    struct packet_info *history = kmalloc(sizeof(*history), GFP_ATOMIC);
+    if (history) {
+        memcpy(history, info, sizeof(*info)); // copy all fields
+        INIT_LIST_HEAD(&history->list);       // independent node
+
+        spin_lock(&list_lock);
+        list_add_tail(&history->list, &packet_list);
+        spin_unlock(&list_lock);
+    } else {
+        pr_warn("Failed to allocate history copy – skipping local log\n");
+    }
+    spin_lock(&list_lock);
+    list_add_tail(&info->list, &packet_list_sent);
+    spin_unlock(&list_lock);
+
+    // Send the info via the tcp connection to the server.
+    wake_up_interruptible(&packet_wq);
+    return true;
+}
+
 /**
  * Packet logging hook.
  */
@@ -531,9 +591,6 @@ static unsigned int packet_hook(void *priv, struct sk_buff *skb,
     struct tcphdr *tcp;
     struct udphdr *udp;
     struct packet_info *info;
-
-    bool allowed_ip = false;
-    bool allowed_port = false;
 
     if (!skb)
         return NF_ACCEPT;
@@ -603,9 +660,7 @@ static unsigned int packet_hook(void *priv, struct sk_buff *skb,
         info->dport = udp->dest;
     }
 
-    spin_lock(&list_lock);
-    list_add_tail(&info->list, &packet_list);
-    spin_unlock(&list_lock);
+    const bool added = add_log_if_necessary(info);
 
     /* In REACTIVE mode, only allow packets with daddr in allowed_ips
      and from the list of allowed ports.
@@ -613,22 +668,29 @@ static unsigned int packet_hook(void *priv, struct sk_buff *skb,
      not blocked; it will be a filtering before printing it.*/
     if (state == REACTIVE) {
         /* Check if source IP is known in allowed table */
-        allowed_ip = ip_is_in_allowed_table(ip->saddr);
+        bool allowed_ip = ip_is_in_allowed_table(ip->saddr);
 
         /* If the IP is known, check whether the destination port is allowed
          * (use host-order port for comparison). If the entry has port_count==0,
          * it means any port is allowed for that IP.
          */
+        bool allowed_port = false;
         if (ip->protocol == IPPROTO_TCP || ip->protocol == IPPROTO_UDP) {
             u16 dport_host = ntohs(info->dport);
             allowed_port = ip_allows_port(ip->saddr, dport_host);
         }
 
         if (!allowed_ip || !allowed_port) {
+            if (!added) {
+                kfree(info);
+            }
             return NF_DROP;
         }
     }
 
+    if (!added) {
+        kfree(info);
+    }
     return NF_ACCEPT;
 }
 
@@ -636,8 +698,6 @@ static unsigned int packet_hook(void *priv, struct sk_buff *skb,
 static int dbg_show(struct seq_file *m, void *v) {
     struct packet_info *info;
     struct logged_packet *lp;
-    bool in_allowed_ip_list = false;
-    bool in_allowed_port_list = false;
     struct logged_packet_key key = {0};
     struct logged_packet *existing;
 
@@ -649,22 +709,9 @@ static int dbg_show(struct seq_file *m, void *v) {
 
     spin_lock(&list_lock);
     list_for_each_entry(info, &packet_list, list) {
-
-        /* Check allowed map for IP and port */
-        in_allowed_ip_list = ip_is_in_allowed_table(info->saddr);
-        in_allowed_port_list = ip_allows_port(info->saddr, ntohs(info->dport));
-
-        /* In monitoring and reactive mode, react only if the packet
-        is not in the allowed list and in the list of allowed ports. */
-        if (in_allowed_ip_list && in_allowed_port_list &&
-            (state == MONITORING || state == REACTIVE))
+        if (!(should_log_packet(info))) {
             continue;
-
-        /* In listening, if it is not found in the list of allowed ip addr
-         and in the list of allowed ports to use, is ignored in the report. */
-        if ((!in_allowed_ip_list || !in_allowed_port_list) &&
-            state == LISTENING)
-            continue;
+        }
 
         key.saddr = info->saddr;
         key.daddr = info->daddr;
@@ -751,7 +798,7 @@ struct socket *conn_socket = NULL;
 static struct task_struct *client_thread;
 static atomic_t client_running = ATOMIC_INIT(0);
 static DEFINE_MUTEX(client_thread_mutex);
-// simple flag (atomic_t better in production)
+#define SEND_BUF_SIZE 512
 
 static int tcp_client_send(struct socket *sock, const char *buf, size_t len,
                            unsigned long flags) {
@@ -784,6 +831,7 @@ static int tcp_client_send(struct socket *sock, const char *buf, size_t len,
     return written;
 }
 
+//TODO: Not used rn
 static int tcp_client_receive(struct socket *sock, char *buf, size_t max_len,
                               unsigned long flags) {
     struct msghdr msg = {.msg_name = NULL,
@@ -822,8 +870,6 @@ static int tcp_client_thread(void *arg) {
         return -1;
     }
     struct sockaddr_in saddr;
-    char send_buf[] = "HOLA\n";
-    char recv_buf[64];
     int ret;
 
     allow_signal(SIGTERM); // optional: allow kthread_stop to interrupt us
@@ -858,7 +904,7 @@ static int tcp_client_thread(void *arg) {
         timeout = wait_event_interruptible_timeout(
             conn_socket->sk->sk_wq->wait,
             conn_socket->sk->sk_state != TCP_SYN_SENT || kthread_should_stop(),
-            msecs_to_jiffies(6000));
+            msecs_to_jiffies(3000));
 
         if (kthread_should_stop()) {
             pr_info("connect aborted due to thread stop\n");
@@ -879,27 +925,60 @@ static int tcp_client_thread(void *arg) {
 
     // Main loop – example: send once, receive once, then idle/sleep
     while (!kthread_should_stop()) {
-        ret = tcp_client_send(conn_socket, send_buf, strlen(send_buf),
-                              MSG_DONTWAIT);
-        if (ret < 0) {
-            if (ret != -EAGAIN)
-                break;
-        } else {
-            pr_info("sent '%s'\n", send_buf);
-        }
+        // Wait until there's something to send or timeout
+        wait_event_interruptible_timeout(packet_wq, kthread_should_stop(),
+                                         msecs_to_jiffies(5000));
 
-        memset(recv_buf, 0, sizeof(recv_buf));
-        ret = tcp_client_receive(conn_socket, recv_buf, sizeof(recv_buf) - 1,
-                                 MSG_DONTWAIT);
-        if (ret > 0) {
-            pr_info("received '%s' (%d bytes)\n", recv_buf, ret);
-        } else if (ret < 0 && ret != -EAGAIN) {
-            pr_err("receive error: %d\n", ret);
+        if (kthread_should_stop())
             break;
+
+        struct packet_info *info, *tmp;
+        LIST_HEAD(local_list);
+        char send_buf[SEND_BUF_SIZE];
+        int sent_count = 0;
+
+        // Grab everything currently in the list (no filtering)
+        spin_lock_bh(&list_lock);
+        list_splice_init(&packet_list_sent,
+                         &local_list); // atomic move of whole list
+        spin_unlock_bh(&list_lock);
+
+        // Send each one
+        list_for_each_entry_safe(info, tmp, &local_list, list) {
+            int len;
+
+            // Use scnprintf (safer than snprintf in kernel) — same format as in
+            // dbg_show
+            len = scnprintf(send_buf, sizeof(send_buf),
+                            "PROTO=%u TTL=%u LEN=%u IFACE=%s\n"
+                            "SRC=%pI4 SPORT=%u DST=%pI4 DPORT=%u\n"
+                            "SRC_MAC=%pM DST_MAC=%pM TCP_FLAGS=%02x\n\n",
+                            info->protocol, info->ttl, info->total_len,
+                            info->indev, &info->saddr, ntohs(info->sport),
+                            &info->daddr, ntohs(info->dport), info->src_mac,
+                            info->dst_mac, info->tcp_flags);
+
+            if (len <= 0 || len >= sizeof(send_buf)) {
+                pr_warn("format buffer too small or error\n");
+                list_del(&info->list);
+                kfree(info);
+                continue;
+            }
+
+            int sent = tcp_client_send(conn_socket, send_buf, len, 0);
+            if (sent == len) {
+                sent_count++;
+                list_del(&info->list);
+                kfree(info);
+            } else {
+                list_move_tail(&info->list, &packet_list_sent);
+                pr_warn("send failed (%d/%d bytes), retry later\n", sent, len);
+                // Optional: break;   // stop this batch if connection is broken
+            }
         }
 
-        // poll every 2s – replace with wait_event* for efficiency
-        msleep_interruptible(2000);
+        if (sent_count > 0)
+            pr_info("tcp-client: sent %d packet log entries\n", sent_count);
     }
 
 out_sock:
@@ -1000,6 +1079,7 @@ static void __exit mynetfilter_exit(void) {
     del_timer_sync(&config_timer);
     cancel_work_sync(&config_work);
     free_packet_list();
+    free_packet_list_sent();
 
     /* free allowed_table entries */
     spin_lock(&allowed_lock);
