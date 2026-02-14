@@ -26,46 +26,12 @@
 #include <vector>
 
 #include "database_handle.h"
+#include "shared_network_types.h"
+#include "tcp_log_receiver.h"
 
 // ============================================================================
 // DATA MODEL
 // ============================================================================
-struct RemotePC {
-    int id;
-    std::string name;
-    std::string host;
-    std::string user;
-    std::string pass;
-    std::string bind_ip;
-
-    ssh_session session = nullptr;
-
-    std::vector<std::string> ips;
-    ImVec2 pos{0, 0};
-    std::string logBuffer;
-    std::mutex logMutex;
-    std::atomic<bool> running{false};
-    std::thread logThread;
-
-    std::string logStatus; // "OK", "ERROR", "NO DATA"
-
-    // === CONFIG EDITOR STATE ===
-    std::string mainConfig;
-    std::string allowedConfig;
-    std::string allowedPath;
-
-    std::set<std::string> allowedIps;
-
-    std::vector<char> mainEditBuf;
-    std::vector<char> allowedEditBuf;
-
-    bool configLoaded = false;
-    bool editingMain = true;
-    bool viewingLogs = false;
-
-    // TODO:
-    int db_pc_id = -1;
-};
 
 struct ExternalNode {
     std::string ip;
@@ -92,8 +58,9 @@ static std::unique_ptr<PendingConnection> pending_connection = nullptr;
 static std::mutex pending_connection_mutex;
 
 // Global structures
-static std::map<std::string, std::unique_ptr<RemotePC>> pc_by_name_host; // key: name + "|" + host
-static std::unordered_map<std::string, RemotePC *> ip_to_pc_map;         // fast IP → PC lookup
+static std::map<std::string, std::unique_ptr<RemotePC>>
+    pc_by_name_host; // key: name + "|" + host
+std::unordered_map<std::string, RemotePC *> ip_to_pc_map; // fast IP → PC lookup
 static int next_pc_id = 0;
 static std::string selectedRemoveIP;
 static int selectedRemoveIdx = 0; // persistent index
@@ -111,7 +78,7 @@ static const float ZOOM_MAX = 3.0f;
 // ============================================================================
 
 // Used to Receive the ips from the `allowed_file`.
-static std::set<std::string> parse_allowed_ips(const std::string &text) {
+std::set<std::string> parse_allowed_ips(const std::string &text) {
     std::set<std::string> ips;
     std::istringstream iss(text);
     std::string line;
@@ -125,7 +92,8 @@ static std::set<std::string> parse_allowed_ips(const std::string &text) {
             continue;
 
         size_t colon = line.find(':');
-        std::string ip = (colon == std::string::npos) ? line : line.substr(0, colon);
+        std::string ip =
+            (colon == std::string::npos) ? line : line.substr(0, colon);
 
         ips.insert(ip);
     }
@@ -133,7 +101,8 @@ static std::set<std::string> parse_allowed_ips(const std::string &text) {
     return ips;
 }
 
-static ssh_session connect_to_host(const char *host, const char *user, const char *pass, const char *bind_ip) {
+static ssh_session connect_to_host(const char *host, const char *user,
+                                   const char *pass, const char *bind_ip) {
     const ssh_session session = ssh_new();
     if (!session)
         return nullptr;
@@ -163,12 +132,14 @@ fail:
     return nullptr;
 }
 
-static bool read_remote_log(const ssh_session session, const char *cmd, std::string &out) {
+static bool read_remote_log(const ssh_session session, const char *cmd,
+                            std::string &out) {
     const ssh_channel ch = ssh_channel_new(session);
     if (!ch)
         return false;
 
-    if (ssh_channel_open_session(ch) != SSH_OK || ssh_channel_request_exec(ch, cmd) != SSH_OK) {
+    if (ssh_channel_open_session(ch) != SSH_OK ||
+        ssh_channel_request_exec(ch, cmd) != SSH_OK) {
         ssh_channel_free(ch);
         return false;
     }
@@ -190,7 +161,8 @@ static bool read_remote_log(const ssh_session session, const char *cmd, std::str
 // ============================================================================
 
 static void start_log_thread(RemotePC *pc) {
-    std::cout << "Starting log thread for " << pc->name << " (" << pc->host << ")\n";
+    std::cout << "Starting log thread for " << pc->name << " (" << pc->host
+              << ")\n";
 
     if (!pc->session) {
         pc->logStatus = "No session available";
@@ -203,7 +175,8 @@ static void start_log_thread(RemotePC *pc) {
     pc->logThread = std::thread([pc] {
         while (pc->running) {
             std::string tmp;
-            const bool success = read_remote_log(pc->session, "sudo cat /sys/kernel/debug/packet_logs", tmp);
+            const bool success = read_remote_log(
+                pc->session, "sudo cat /sys/kernel/debug/packet_logs", tmp);
 
             {
                 std::lock_guard<std::mutex> lock(pc->logMutex);
@@ -232,7 +205,9 @@ static void start_log_thread(RemotePC *pc) {
 // ============================================================================
 // HELPERS
 // ============================================================================
-static std::string make_key(const std::string &name, const std::string &host) { return name + "|" + host; }
+static std::string make_key(const std::string &name, const std::string &host) {
+    return name + "|" + host;
+}
 
 static void update_ip_map_for_pc(RemotePC *pc) {
     for (const std::string &ip : pc->ips) {
@@ -241,12 +216,13 @@ static void update_ip_map_for_pc(RemotePC *pc) {
     }
 }
 
-static RemotePC *find_pc_by_ip(const std::string &ip) {
+RemotePC *find_pc_by_ip(const std::string &ip) {
     auto it = ip_to_pc_map.find(ip);
     return it != ip_to_pc_map.end() ? it->second : nullptr;
 }
 
-static std::vector<std::pair<std::string, std::string>> parse_connections(const std::string &log) {
+std::vector<std::pair<std::string, std::string>>
+parse_connections(const std::string &log) {
     std::vector<std::pair<std::string, std::string>> connections;
     std::regex pattern(R"(SRC=([\d\.]+).*DST=([\d\.]+))");
     std::istringstream iss(log);
@@ -258,7 +234,8 @@ static std::vector<std::pair<std::string, std::string>> parse_connections(const 
             std::string src = match[1].str();
             std::string dst = match[2].str();
 
-            if (dst == "255.255.255.255" || dst == "127.0.0.1" || src == "127.0.0.1" || src == "0.0.0.0")
+            if (dst == "255.255.255.255" || dst == "127.0.0.1" ||
+                src == "127.0.0.1" || src == "0.0.0.0")
                 continue;
 
             connections.emplace_back(src, dst);
@@ -267,7 +244,8 @@ static std::vector<std::pair<std::string, std::string>> parse_connections(const 
     return connections;
 }
 
-static bool load_file_from_ssh(const char *host, const char *user, const char *pass, const char *path,
+static bool load_file_from_ssh(const char *host, const char *user,
+                               const char *pass, const char *path,
                                std::string &out) {
     const ssh_session session = ssh_new();
     if (!session)
@@ -356,7 +334,8 @@ static bool remove_pc(const std::string &name, const std::string &host) {
 static bool remove_pc_by_ip(const std::string &ip) {
     std::cout << "Tracked IPs:\n";
     for (const std::pair<std::string, RemotePC *> &pair : ip_to_pc_map) {
-        std::cout << "[" << pair.first << "] -> " << pair.second->name << " (" << pair.second->host << ")\n";
+        std::cout << "[" << pair.first << "] -> " << pair.second->name << " ("
+                  << pair.second->host << ")\n";
     }
 
     const RemotePC *pc = find_pc_by_ip(ip);
@@ -377,7 +356,8 @@ static bool remove_pc_by_ip(const std::string &ip) {
 // ============================================================================
 // SSH Save
 // ============================================================================
-static int save_file_to_ssh(const char *host, const char *user, const char *pass, const char *path,
+static int save_file_to_ssh(const char *host, const char *user,
+                            const char *pass, const char *path,
                             const std::string &data) {
     const ssh_session session = ssh_new();
     if (!session)
@@ -405,7 +385,8 @@ static int save_file_to_ssh(const char *host, const char *user, const char *pass
         return 0;
     }
 
-    const sftp_file file = sftp_open(sftp, path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    const sftp_file file =
+        sftp_open(sftp, path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
 
     if (!file) {
         sftp_free(sftp);
@@ -466,7 +447,8 @@ static void discover_new_ips() {
             log_copy = pc->logBuffer;
         }
 
-        std::vector<std::pair<std::string, std::string>> conns = parse_connections(log_copy);
+        std::vector<std::pair<std::string, std::string>> conns =
+            parse_connections(log_copy);
 
         for (const auto &[_, dst_ip] : conns) {
             RemotePC *dst_pc = find_pc_by_ip(dst_ip);
@@ -493,7 +475,8 @@ static void discover_new_ips() {
 }
 
 // ===============================================================================================
-// ================================== async connection handling ==================================
+// ================================== async connection handling
+// ==================================
 // ===============================================================================================
 
 // Background connection function
@@ -510,7 +493,8 @@ static void async_connect(PendingConnection *pending) {
     ssh_options_set(session, SSH_OPTIONS_USER, pending->user.c_str());
 
     if (!pending->bind_ip.empty() && pending->bind_ip.length() > 0) {
-        ssh_options_set(session, SSH_OPTIONS_BINDADDR, pending->bind_ip.c_str());
+        ssh_options_set(session, SSH_OPTIONS_BINDADDR,
+                        pending->bind_ip.c_str());
     }
 
     const int strict = 0;
@@ -521,14 +505,16 @@ static void async_connect(PendingConnection *pending) {
     ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &timeout);
 
     if (ssh_connect(session) != SSH_OK) {
-        pending->error_msg = "Failed to connect to " + pending->host + ": " + std::string(ssh_get_error(session));
+        pending->error_msg = "Failed to connect to " + pending->host + ": " +
+                             std::string(ssh_get_error(session));
         ssh_free(session);
         pending->success = false;
         pending->completed = true;
         return;
     }
 
-    if (ssh_userauth_password(session, nullptr, pending->pass.c_str()) != SSH_AUTH_SUCCESS) {
+    if (ssh_userauth_password(session, nullptr, pending->pass.c_str()) !=
+        SSH_AUTH_SUCCESS) {
         pending->error_msg = "Authentication failed for " + pending->host;
         ssh_disconnect(session);
         ssh_free(session);
@@ -544,7 +530,8 @@ static void async_connect(PendingConnection *pending) {
 }
 
 // Start an async connection
-static void start_async_connection(const char *name, const char *host, const char *user, const char *pass,
+static void start_async_connection(const char *name, const char *host,
+                                   const char *user, const char *pass,
                                    const char *bind_ip) {
 
     std::lock_guard<std::mutex> lock(pending_connection_mutex);
@@ -554,14 +541,17 @@ static void start_async_connection(const char *name, const char *host, const cha
     pending_connection->host = host;
     pending_connection->user = user;
     pending_connection->pass = pass;
-    pending_connection->bind_ip = (bind_ip && strlen(bind_ip) > 0) ? bind_ip : "";
+    pending_connection->bind_ip =
+        (bind_ip && strlen(bind_ip) > 0) ? bind_ip : "";
 
     // Start the connection thread
-    pending_connection->connection_thread = std::thread(async_connect, pending_connection.get());
+    pending_connection->connection_thread =
+        std::thread(async_connect, pending_connection.get());
 }
 
 // Check and process completed connections
-static void process_pending_connections(std::string &successMsg, std::string &errorMsg) {
+static void process_pending_connections(std::string &successMsg,
+                                        std::string &errorMsg) {
     std::lock_guard<std::mutex> lock(pending_connection_mutex);
 
     if (pending_connection == nullptr || !pending_connection->completed) {
@@ -581,16 +571,19 @@ static void process_pending_connections(std::string &successMsg, std::string &er
     }
 
     // Connection successful - add the PC
-    std::string key = make_key(pending_connection->name, pending_connection->host);
+    std::string key =
+        make_key(pending_connection->name, pending_connection->host);
     auto pc_it = pc_by_name_host.find(key);
 
     if (pc_it != pc_by_name_host.end()) {
         // Existing PC — add IP if new
         RemotePC *pc = pc_it->second.get();
-        if (std::find(pc->ips.begin(), pc->ips.end(), pending_connection->host) == pc->ips.end()) {
+        if (std::find(pc->ips.begin(), pc->ips.end(),
+                      pending_connection->host) == pc->ips.end()) {
             pc->ips.push_back(pending_connection->host);
             update_ip_map_for_pc(pc);
-            successMsg = "Added IP " + pending_connection->host + " to existing PC " + pending_connection->name;
+            successMsg = "Added IP " + pending_connection->host +
+                         " to existing PC " + pending_connection->name;
 
         } else {
             successMsg = "PC already exists with this configuration";
@@ -629,7 +622,8 @@ static bool is_connection_pending() {
     return pending_connection != nullptr;
 }
 
-// ================================== Transformations from topology reactivity ==================================
+// ================================== Transformations from topology reactivity
+// ==================================
 
 /**
  * Handles interactive panning and zooming of the topology view.
@@ -639,7 +633,8 @@ static void calculate_zoom_and_drag() {
     const ImGuiIO &io = ImGui::GetIO();
     const ImVec2 mouse = io.MousePos;
 
-    if (ImGui::IsWindowHovered() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+    if (ImGui::IsWindowHovered() &&
+        ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
         topology_pan.x += io.MouseDelta.x;
         topology_pan.y += io.MouseDelta.y;
     }
@@ -672,11 +667,13 @@ static void calculate_zoom_and_drag() {
  * @return       Corresponding position in screen coordinates.
  */
 static ImVec2 to_screen(const ImVec2 &world) {
-    return ImVec2(world.x * topology_zoom + topology_pan.x, world.y * topology_zoom + topology_pan.y);
+    return ImVec2(world.x * topology_zoom + topology_pan.x,
+                  world.y * topology_zoom + topology_pan.y);
 }
 
 // ===================================================================================================
-// ===================================== Main UI functionalities =====================================
+// ===================================== Main UI functionalities
+// =====================================
 // ===================================================================================================
 
 static void draw_add_pc() {
@@ -709,7 +706,8 @@ static void draw_add_pc() {
     ImGui::Spacing();
 
     ImGui::InputText("Username", user, sizeof(user));
-    ImGui::InputText("Password", pass, sizeof(pass), ImGuiInputTextFlags_Password);
+    ImGui::InputText("Password", pass, sizeof(pass),
+                     ImGuiInputTextFlags_Password);
     ImGui::PopItemWidth();
 
     ImGui::Spacing();
@@ -719,8 +717,10 @@ static void draw_add_pc() {
 
     if (is_connecting) {
         ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(100, 100, 100, 255));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(100, 100, 100, 255));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(100, 100, 100, 255));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                              IM_COL32(100, 100, 100, 255));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                              IM_COL32(100, 100, 100, 255));
     }
 
     if (ImGui::Button("Add PC", ImVec2(150, 30)) && !is_connecting) {
@@ -730,7 +730,8 @@ static void draw_add_pc() {
         if (strlen(name) > 0 && strlen(host) > 0) {
             // Start async connection
 
-            // TODO: I check if this host ip matches ones already present, but if its a sleeping host ip (not active)
+            // TODO: I check if this host ip matches ones already present, but
+            // if its a sleeping host ip (not active)
             if (find_pc_by_ip(host) == nullptr) {
                 start_async_connection(name, host, user, pass, ip);
                 successMsg = "Connecting to " + std::string(host) + "...";
@@ -807,11 +808,13 @@ static void draw_add_pc() {
         ImGui::Spacing();
 
         if (ImGui::Button("Remove Selected PC", ImVec2(-1, 30))) {
-            std::cout << "Trying to remove PC with IP: " << selectedRemoveIP << "\n";
+            std::cout << "Trying to remove PC with IP: " << selectedRemoveIP
+                      << "\n";
             if (!selectedRemoveIP.empty()) {
                 bool success = remove_pc_by_ip(selectedRemoveIP);
                 if (success) {
-                    std::cout << "Successfully removed PC with IP: " << selectedRemoveIP << "\n";
+                    std::cout << "Successfully removed PC with IP: "
+                              << selectedRemoveIP << "\n";
                     selectedRemoveIP.clear();
                     selectedRemoveIdx = 0;
                 } else {
@@ -857,10 +860,13 @@ static void draw_topology() {
 
     calculate_zoom_and_drag();
 
-    dl->AddRectFilled(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y),
-                      IM_COL32(30, 30, 40, 255));
+    dl->AddRectFilled(
+        canvas_pos,
+        ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y),
+        IM_COL32(30, 30, 40, 255));
 
-    ImVec2 center(canvas_pos.x + canvas_size.x * 0.5f, canvas_pos.y + canvas_size.y * 0.5f);
+    ImVec2 center(canvas_pos.x + canvas_size.x * 0.5f,
+                  canvas_pos.y + canvas_size.y * 0.5f);
 
     // === 1. Collect monitored PCs ===
     std::vector<RemotePC *> monitored_pcs;
@@ -870,7 +876,8 @@ static void draw_topology() {
 
     // === 3. Collect external IPs (first pass - only collect) ===
 
-    // Store in a map the ip of the external pc and a set of all the pcs that are connected to this ip.
+    // Store in a map the ip of the external pc and a set of all the pcs that
+    // are connected to this ip.
     std::map<std::string, std::set<RemotePC *>> external_ip_to_pcs;
     std::map<RemotePC *, std::set<std::string>> pcs_to_ip;
     std::set<std::pair<int, int>> drawn_monitored_edges;
@@ -895,7 +902,8 @@ static void draw_topology() {
                     std::swap(a, b);
                 drawn_monitored_edges.insert({a, b});
             } else if (!src_pc && dst_pc) {
-                // One side is external (meaning the destination is in the list of tracked files, and the source is not)
+                // One side is external (meaning the destination is in the list
+                // of tracked files, and the source is not)
                 external_ip_to_pcs[src_ip].insert(dst_pc);
                 pcs_to_ip[dst_pc].insert(src_ip);
             }
@@ -913,7 +921,8 @@ static void draw_topology() {
         int total_nodes = pcs_to_ip[pc].size();
         int ring_number = 0;
         if (total_nodes > 0) {
-            ring_number = static_cast<int>(std::ceil(std::log2(static_cast<float>(total_nodes) / nodes_per_ring + 1)));
+            ring_number = static_cast<int>(std::ceil(std::log2(
+                static_cast<float>(total_nodes) / nodes_per_ring + 1)));
         }
         pcs_total_rings[pc] = ring_number;
     }
@@ -923,17 +932,20 @@ static void draw_topology() {
             monitored_pcs[i]->pos = center;
         } else {
             const float angle = i * (2.0f * M_PI / pc_count);
-            const float extra_length = pcs_total_rings[monitored_pcs[i]] * ring_spacing;
+            const float extra_length =
+                pcs_total_rings[monitored_pcs[i]] * ring_spacing;
             const float radius = inner_radius + extra_length;
 
-            monitored_pcs[i]->pos = ImVec2(center.x + radius * cosf(angle), center.y + radius * sinf(angle));
+            monitored_pcs[i]->pos = ImVec2(center.x + radius * cosf(angle),
+                                           center.y + radius * sinf(angle));
         }
     }
 
     // === 4. Create and position external nodes ===
     std::map<std::string, ExternalNode> external_nodes;
     // Distance from the connected PC
-    const float orbit_radius_base = std::min(canvas_size.x, canvas_size.y) * 0.20f;
+    const float orbit_radius_base =
+        std::min(canvas_size.x, canvas_size.y) * 0.20f;
     /* Max nodes per orbital ring before adding another ring */
 
     // First, count how many external nodes connect to each PC
@@ -976,14 +988,15 @@ static void draw_topology() {
 
             const int position_in_ring = current_idx - nodes_before;
 
-            const float orbit_radius = orbit_radius_base + ring_number * ring_spacing;
+            const float orbit_radius =
+                orbit_radius_base + ring_number * ring_spacing;
             float angle = (2.0f * M_PI * position_in_ring) / nodes_in_ring;
 
             if (ring_number % 2 == 1)
                 angle += M_PI / nodes_in_ring;
 
-            node.pos =
-                ImVec2(target_pc->pos.x + orbit_radius * cosf(angle), target_pc->pos.y + orbit_radius * sinf(angle));
+            node.pos = ImVec2(target_pc->pos.x + orbit_radius * cosf(angle),
+                              target_pc->pos.y + orbit_radius * sinf(angle));
 
         } else {
             // Connected to multiple PCs - position at centroid
@@ -1001,7 +1014,8 @@ static void draw_topology() {
             if (len > 1e-3f) {
                 dir.x /= len;
                 dir.y /= len;
-                node.pos = ImVec2(centroid.x + dir.x * 60.0f, centroid.y + dir.y * 60.0f);
+                node.pos = ImVec2(centroid.x + dir.x * 60.0f,
+                                  centroid.y + dir.y * 60.0f);
             } else {
                 node.pos = centroid;
             }
@@ -1055,7 +1069,8 @@ static void draw_topology() {
             }
 
             // Draw line
-            dl->AddLine(to_screen(from_pos), to_screen(to_pos), line_color, 3.0f);
+            dl->AddLine(to_screen(from_pos), to_screen(to_pos), line_color,
+                        3.0f);
         }
     }
 
@@ -1077,16 +1092,21 @@ static void draw_topology() {
         ImU32 fillColor = is_allowed ? IM_COL32(255, 220, 80, 255) // yellow
                                      : IM_COL32(255, 80, 80, 255); // red
 
-        ImU32 borderColor = is_allowed ? IM_COL32(255, 240, 120, 255) : IM_COL32(255, 120, 120, 255);
+        ImU32 borderColor = is_allowed ? IM_COL32(255, 240, 120, 255)
+                                       : IM_COL32(255, 120, 120, 255);
 
-        dl->AddCircleFilled(to_screen(node.pos), external_circle_radius, fillColor);
-        dl->AddCircle(to_screen(node.pos), external_circle_radius, borderColor, circle_segments, 4.0f);
+        dl->AddCircleFilled(to_screen(node.pos), external_circle_radius,
+                            fillColor);
+        dl->AddCircle(to_screen(node.pos), external_circle_radius, borderColor,
+                      circle_segments, 4.0f);
 
         ImGui::SetWindowFontScale(topology_zoom);
         ImVec2 screen_pos = to_screen(node.pos);
         ImVec2 ts = ImGui::CalcTextSize(ip.c_str());
 
-        dl->AddText(ImVec2(screen_pos.x - ts.x * 0.5f, screen_pos.y - ts.y * 0.5f), IM_COL32_WHITE, ip.c_str());
+        dl->AddText(
+            ImVec2(screen_pos.x - ts.x * 0.5f, screen_pos.y - ts.y * 0.5f),
+            IM_COL32_WHITE, ip.c_str());
         ImGui::SetWindowFontScale(1.0f);
 
         // Hover for the other nodes presend.
@@ -1094,17 +1114,20 @@ static void draw_topology() {
         float dx = mouse.x - screen_pos.x;
         float dy = mouse.y - screen_pos.y;
 
-        if (dx * dx + dy * dy <= external_circle_radius * external_circle_radius) {
+        if (dx * dx + dy * dy <=
+            external_circle_radius * external_circle_radius) {
             ImGui::BeginTooltip();
             ImGui::Text("IP: %s", ip.c_str());
             ImGui::Separator();
 
             if (is_allowed) {
-                ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 220, 80, 255));
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                                      IM_COL32(255, 220, 80, 255));
                 ImGui::Text("Status: Allowed");
                 ImGui::PopStyleColor();
             } else {
-                ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 80, 80, 255));
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                                      IM_COL32(255, 80, 80, 255));
                 ImGui::Text("Status: External (Not Allowed)");
                 ImGui::PopStyleColor();
             }
@@ -1123,8 +1146,10 @@ static void draw_topology() {
 
     // === 7. Draw monitored nodes on top ===
     for (RemotePC *pc : monitored_pcs) {
-        dl->AddCircleFilled(to_screen(pc->pos), monitored_circle_radius, IM_COL32(80, 150, 255, 255));
-        dl->AddCircle(to_screen(pc->pos), monitored_circle_radius, IM_COL32(120, 190, 255, 255), circle_segments, 4.0f);
+        dl->AddCircleFilled(to_screen(pc->pos), monitored_circle_radius,
+                            IM_COL32(80, 150, 255, 255));
+        dl->AddCircle(to_screen(pc->pos), monitored_circle_radius,
+                      IM_COL32(120, 190, 255, 255), circle_segments, 4.0f);
 
         std::string label = pc->name;
         if (!pc->ips.empty()) {
@@ -1135,7 +1160,9 @@ static void draw_topology() {
         ImVec2 ts = ImGui::CalcTextSize(label.c_str());
         ImVec2 screen_pos = to_screen(pc->pos);
 
-        dl->AddText(ImVec2(screen_pos.x - ts.x * 0.5f, screen_pos.y - ts.y * 0.5f), IM_COL32_WHITE, label.c_str());
+        dl->AddText(
+            ImVec2(screen_pos.x - ts.x * 0.5f, screen_pos.y - ts.y * 0.5f),
+            IM_COL32_WHITE, label.c_str());
         ImGui::SetWindowFontScale(1.0f);
 
         // ===== HOVER TOOLTIP =====
@@ -1143,7 +1170,8 @@ static void draw_topology() {
         float dx = mouse.x - screen_pos.x;
         float dy = mouse.y - screen_pos.y;
 
-        if (dx * dx + dy * dy <= monitored_circle_radius * monitored_circle_radius) {
+        if (dx * dx + dy * dy <=
+            monitored_circle_radius * monitored_circle_radius) {
             ImGui::BeginTooltip();
             ImGui::Text("PC: %s", pc->name.c_str());
             ImGui::Separator();
@@ -1160,8 +1188,8 @@ static void draw_topology() {
 }
 
 static void draw_logs() {
-    // TODO: Small bug. If this pc has another ip, it will not be updated right away. I need to reenter on this page to
-    // see the modification.
+    // TODO: Small bug. If this pc has another ip, it will not be updated right
+    // away. I need to reenter on this page to see the modification.
 
     // To remember the selected option.
     static int selected = -1;
@@ -1169,8 +1197,8 @@ static void draw_logs() {
     int idx = 0;
     for (const auto &[key, pc_uptr] : pc_by_name_host) {
         RemotePC *pc = pc_uptr.get();
-        std::string label =
-            pc->name + " (" + std::to_string(pc->ips.size()) + " IP" + (pc->ips.size() > 1 ? "s" : "") + ")";
+        std::string label = pc->name + " (" + std::to_string(pc->ips.size()) +
+                            " IP" + (pc->ips.size() > 1 ? "s" : "") + ")";
         for (const auto ip : pc->ips) {
             label += "\n\t" + ip;
         }
@@ -1184,7 +1212,8 @@ static void draw_logs() {
     ImGui::BeginChild("right", ImVec2(0, 0), true);
 
     if (idx == 0) {
-        ImGui::TextDisabled("No PC is currently tracked, add a PC to inspect logs.");
+        ImGui::TextDisabled(
+            "No PC is currently tracked, add a PC to inspect logs.");
         ImGui::EndChild();
 
         // Reset the selected pc if all are removed.
@@ -1193,7 +1222,8 @@ static void draw_logs() {
     }
 
     if (selected < 0) {
-        ImGui::TextDisabled("Select a PC from the left pannel to show its logs.");
+        ImGui::TextDisabled(
+            "Select a PC from the left pannel to show its logs.");
         ImGui::EndChild();
         return;
     }
@@ -1209,9 +1239,10 @@ static void draw_logs() {
     ImGui::EndChild();
 }
 
-// TODO: I can change the logs to not send all the data all the time, but change once its read (keeping the reading file
-// way smaller) and just add them continously untill I detect a change in the config file (might be able to detect even
-// if the mode was changed on each pc with a variable?).
+// TODO: I can change the logs to not send all the data all the time, but change
+// once its read (keeping the reading file way smaller) and just add them
+// continously untill I detect a change in the config file (might be able to
+// detect even if the mode was changed on each pc with a variable?).
 static void draw_config_editor() {
     static int selectedPC = -1;
     static int writing_succedded = -1;
@@ -1225,7 +1256,8 @@ static void draw_config_editor() {
     }
     for (const auto &[key, pc_uptr] : pc_by_name_host) {
 
-        std::string label = pc_uptr->name + " (" + std::to_string(pc_uptr->ips.size()) + " IP" +
+        std::string label = pc_uptr->name + " (" +
+                            std::to_string(pc_uptr->ips.size()) + " IP" +
                             (pc_uptr->ips.size() > 1 ? "s" : "") + ")";
         for (const auto ip : pc_uptr->ips) {
             label += "\n\t" + ip;
@@ -1276,19 +1308,23 @@ static void draw_config_editor() {
 
     // === Load config once ===
     if (!pc->configLoaded) {
-        if (load_file_from_ssh(pc->host.c_str(), pc->user.c_str(), pc->pass.c_str(), MAIN_FILE, pc->mainConfig)) {
+        if (load_file_from_ssh(pc->host.c_str(), pc->user.c_str(),
+                               pc->pass.c_str(), MAIN_FILE, pc->mainConfig)) {
 
             pc->allowedPath = extract_allowed_file(pc->mainConfig);
 
             if (!pc->allowedPath.empty()) {
-                load_file_from_ssh(pc->host.c_str(), pc->user.c_str(), pc->pass.c_str(), pc->allowedPath.c_str(),
+                load_file_from_ssh(pc->host.c_str(), pc->user.c_str(),
+                                   pc->pass.c_str(), pc->allowedPath.c_str(),
                                    pc->allowedConfig);
             }
 
-            pc->mainEditBuf.assign(pc->mainConfig.begin(), pc->mainConfig.end());
+            pc->mainEditBuf.assign(pc->mainConfig.begin(),
+                                   pc->mainConfig.end());
             pc->mainEditBuf.push_back('\0');
 
-            pc->allowedEditBuf.assign(pc->allowedConfig.begin(), pc->allowedConfig.end());
+            pc->allowedEditBuf.assign(pc->allowedConfig.begin(),
+                                      pc->allowedConfig.end());
             pc->allowedEditBuf.push_back('\0');
 
             pc->configLoaded = true;
@@ -1315,7 +1351,8 @@ static void draw_config_editor() {
     ImGui::Separator();
 
     std::string &active = pc->editingMain ? pc->mainConfig : pc->allowedConfig;
-    std::vector<char> &buf = pc->editingMain ? pc->mainEditBuf : pc->allowedEditBuf;
+    std::vector<char> &buf =
+        pc->editingMain ? pc->mainEditBuf : pc->allowedEditBuf;
     const char *path = pc->editingMain ? MAIN_FILE : pc->allowedPath.c_str();
 
     ImGui::Text("Editing: %s", path);
@@ -1329,9 +1366,10 @@ static void draw_config_editor() {
         return 0;
     };
 
-    bool changed = ImGui::InputTextMultiline("##editor", buf.data(), buf.size(), ImVec2(-1, -60),
-                                             ImGuiInputTextFlags_AllowTabInput | ImGuiInputTextFlags_CallbackResize,
-                                             resizeCb, &buf);
+    bool changed = ImGui::InputTextMultiline(
+        "##editor", buf.data(), buf.size(), ImVec2(-1, -60),
+        ImGuiInputTextFlags_AllowTabInput | ImGuiInputTextFlags_CallbackResize,
+        resizeCb, &buf);
 
     // If the input box changed, update the menu with still active.
     if (changed) {
@@ -1340,7 +1378,8 @@ static void draw_config_editor() {
     }
 
     if (ImGui::Button("Save")) {
-        writing_succedded = save_file_to_ssh(pc->host.c_str(), pc->user.c_str(), pc->pass.c_str(), path, active);
+        writing_succedded = save_file_to_ssh(pc->host.c_str(), pc->user.c_str(),
+                                             pc->pass.c_str(), path, active);
     }
 
     if (writing_succedded == 0) {
@@ -1360,10 +1399,13 @@ static void draw_config_editor() {
             if (newAllowed != pc->allowedPath) {
                 pc->allowedPath = newAllowed;
                 if (!newAllowed.empty()) {
-                    // Reload the new allowed file; Create a new ssh connection with that will be used to read.
-                    if (load_file_from_ssh(pc->host.c_str(), pc->user.c_str(), pc->pass.c_str(), newAllowed.c_str(),
+                    // Reload the new allowed file; Create a new ssh connection
+                    // with that will be used to read.
+                    if (load_file_from_ssh(pc->host.c_str(), pc->user.c_str(),
+                                           pc->pass.c_str(), newAllowed.c_str(),
                                            pc->allowedConfig)) {
-                        pc->allowedEditBuf.assign(pc->allowedConfig.begin(), pc->allowedConfig.end());
+                        pc->allowedEditBuf.assign(pc->allowedConfig.begin(),
+                                                  pc->allowedConfig.end());
                         pc->allowedEditBuf.push_back('\0');
                     }
                 }
@@ -1377,16 +1419,25 @@ static void draw_config_editor() {
 }
 
 // ===================================================================================================
-// ============================================= Main ================================================
+// ============================================= Main
+// ================================================
 // ===================================================================================================
 enum class Page { AddPC, Topology, Logs, Config };
 
 int main() {
+    if (!g_network_log_db.open()) {
+        std::cerr << "Cannot initialize SQLite database → continuing without "
+                     "logging\n";
+    } else {
+        g_tcp_log_receiver.start();
+    }
+
     const double target_fps = 30.0;
     const double target_frame_time = 1.0 / target_fps;
 
     glfwInit();
-    GLFWwindow *wnd = glfwCreateWindow(1400, 900, "Network Inspection App", nullptr, nullptr);
+    GLFWwindow *wnd =
+        glfwCreateWindow(1400, 900, "Network Inspection App", nullptr, nullptr);
     glfwMakeContextCurrent(wnd);
 
     // Based on VSync
@@ -1411,8 +1462,9 @@ int main() {
         // Keep track of all new ips that a pc might have.
         discover_new_ips();
 
-        ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
-                                 ImGuiWindowFlags_NoBringToFrontOnFocus;
+        ImGuiWindowFlags flags =
+            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoBringToFrontOnFocus;
 
         ImGui::SetNextWindowPos(ImVec2(0, 0));
         ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
@@ -1458,7 +1510,8 @@ int main() {
         double frame_end = glfwGetTime();
         double frame_duration = frame_end - frame_start;
         if (frame_duration < target_frame_time) {
-            std::this_thread::sleep_for(std::chrono::duration<double>(target_frame_time - frame_duration));
+            std::this_thread::sleep_for(std::chrono::duration<double>(
+                target_frame_time - frame_duration));
         }
     }
 
@@ -1484,6 +1537,9 @@ int main() {
             pc->logThread.join();
         }
     }
+
+    g_tcp_log_receiver.stop();
+    g_network_log_db.close();
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();

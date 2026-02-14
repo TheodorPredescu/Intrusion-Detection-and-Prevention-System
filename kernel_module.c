@@ -950,9 +950,9 @@ static int tcp_client_thread(void *arg) {
             // Use scnprintf (safer than snprintf in kernel) — same format as in
             // dbg_show
             len = scnprintf(send_buf, sizeof(send_buf),
-                            "PROTO=%u TTL=%u LEN=%u IFACE=%s\n"
-                            "SRC=%pI4 SPORT=%u DST=%pI4 DPORT=%u\n"
-                            "SRC_MAC=%pM DST_MAC=%pM TCP_FLAGS=%02x\n\n",
+                            "PROTO=%u TTL=%u LEN=%u IFACE=%s "
+                            "SRC=%pI4 SPORT=%u DST=%pI4 DPORT=%u "
+                            "SRC_MAC=%pM DST_MAC=%pM TCP_FLAGS=%02x\n",
                             info->protocol, info->ttl, info->total_len,
                             info->indev, &info->saddr, ntohs(info->sport),
                             &info->daddr, ntohs(info->dport), info->src_mac,
