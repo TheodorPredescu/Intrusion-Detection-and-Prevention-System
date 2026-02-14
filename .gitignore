@@ -6,3 +6,5 @@ modules.order
 
 compile_commands.json
 Makefile
+
+admin_licenta/application

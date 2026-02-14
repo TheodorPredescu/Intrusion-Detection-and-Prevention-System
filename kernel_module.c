@@ -1,5 +1,3 @@
-#include <linux/types.h>
-#include <linux/stddef.h>
 #include <linux/compiler.h>
 #include <linux/debugfs.h>
 #include <linux/etherdevice.h>
@@ -20,11 +18,19 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/stddef.h>
 #include <linux/tcp.h>
 #include <linux/time64.h>
 #include <linux/timer.h>
-#include <linux/uaccess.h>
+#include <linux/types.h>
 #include <linux/udp.h>
+
+#include <asm/uaccess.h>
+#include <linux/atomic.h>
+#include <linux/in.h>
+#include <linux/net.h>
+#include <linux/socket.h>
+#include <net/sock.h>
 
 #define CONFIG_FILE_PATH "/etc/mymodule.conf"
 #define CONFIG_BUF_SIZE 256
@@ -119,6 +125,13 @@ static __be32 server_ip = 0;
 /** the port of the server. */
 static u16 server_port = 0;
 
+static __be32 prev_server_ip = 0;
+static u16 prev_server_port = 0;
+/** Used to block the reading of server_ip and server_port. */
+static DEFINE_MUTEX(client_server_info_mutex);
+static DECLARE_WAIT_QUEUE_HEAD(packet_wq);
+static LIST_HEAD(packet_list_sent);
+
 /**
  * To clear the table for logged information.
  */
@@ -189,6 +202,38 @@ static void free_packet_list(void) {
         kfree(info);
     }
     spin_unlock(&list_lock);
+}
+
+static void free_packet_list_sent(void) {
+    struct packet_info *info, *tmp;
+
+    spin_lock(&list_lock);
+    list_for_each_entry_safe(info, tmp, &packet_list_sent, list) {
+        list_del(&info->list);
+        kfree(info);
+    }
+    spin_unlock(&list_lock);
+}
+/**
+ * Decide if this packet should be logged (same rules as dbg_show).
+ * Returns true if it should be added to packet_list / sent to server.
+ */
+static bool should_log_packet(const struct packet_info *info) {
+    bool in_allowed_ip_list = ip_is_in_allowed_table(info->saddr);
+    bool in_allowed_port_list = ip_allows_port(info->saddr, ntohs(info->dport));
+
+    // Same as dbg_show
+    if (in_allowed_ip_list && in_allowed_port_list &&
+        (state == MONITORING || state == REACTIVE))
+        return false;
+
+    if ((!in_allowed_ip_list || !in_allowed_port_list) && state == LISTENING)
+        return false;
+
+    if (state == DISABLED)
+        return false;
+
+    return true;
 }
 
 /**
@@ -357,6 +402,7 @@ static ssize_t load_config_from_file(void) {
     ssize_t bytes;
     char *line, *end;
     unsigned int a, b, c, d;
+    u16 parsed_port;
 
     /* Open the file; If the file is not present, create it.  */
     // filp = filp_open(CONFIG_FILE_PATH, O_RDWR | O_CREAT, 0666);
@@ -391,11 +437,15 @@ static ssize_t load_config_from_file(void) {
     while ((end = strstr(line, "\n")) != NULL) {
         *end = '\0';
         if (sscanf(line, "server IP %u.%u.%u.%u", &a, &b, &c, &d) == 4) {
+
+            mutex_lock(&client_server_info_mutex);
             server_ip = htonl((a << 24) | (b << 16) | (c << 8) | d);
             pr_info("Parsed server IP: %pI4\n", &server_ip);
-        } else if (sscanf(line, "server port %hu", &server_port) == 1) {
-            /*server_port is already saved by sscanf correctly; no conversion
-             * needed */
+            mutex_unlock(&client_server_info_mutex);
+        } else if (sscanf(line, "server port %hu", &parsed_port) == 1) {
+            mutex_lock(&client_server_info_mutex);
+            server_port = parsed_port;
+            mutex_unlock(&client_server_info_mutex);
         } else if (strcmp(line, "Listening") == 0) {
             state = LISTENING;
         } else if (strcmp(line, "Monitoring") == 0) {
@@ -429,6 +479,8 @@ static void config_timer_callback(struct timer_list *unused) {
               jiffies + msecs_to_jiffies(CONFIG_POLL_INTERVAL_MS));
 }
 
+static void restart_client_thread_if_needed(void);
+
 static void config_work_func(struct work_struct *work) {
     struct file *filp;
     struct timespec64 current_mtime_config_file;
@@ -458,6 +510,8 @@ static void config_work_func(struct work_struct *work) {
         pr_info("Config file modification response: %ld\n", ret);
         if (ret >= 0) {
             last_mtime_config_file = current_mtime_config_file;
+
+            restart_client_thread_if_needed();
 
             update_allowed_file = true;
         }
@@ -501,6 +555,32 @@ static bool is_router_noise(struct iphdr *ip, struct sk_buff *skb) {
     return false;
 }
 
+static bool add_log_if_necessary(struct packet_info *info) {
+
+    if (!should_log_packet(info)) {
+        return false;
+    }
+    // === Add copy to permanent history (debugfs) ===
+    struct packet_info *history = kmalloc(sizeof(*history), GFP_ATOMIC);
+    if (history) {
+        memcpy(history, info, sizeof(*info)); // copy all fields
+        INIT_LIST_HEAD(&history->list);       // independent node
+
+        spin_lock(&list_lock);
+        list_add_tail(&history->list, &packet_list);
+        spin_unlock(&list_lock);
+    } else {
+        pr_warn("Failed to allocate history copy – skipping local log\n");
+    }
+    spin_lock(&list_lock);
+    list_add_tail(&info->list, &packet_list_sent);
+    spin_unlock(&list_lock);
+
+    // Send the info via the tcp connection to the server.
+    wake_up_interruptible(&packet_wq);
+    return true;
+}
+
 /**
  * Packet logging hook.
  */
@@ -512,9 +592,6 @@ static unsigned int packet_hook(void *priv, struct sk_buff *skb,
     struct udphdr *udp;
     struct packet_info *info;
 
-    bool allowed_ip = false;
-    bool allowed_port = false;
-
     if (!skb)
         return NF_ACCEPT;
 
@@ -523,16 +600,21 @@ static unsigned int packet_hook(void *priv, struct sk_buff *skb,
     if (!ip || skb->len < sizeof(struct iphdr))
         return NF_ACCEPT;
 
+    mutex_lock(&client_server_info_mutex);
+    const __be32 copy_server_ip = server_ip;
+    const u16 copy_server_port = server_port;
+    mutex_unlock(&client_server_info_mutex);
     // Skip if packet matches server IP and destination port.
-    if (server_ip != 0 && server_port != 0 && ip->saddr == server_ip) {
+    if (copy_server_ip != 0 && copy_server_port != 0 &&
+        ip->saddr == copy_server_ip) {
         if (ip->protocol == IPPROTO_TCP && skb_transport_header_was_set(skb)) {
             tcp = tcp_hdr(skb);
-            if (ntohs(tcp->dest) == server_port) {
+            if (ntohs(tcp->dest) == copy_server_port) {
                 return NF_ACCEPT;
             }
         } else if (ip->protocol == IPPROTO_UDP) {
             udp = udp_hdr(skb);
-            if (ntohs(udp->dest) == server_port) {
+            if (ntohs(udp->dest) == copy_server_port) {
                 return NF_ACCEPT;
             }
         }
@@ -578,9 +660,7 @@ static unsigned int packet_hook(void *priv, struct sk_buff *skb,
         info->dport = udp->dest;
     }
 
-    spin_lock(&list_lock);
-    list_add_tail(&info->list, &packet_list);
-    spin_unlock(&list_lock);
+    const bool added = add_log_if_necessary(info);
 
     /* In REACTIVE mode, only allow packets with daddr in allowed_ips
      and from the list of allowed ports.
@@ -588,22 +668,29 @@ static unsigned int packet_hook(void *priv, struct sk_buff *skb,
      not blocked; it will be a filtering before printing it.*/
     if (state == REACTIVE) {
         /* Check if source IP is known in allowed table */
-        allowed_ip = ip_is_in_allowed_table(ip->saddr);
+        bool allowed_ip = ip_is_in_allowed_table(ip->saddr);
 
         /* If the IP is known, check whether the destination port is allowed
          * (use host-order port for comparison). If the entry has port_count==0,
          * it means any port is allowed for that IP.
          */
+        bool allowed_port = false;
         if (ip->protocol == IPPROTO_TCP || ip->protocol == IPPROTO_UDP) {
             u16 dport_host = ntohs(info->dport);
             allowed_port = ip_allows_port(ip->saddr, dport_host);
         }
 
         if (!allowed_ip || !allowed_port) {
+            if (!added) {
+                kfree(info);
+            }
             return NF_DROP;
         }
     }
 
+    if (!added) {
+        kfree(info);
+    }
     return NF_ACCEPT;
 }
 
@@ -611,8 +698,6 @@ static unsigned int packet_hook(void *priv, struct sk_buff *skb,
 static int dbg_show(struct seq_file *m, void *v) {
     struct packet_info *info;
     struct logged_packet *lp;
-    bool in_allowed_ip_list = false;
-    bool in_allowed_port_list = false;
     struct logged_packet_key key = {0};
     struct logged_packet *existing;
 
@@ -624,22 +709,9 @@ static int dbg_show(struct seq_file *m, void *v) {
 
     spin_lock(&list_lock);
     list_for_each_entry(info, &packet_list, list) {
-
-        /* Check allowed map for IP and port */
-        in_allowed_ip_list = ip_is_in_allowed_table(info->saddr);
-        in_allowed_port_list = ip_allows_port(info->saddr, ntohs(info->dport));
-
-        /* In monitoring and reactive mode, react only if the packet
-        is not in the allowed list and in the list of allowed ports. */
-        if (in_allowed_ip_list && in_allowed_port_list &&
-            (state == MONITORING || state == REACTIVE))
+        if (!(should_log_packet(info))) {
             continue;
-
-        /* In listening, if it is not found in the list of allowed ip addr
-         and in the list of allowed ports to use, is ignored in the report. */
-        if ((!in_allowed_ip_list || !in_allowed_port_list) &&
-            state == LISTENING)
-            continue;
+        }
 
         key.saddr = info->saddr;
         key.daddr = info->daddr;
@@ -650,8 +722,12 @@ static int dbg_show(struct seq_file *m, void *v) {
         existing = rhashtable_lookup_fast(&logged_table, &key, logged_params);
         spin_unlock(&logged_lock);
 
-        if (!existing &&
-            !(server_ip == 0 && server_port == 0 && info->daddr == server_ip)) {
+        mutex_lock(&client_server_info_mutex);
+        const __be32 copy_server_ip = server_ip;
+        const u16 copy_server_port = server_port;
+        mutex_unlock(&client_server_info_mutex);
+        if (!existing && !(copy_server_ip == 0 && copy_server_port == 0 &&
+                           info->daddr == copy_server_ip)) {
             seq_printf(m,
                        "PROTO=%u TTL=%u LEN=%u IFACE=%s\n"
                        "SRC=%pI4 SPORT=%u DST=%pI4 DPORT=%u\n"
@@ -716,6 +792,245 @@ static const struct file_operations cfg_fops = {
     .read = cfg_read,
 };
 
+// ====================================================================================
+
+struct socket *conn_socket = NULL;
+static struct task_struct *client_thread;
+static atomic_t client_running = ATOMIC_INIT(0);
+static DEFINE_MUTEX(client_thread_mutex);
+#define SEND_BUF_SIZE 512
+
+static int tcp_client_send(struct socket *sock, const char *buf, size_t len,
+                           unsigned long flags) {
+    struct msghdr msg = {.msg_name = NULL,
+                         .msg_namelen = 0,
+                         .msg_control = NULL,
+                         .msg_controllen = 0,
+                         .msg_flags = flags};
+    struct kvec vec;
+    int written = 0;
+    int left = len;
+    int ret;
+
+    while (left > 0) {
+        vec.iov_base = (void *)(buf + written);
+        vec.iov_len = left;
+
+        ret = kernel_sendmsg(sock, &msg, &vec, 1, left);
+        if (ret < 0) {
+            if (ret == -ERESTARTSYS || (flags & MSG_DONTWAIT && ret == -EAGAIN))
+                continue; // retry on signal or would-block
+            pr_err("send failed: %d\n", ret);
+            return ret;
+        }
+
+        written += ret;
+        left -= ret;
+    }
+
+    return written;
+}
+
+//TODO: Not used rn
+static int tcp_client_receive(struct socket *sock, char *buf, size_t max_len,
+                              unsigned long flags) {
+    struct msghdr msg = {.msg_name = NULL,
+                         .msg_namelen = 0,
+                         .msg_control = NULL,
+                         .msg_controllen = 0,
+                         .msg_flags = flags};
+    struct kvec vec;
+    int ret;
+
+    vec.iov_base = buf;
+    vec.iov_len = max_len;
+
+    ret = kernel_recvmsg(sock, &msg, &vec, 1, max_len, flags);
+    if (ret < 0) {
+        if (ret == -EAGAIN || ret == -ERESTARTSYS)
+            return -EAGAIN; // caller can retry
+        pr_err("recv failed: %d\n", ret);
+        return ret;
+    }
+
+    if (ret < max_len)
+        buf[ret] = '\0'; // null-terminate if string
+
+    return ret;
+}
+
+static int tcp_client_thread(void *arg) {
+    mutex_lock(&client_server_info_mutex);
+    const __be32 copy_server_ip = server_ip;
+    const u16 copy_server_port = server_port;
+    mutex_unlock(&client_server_info_mutex);
+
+    if (copy_server_ip == 0 || copy_server_port == 0) {
+        atomic_set(&client_running, 0);
+        return -1;
+    }
+    struct sockaddr_in saddr;
+    int ret;
+
+    allow_signal(SIGTERM); // optional: allow kthread_stop to interrupt us
+
+    pr_info("client thread started\n");
+
+    ret = sock_create(PF_INET, SOCK_STREAM, IPPROTO_TCP, &conn_socket);
+    if (ret < 0) {
+        pr_err("sock_create failed: %d\n", ret);
+        goto out;
+    }
+
+    memset(&saddr, 0, sizeof(saddr));
+    saddr.sin_family = AF_INET;
+    saddr.sin_port = htons(copy_server_port);
+    saddr.sin_addr.s_addr = copy_server_ip;
+
+    conn_socket->sk->sk_rcvtimeo = msecs_to_jiffies(6000);
+    conn_socket->sk->sk_sndtimeo = msecs_to_jiffies(6000);
+
+    ret = conn_socket->ops->connect(conn_socket, (struct sockaddr *)&saddr,
+                                    sizeof(saddr), 0);
+
+    if (ret && ret != -EINPROGRESS) {
+        pr_err("connect failed immediately: %d\n", ret);
+        goto out_sock;
+    }
+
+    if (ret == -EINPROGRESS) {
+        long timeout;
+
+        timeout = wait_event_interruptible_timeout(
+            conn_socket->sk->sk_wq->wait,
+            conn_socket->sk->sk_state != TCP_SYN_SENT || kthread_should_stop(),
+            msecs_to_jiffies(3000));
+
+        if (kthread_should_stop()) {
+            pr_info("connect aborted due to thread stop\n");
+            goto out_sock;
+        }
+        if (timeout <= 0) {
+            pr_err("connect timeout\n");
+            goto out_sock;
+        }
+
+        if (conn_socket->sk->sk_state != TCP_ESTABLISHED) {
+            pr_err("connect failed, state=%d\n", conn_socket->sk->sk_state);
+            goto out_sock;
+        }
+    }
+
+    pr_info("connected to server\n");
+
+    // Main loop – example: send once, receive once, then idle/sleep
+    while (!kthread_should_stop()) {
+        // Wait until there's something to send or timeout
+        wait_event_interruptible_timeout(packet_wq, kthread_should_stop(),
+                                         msecs_to_jiffies(5000));
+
+        if (kthread_should_stop())
+            break;
+
+        struct packet_info *info, *tmp;
+        LIST_HEAD(local_list);
+        char send_buf[SEND_BUF_SIZE];
+        int sent_count = 0;
+
+        // Grab everything currently in the list (no filtering)
+        spin_lock_bh(&list_lock);
+        list_splice_init(&packet_list_sent,
+                         &local_list); // atomic move of whole list
+        spin_unlock_bh(&list_lock);
+
+        // Send each one
+        list_for_each_entry_safe(info, tmp, &local_list, list) {
+            int len;
+
+            // Use scnprintf (safer than snprintf in kernel) — same format as in
+            // dbg_show
+            len = scnprintf(send_buf, sizeof(send_buf),
+                            "PROTO=%u TTL=%u LEN=%u IFACE=%s\n"
+                            "SRC=%pI4 SPORT=%u DST=%pI4 DPORT=%u\n"
+                            "SRC_MAC=%pM DST_MAC=%pM TCP_FLAGS=%02x\n\n",
+                            info->protocol, info->ttl, info->total_len,
+                            info->indev, &info->saddr, ntohs(info->sport),
+                            &info->daddr, ntohs(info->dport), info->src_mac,
+                            info->dst_mac, info->tcp_flags);
+
+            if (len <= 0 || len >= sizeof(send_buf)) {
+                pr_warn("format buffer too small or error\n");
+                list_del(&info->list);
+                kfree(info);
+                continue;
+            }
+
+            int sent = tcp_client_send(conn_socket, send_buf, len, 0);
+            if (sent == len) {
+                sent_count++;
+                list_del(&info->list);
+                kfree(info);
+            } else {
+                list_move_tail(&info->list, &packet_list_sent);
+                pr_warn("send failed (%d/%d bytes), retry later\n", sent, len);
+                // Optional: break;   // stop this batch if connection is broken
+            }
+        }
+
+        if (sent_count > 0)
+            pr_info("tcp-client: sent %d packet log entries\n", sent_count);
+    }
+
+out_sock:
+    if (conn_socket)
+        sock_release(conn_socket);
+    conn_socket = NULL;
+
+out:
+    atomic_set(&client_running, 0);
+    pr_info("client thread exiting\n");
+    return 0;
+}
+
+static void restart_client_thread_if_needed(void) {
+    mutex_lock(&client_server_info_mutex);
+    const __be32 copy_server_ip = server_ip;
+    const u16 copy_server_port = server_port;
+
+    if (copy_server_ip == prev_server_ip &&
+        copy_server_port == prev_server_port) {
+        mutex_unlock(&client_server_info_mutex);
+        return;
+    }
+
+    pr_info("Server config changed → restarting client thread\n");
+
+    prev_server_ip = copy_server_ip;
+    prev_server_port = copy_server_port;
+
+    mutex_unlock(&client_server_info_mutex);
+    /* Stop old thread */
+    mutex_lock(&client_thread_mutex);
+    if (atomic_read(&client_running)) {
+        kthread_stop(client_thread);
+        atomic_set(&client_running, 0);
+    }
+
+    /* Start new thread ONLY if config is valid */
+    if (copy_server_ip != 0 && copy_server_port != 0) {
+        client_thread = kthread_run(tcp_client_thread, NULL, "tcp-client");
+        if (IS_ERR(client_thread)) {
+            pr_err("Failed to restart client thread: %ld\n",
+                   PTR_ERR(client_thread));
+            atomic_set(&client_running, 0);
+        } else {
+            atomic_set(&client_running, 1);
+            pr_info("Client thread restarted\n");
+        }
+    }
+    mutex_unlock(&client_thread_mutex);
+}
+
 /**
  * Module init/exit.
  */
@@ -762,11 +1077,22 @@ static void __exit mynetfilter_exit(void) {
     nf_unregister_net_hook(&init_net, &netfilter_ops);
     debugfs_remove(dbg_file);
     del_timer_sync(&config_timer);
+    cancel_work_sync(&config_work);
     free_packet_list();
+    free_packet_list_sent();
+
     /* free allowed_table entries */
     spin_lock(&allowed_lock);
     rhashtable_free_and_destroy(&allowed_table, allowed_free_fn, NULL);
     spin_unlock(&allowed_lock);
+
+    mutex_lock(&client_server_info_mutex);
+    if (atomic_read(&client_running)) {
+        kthread_stop(client_thread);
+        atomic_set(&client_running, 0);
+    }
+    mutex_unlock(&client_server_info_mutex);
+
     pr_info("Netfilter module unloaded\n");
 }
 
