@@ -2,26 +2,26 @@
 #define TCP_LOG_RECEIVER_H
 
 #include <atomic>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
-#include <mutex>
 
 // Forward declaration so we can use the same struct
 struct ConnectionEvent;
 
 class TcpLogReceiver {
-public:
+  public:
     TcpLogReceiver();
     ~TcpLogReceiver();
 
-    void start();           // starts listener + parser threads
-    void stop();            // clean shutdown
+    void start(); // starts listener + parser threads
+    void stop();  // clean shutdown
 
-    // Optional: get the last N lines of raw received data (for a new "Incoming Logs" tab)
+    // TODO: Not used rn: get the last N lines of raw received data (for a new "Incoming Logs" tab)
     std::string get_recent_raw_logs(size_t max_lines = 500) const;
 
-private:
+  private:
     void listener_thread_func();
     void parser_thread_func();
 
@@ -32,11 +32,11 @@ private:
 
     // Thread-safe queue for raw data coming from sockets
     std::vector<std::string> raw_queue;
-    mutable std::mutex       queue_mutex;
+    mutable std::mutex queue_mutex;
 
     // Very simple circular raw log buffer for UI
-    std::string              raw_log_buffer;
-    mutable std::mutex       raw_log_mutex;
+    std::string raw_log_buffer;
+    mutable std::mutex raw_log_mutex;
 };
 
 extern TcpLogReceiver g_tcp_log_receiver;

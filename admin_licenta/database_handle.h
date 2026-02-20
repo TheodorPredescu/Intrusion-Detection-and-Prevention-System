@@ -33,7 +33,6 @@ class NetworkLogDatabase {
     std::string db_path;
 
     bool exec_no_callback(const char *sql);
-    bool table_exists(const std::string &table_name);
 
   public:
     explicit NetworkLogDatabase(const std::string &path = "network_logs.db");
@@ -51,7 +50,7 @@ class NetworkLogDatabase {
     bool update_allowed_ips(int pc_db_id,
                             const std::set<std::string> &allowed_ips);
 
-    // Optional – for debugging / exporting
+    // TODO: Not used rn – for debugging / exporting
     void export_recent_to_csv(const std::string &filename,
                               int limit = 50000) const;
 };

@@ -1,6 +1,5 @@
 #include "tcp_log_receiver.h"
 #include "database_handle.h"
-#include "shared_network_types.h"
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <iostream>
@@ -12,7 +11,9 @@
 TcpLogReceiver g_tcp_log_receiver;
 
 TcpLogReceiver::TcpLogReceiver() = default;
-TcpLogReceiver::~TcpLogReceiver() { stop(); }
+TcpLogReceiver::~TcpLogReceiver() {
+    stop();
+}
 
 void TcpLogReceiver::start() {
     if (running)
@@ -53,8 +54,7 @@ void TcpLogReceiver::listener_thread_func() {
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(1234);
 
-    if (bind(server_fd, (sockaddr *)&addr, sizeof(addr)) < 0 ||
-        listen(server_fd, 8) < 0) {
+    if (bind(server_fd, (sockaddr *)&addr, sizeof(addr)) < 0 || listen(server_fd, 8) < 0) {
         std::cerr << "[TCP-LOG] bind/listen failed on port 1234\n";
         close(server_fd);
         return;
@@ -163,8 +163,7 @@ void TcpLogReceiver::parser_thread_func() {
             event.is_allowed = false;
 
             // Lambda to extract string values
-            auto extract_field =
-                [&line](const std::string &key) -> std::string {
+            auto extract_field = [&line](const std::string &key) -> std::string {
                 size_t pos = line.find(key + "=");
                 if (pos == std::string::npos)
                     return "";
@@ -176,16 +175,13 @@ void TcpLogReceiver::parser_thread_func() {
             };
 
             // Lambda to extract integer values
-            auto extract_int = [&line](const std::string &key,
-                                       int default_val = 0) -> int {
+            auto extract_int = [&line](const std::string &key, int default_val = 0) -> int {
                 size_t pos = line.find(key + "=");
                 if (pos == std::string::npos)
                     return default_val;
                 size_t start = pos + key.length() + 1;
                 size_t end = line.find(' ', start);
-                std::string val = (end == std::string::npos)
-                                      ? line.substr(start)
-                                      : line.substr(start, end - start);
+                std::string val = (end == std::string::npos) ? line.substr(start) : line.substr(start, end - start);
                 try {
                     return std::stoi(val);
                 } catch (...) {

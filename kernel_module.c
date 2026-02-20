@@ -62,9 +62,6 @@ struct logged_packet_key {
     __be32 saddr;
     __be32 daddr;
     __be16 dport;
-
-    // Exclude the source (client) port.
-    // __be16 sport;
 };
 
 struct logged_packet {
@@ -79,9 +76,8 @@ static struct rhashtable_params logged_params = {
     .nelem_hint = 64, // Initial hint for number of elements
     .key_len = sizeof(struct logged_packet_key),
     .key_offset = offsetof(struct logged_packet, key),
-    .head_offset =
-        offsetof(struct logged_packet, node), // Required for rhashtable
-    .hashfn = jhash, // Use jhash as the default hash function
+    .head_offset = offsetof(struct logged_packet, node), // Required for rhashtable
+    .hashfn = jhash,                                     // Use jhash as the default hash function
 };
 
 static LIST_HEAD(packet_list);
@@ -132,14 +128,42 @@ static DEFINE_MUTEX(client_server_info_mutex);
 static DECLARE_WAIT_QUEUE_HEAD(packet_wq);
 static LIST_HEAD(packet_list_sent);
 
+static DEFINE_SPINLOCK(allowed_lock);
+// ============================================================
+
+struct socket *conn_socket = NULL;
+static struct task_struct *client_thread;
+static atomic_t client_running = ATOMIC_INIT(0);
+static DEFINE_MUTEX(client_thread_mutex);
+#define SEND_BUF_SIZE 512
+// ============================================================
+#define MAX_SUPPORT_VECTORS 10000
+#define NUM_FEATURES 6
+#define SCALE 1000000      /* 6 decimal places */
+typedef s64 fixed_point_t; /* 64-bit fixed point */
+
+struct SVMModel {
+    s64 scaler_mean[NUM_FEATURES];
+    s64 scaler_std[NUM_FEATURES];
+    s64 offset;
+    int num_support_vectors;
+    s64 support_vectors[MAX_SUPPORT_VECTORS][NUM_FEATURES];
+    s64 dual_coefficients[MAX_SUPPORT_VECTORS];
+    bool loaded;
+};
+
+static struct SVMModel svm_model = {0};
+static DEFINE_SPINLOCK(svm_model_lock);
+static struct timespec64 last_mtime_model_file;
+static char *model_bin_path = "/etc/model.bin";
+// I do not have floats here, so I transform in int and then devide by `SCALE`
+
 /**
  * To clear the table for logged information.
  */
 static void rht_free_fn(void *head, void *arg) {
     kfree(container_of(head, struct logged_packet, node));
 }
-
-static DEFINE_SPINLOCK(allowed_lock);
 
 static void allowed_free_fn(void *head, void *arg) {
     kfree(container_of(head, struct allowed_entry, node));
@@ -223,8 +247,7 @@ static bool should_log_packet(const struct packet_info *info) {
     bool in_allowed_port_list = ip_allows_port(info->saddr, ntohs(info->dport));
 
     // Same as dbg_show
-    if (in_allowed_ip_list && in_allowed_port_list &&
-        (state == MONITORING || state == REACTIVE))
+    if (in_allowed_ip_list && in_allowed_port_list && (state == MONITORING || state == REACTIVE))
         return false;
 
     if ((!in_allowed_ip_list || !in_allowed_port_list) && state == LISTENING)
@@ -260,8 +283,7 @@ static int load_allowed_file(void) {
 
     filp = filp_open(allowed_file_path, O_RDWR | O_CREAT, 0666);
     if (IS_ERR(filp)) {
-        pr_err("Failed to open allowed file: %s (%ld)\n", allowed_file_path,
-               PTR_ERR(filp));
+        pr_err("Failed to open allowed file: %s (%ld)\n", allowed_file_path, PTR_ERR(filp));
         return PTR_ERR(filp);
     }
 
@@ -315,8 +337,7 @@ static int load_allowed_file(void) {
                 char *ports_str = colon + 1;
                 /* Read the port as a string. */
                 char *tok;
-                while ((tok = strsep(&ports_str, ",")) != NULL &&
-                       ent->port_count < MAX_ALLOWED_DEFINITION_FILE) {
+                while ((tok = strsep(&ports_str, ",")) != NULL && ent->port_count < MAX_ALLOWED_DEFINITION_FILE) {
                     u16 p = 0;
                     /* Try to transform it to a u16. On success, add the port.*/
                     if (sscanf(tok, "%hu", &p) == 1) {
@@ -325,15 +346,13 @@ static int load_allowed_file(void) {
                 }
 
                 spin_lock(&allowed_lock);
-                if (rhashtable_insert_fast(&allowed_table, &ent->node,
-                                           allowed_params) == 0)
+                if (rhashtable_insert_fast(&allowed_table, &ent->node, allowed_params) == 0)
                     allowed_entry_count++;
                 spin_unlock(&allowed_lock);
                 pr_info("added ip %pI4 with %d ports", &ip, ent->port_count);
             }
         } else {
-            if (tmp_ip_count < MAX_ALLOWED_DEFINITION_FILE &&
-                sscanf(line, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
+            if (tmp_ip_count < MAX_ALLOWED_DEFINITION_FILE && sscanf(line, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
                 ip = htonl((a << 24) | (b << 16) | (c << 8) | d);
                 tmp_ips[tmp_ip_count++] = ip;
                 pr_info("queued ip %pI4", &ip);
@@ -360,12 +379,10 @@ static int load_allowed_file(void) {
             ent->port_count = 0; /* means any port allowed for this IP */
         }
         spin_lock(&allowed_lock);
-        if (rhashtable_insert_fast(&allowed_table, &ent->node,
-                                   allowed_params) == 0)
+        if (rhashtable_insert_fast(&allowed_table, &ent->node, allowed_params) == 0)
             allowed_entry_count++;
         spin_unlock(&allowed_lock);
-        pr_info("added queued ip %pI4 with %d ports", &ent->ip,
-                ent->port_count);
+        pr_info("added queued ip %pI4 with %d ports", &ent->ip, ent->port_count);
     }
 
     /* print entries in allowed_table for inspection */
@@ -409,8 +426,7 @@ static ssize_t load_config_from_file(void) {
     filp = filp_open(CONFIG_FILE_PATH, O_RDONLY, 0);
 
     if (IS_ERR(filp)) {
-        pr_err("Failed to open or create config file: -%s- (%ld)\n",
-               CONFIG_FILE_PATH, PTR_ERR(filp));
+        pr_err("Failed to open or create config file: -%s- (%ld)\n", CONFIG_FILE_PATH, PTR_ERR(filp));
         return PTR_ERR(filp);
     }
 
@@ -423,8 +439,7 @@ static ssize_t load_config_from_file(void) {
     }
 
     config_buf[bytes] = '\0';
-    pr_info("Config loaded -%s-(%zd bytes):\n%s", CONFIG_FILE_PATH, bytes,
-            config_buf);
+    pr_info("Config loaded -%s-(%zd bytes):\n%s", CONFIG_FILE_PATH, bytes, config_buf);
 
     // Reset allowed_file_path.
     strcpy(allowed_file_path, "\0");
@@ -469,14 +484,140 @@ static ssize_t load_config_from_file(void) {
     return bytes;
 }
 
+// ========================================================
+// Section for loading weights for anomaly detection
+// ========================================================
+static int load_model_binary(void) {
+    struct file *filp;
+    loff_t pos = 0;
+    int i, j;
+    u32 num_features, num_vectors;
+    union {
+        u8 bytes[8];
+        s64 as_s64;
+    } converter;
+
+    filp = filp_open(model_bin_path, O_RDONLY, 0);
+    if (IS_ERR(filp))
+        return -1;
+
+    kernel_read(filp, &num_features, sizeof(u32), &pos);
+    if (num_features != NUM_FEATURES) {
+        filp_close(filp, NULL);
+        return -1;
+    }
+
+    /* Read scaler means (8 bytes, interpret as double) */
+    for (i = 0; i < NUM_FEATURES; i++) {
+        kernel_read(filp, converter.bytes, 8, &pos);
+        svm_model.scaler_mean[i] = converter.as_s64;
+    }
+
+    for (i = 0; i < NUM_FEATURES; i++) {
+        kernel_read(filp, converter.bytes, 8, &pos);
+        svm_model.scaler_std[i] = converter.as_s64;
+    }
+
+    kernel_read(filp, converter.bytes, 8, &pos);
+    svm_model.offset = converter.as_s64;
+
+    kernel_read(filp, &num_vectors, sizeof(u32), &pos);
+    if (num_vectors > MAX_SUPPORT_VECTORS) {
+        filp_close(filp, NULL);
+        return -1;
+    }
+
+    svm_model.num_support_vectors = num_vectors;
+
+    for (i = 0; i < num_vectors; i++) {
+        for (j = 0; j < NUM_FEATURES; j++) {
+            kernel_read(filp, converter.bytes, 8, &pos);
+            svm_model.support_vectors[i][j] = converter.as_s64;
+        }
+    }
+
+    for (i = 0; i < num_vectors; i++) {
+        kernel_read(filp, converter.bytes, 8, &pos);
+        svm_model.dual_coefficients[i] = converter.as_s64;
+    }
+
+    filp_close(filp, NULL);
+    pr_info("SVM Model loaded: %d support vectors\n", num_vectors);
+    return 0;
+}
+
+/* Better exp approximation using Taylor series */
+static s64 exp_approx_fixed(s64 x_unscaled) {
+    /* Input: unscaled exponent (e.g., -0.5, -2, -5)
+       Output: scaled result (e.g., 0.6*SCALE, 0.13*SCALE, 0.0067*SCALE) */
+
+    if (x_unscaled >= 0)
+        return SCALE; /* e^0 = 1.0 */
+    if (x_unscaled < -10)
+        return 0; /* e^-10 ≈ 0 */
+
+    /* Approximate: e^x ≈ 1 / (1 - x + x²/2) for small x */
+    s64 x2 = (x_unscaled * x_unscaled) / 2;
+    s64 denom = SCALE - (x_unscaled * SCALE) + x2;
+
+    if (denom <= 0)
+        return 0;
+
+    return (u64)SCALE * SCALE / denom;
+}
+
+static s64 rbf_kernel_fixed(s64 *x1, s64 *x2, s64 gamma) {
+    s64 dist = 0;
+    int i;
+    for (i = 0; i < NUM_FEATURES; i++) {
+        s64 diff = (x1[i] - x2[i]) / SCALE;
+        dist += (diff * diff);
+    }
+    /* Pass unscaled exponent: -gamma * dist / SCALE */
+    s64 exponent = -(gamma / SCALE) * dist; /* This is unscaled now */
+    return exp_approx_fixed(exponent);
+}
+
+static int predict_anomaly(int sport, int dport, int protocol, int ttl, int total_len, int tcp_flags) {
+    s64 features[NUM_FEATURES];
+    s64 decision = 0;
+    int i;
+    s64 gamma = SCALE / NUM_FEATURES; /* Scaled gamma */
+
+    /* Normalize: (x - mean) / std, then scale */
+    features[0] = ((((s64)sport * SCALE) - svm_model.scaler_mean[0]) / svm_model.scaler_std[0]) * SCALE;
+    features[1] = ((((s64)dport * SCALE) - svm_model.scaler_mean[1]) / svm_model.scaler_std[1]) * SCALE;
+    features[2] = ((((s64)protocol * SCALE) - svm_model.scaler_mean[2]) / svm_model.scaler_std[2]) * SCALE;
+    features[3] = ((((s64)ttl * SCALE) - svm_model.scaler_mean[3]) / svm_model.scaler_std[3]) * SCALE;
+    features[4] = ((((s64)total_len * SCALE) - svm_model.scaler_mean[4]) / svm_model.scaler_std[4]) * SCALE;
+    features[5] = ((((s64)tcp_flags * SCALE) - svm_model.scaler_mean[5]) / svm_model.scaler_std[5]) * SCALE;
+
+    spin_lock(&svm_model_lock);
+
+    if (!svm_model.loaded || svm_model.num_support_vectors == 0) {
+        spin_unlock(&svm_model_lock);
+        return 1;
+    }
+
+    for (i = 0; i < svm_model.num_support_vectors; i++) {
+        s64 kernel_val = rbf_kernel_fixed(features, svm_model.support_vectors[i], gamma);
+        decision += (svm_model.dual_coefficients[i] * kernel_val) / SCALE;
+    }
+
+    decision += svm_model.offset;
+    spin_unlock(&svm_model_lock);
+
+    return (decision < 0) ? -1 : 1;
+}
+// ========================================================
+
 /** Workque for safer repetitive reading from a file. */
 static void config_work_func(struct work_struct *work);
 static DECLARE_WORK(config_work, config_work_func);
 
 static void config_timer_callback(struct timer_list *unused) {
     schedule_work(&config_work); // defer to process context
-    mod_timer(&config_timer,
-              jiffies + msecs_to_jiffies(CONFIG_POLL_INTERVAL_MS));
+    mod_timer(&config_timer, jiffies + msecs_to_jiffies(CONFIG_POLL_INTERVAL_MS));
 }
 
 static void restart_client_thread_if_needed(void);
@@ -493,8 +634,7 @@ static void config_work_func(struct work_struct *work) {
     // Check config file last modification.
     filp = filp_open(CONFIG_FILE_PATH, O_RDONLY, 0);
     if (IS_ERR(filp)) {
-        pr_err("Failed to open config file: %s (%ld)\n", CONFIG_FILE_PATH,
-               PTR_ERR(filp));
+        pr_err("Failed to open config file: %s (%ld)\n", CONFIG_FILE_PATH, PTR_ERR(filp));
         return;
     }
 
@@ -503,8 +643,7 @@ static void config_work_func(struct work_struct *work) {
     // current_mtime_config_file = file_inode(filp)->i_mtime;
     filp_close(filp, NULL);
 
-    if (timespec64_compare(&current_mtime_config_file,
-                           &last_mtime_config_file) != 0) {
+    if (timespec64_compare(&current_mtime_config_file, &last_mtime_config_file) != 0) {
         pr_info("Config file modification detected, reloading...\n");
         ret = load_config_from_file();
         pr_info("Config file modification response: %ld\n", ret);
@@ -517,13 +656,15 @@ static void config_work_func(struct work_struct *work) {
         }
     }
 
+    // ____________________________________________
     if (allowed_file_path[0] == '\0') {
         return;
     }
+
     filp = filp_open(allowed_file_path, O_RDWR | O_CREAT, 0644);
+
     if (IS_ERR(filp)) {
-        pr_err("Failed to open allowed file: %256s (%ld)\n", allowed_file_path,
-               PTR_ERR(filp));
+        pr_err("Failed to open allowed file: %256s (%ld)\n", allowed_file_path, PTR_ERR(filp));
         return;
     }
 
@@ -532,8 +673,7 @@ static void config_work_func(struct work_struct *work) {
     // current_mtime_allowed_file = file_inode(filp)->i_mtime;
     filp_close(filp, NULL);
 
-    if (timespec64_compare(&current_mtime_allowed_file,
-                           &last_mtime_allowed_file) != 0) {
+    if (timespec64_compare(&current_mtime_allowed_file, &last_mtime_allowed_file) != 0) {
         pr_info("Config allowed modification detected, reloading...\n");
         update_allowed_file = true;
     }
@@ -542,6 +682,29 @@ static void config_work_func(struct work_struct *work) {
         ret = load_allowed_file();
         if (ret >= 0) {
             last_mtime_allowed_file = current_mtime_allowed_file;
+        }
+    }
+
+    // ____________________________________________
+    struct timespec64 current_mtime_model_file;
+
+    filp = filp_open(model_bin_path, O_RDONLY, 0);
+    if (!IS_ERR(filp)) {
+        current_mtime_model_file = inode_get_mtime(file_inode(filp));
+        filp_close(filp, NULL);
+
+        if (timespec64_compare(&current_mtime_model_file, &last_mtime_model_file) != 0) {
+            pr_info("Model file modification detected, reloading...\n");
+
+            spin_lock(&svm_model_lock);
+            if (load_model_binary() == 0) {
+                svm_model.loaded = true;
+                last_mtime_model_file = current_mtime_model_file;
+                pr_info("Model reloaded successfully\n");
+            } else {
+                pr_err("Failed to load model\n");
+            }
+            spin_unlock(&svm_model_lock);
         }
     }
 }
@@ -584,8 +747,7 @@ static bool add_log_if_necessary(struct packet_info *info) {
 /**
  * Packet logging hook.
  */
-static unsigned int packet_hook(void *priv, struct sk_buff *skb,
-                                const struct nf_hook_state *hook_state) {
+static unsigned int packet_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *hook_state) {
     struct ethhdr *eth;
     struct iphdr *ip;
     struct tcphdr *tcp;
@@ -605,8 +767,7 @@ static unsigned int packet_hook(void *priv, struct sk_buff *skb,
     const u16 copy_server_port = server_port;
     mutex_unlock(&client_server_info_mutex);
     // Skip if packet matches server IP and destination port.
-    if (copy_server_ip != 0 && copy_server_port != 0 &&
-        ip->saddr == copy_server_ip) {
+    if (copy_server_ip != 0 && copy_server_port != 0 && ip->saddr == copy_server_ip) {
         if (ip->protocol == IPPROTO_TCP && skb_transport_header_was_set(skb)) {
             tcp = tcp_hdr(skb);
             if (ntohs(tcp->dest) == copy_server_port) {
@@ -652,8 +813,8 @@ static unsigned int packet_hook(void *priv, struct sk_buff *skb,
         tcp = tcp_hdr(skb);
         info->sport = tcp->source;
         info->dport = tcp->dest;
-        info->tcp_flags = (tcp->fin << 0) | (tcp->syn << 1) | (tcp->rst << 2) |
-                          (tcp->psh << 3) | (tcp->ack << 4) | (tcp->urg << 5);
+        info->tcp_flags =
+            (tcp->fin << 0) | (tcp->syn << 1) | (tcp->rst << 2) | (tcp->psh << 3) | (tcp->ack << 4) | (tcp->urg << 5);
     } else if (ip->protocol == IPPROTO_UDP) {
         udp = udp_hdr(skb);
         info->sport = udp->source;
@@ -662,11 +823,15 @@ static unsigned int packet_hook(void *priv, struct sk_buff *skb,
 
     const bool added = add_log_if_necessary(info);
 
+    // TODO: The logic here is just bad. I need to make a decision and just stick with it - I combine monitoring and
+    // listening and in some case I do nothing where I sould.
+
     /* In REACTIVE mode, only allow packets with daddr in allowed_ips
      and from the list of allowed ports.
      In the packet list will be packets that are also packets that are
      not blocked; it will be a filtering before printing it.*/
-    if (state == REACTIVE) {
+    if (state == REACTIVE || state == LISTENING) {
+        bool should_drop = true;
         /* Check if source IP is known in allowed table */
         bool allowed_ip = ip_is_in_allowed_table(ip->saddr);
 
@@ -680,7 +845,87 @@ static unsigned int packet_hook(void *priv, struct sk_buff *skb,
             allowed_port = ip_allows_port(ip->saddr, dport_host);
         }
 
-        if (!allowed_ip || !allowed_port) {
+        if (allowed_ip && allowed_port) {
+            should_drop = false;
+        }
+
+        if (should_drop && svm_model.loaded) {
+            int prediction = predict_anomaly(ntohs(info->sport), ntohs(info->dport), info->protocol, info->ttl,
+                                             info->total_len, info->tcp_flags);
+            const int is_anomaly = (prediction == -1) ? 1 : 0;
+
+            if (is_anomaly) {
+                pr_info("ANOMALY: SRC=%pI4 DPORT=%u\n", &info->saddr, ntohs(info->dport));
+                should_drop = false;
+            }
+        }
+
+        if (!added) {
+            kfree(info);
+        }
+
+        if (state == REACTIVE) {
+            return should_drop ? NF_DROP : NF_ACCEPT;
+        }
+    }
+    // Diferența dintre **Listening** și **Monitoring** este subtilă, dar importantă — ea ține de când și ce se trimite
+    // către server și de cât de mult trafic/loguri generează modulul.
+    //
+    // NOTE: Deci in mare Monitoring este cazul general (orice conexiune), si listening orice conexiune care nu apare in
+    // allowed.
+
+    // Hai să le punem clar față în față, pe baza descrierii tale:
+
+    //|Aspect                |Listening                             |Monitoring                                     |
+    //|----------------------|--------------------------------------|-----------------------------------------------|
+    //|Scop principal        |Ascultă doar conexiunile noi/nepermise|Monitorizează toate conexiunile (permise și nu)|
+    //|Ce se trimite la      |Doar conexiunile care NU sunt în      |Toate conexiunile care NU sunt identice |
+    //   server              |fișierul allowed                      |cu cele stocate
+    //|Când se trimite       |Numai la conexiune nouă sau nepermisă |Când apare o conexiune care diferă (nou IP/port)|
+    //|Excludere duplicate   |Exclude portul clientului + conexiuni |Exclude doar conexiunile exact identice     |
+    //                       |repetitive
+    //|Cantitate date trimise|Mult mai puține (doar                 |Mai multe (orice variație minoră declanșează)|
+    //                       | excepțiile/nepermisele)
+    //|Util când vrei...     |Detecție rapidă a activităților|Imagine completă și actualizată a tuturor conexiunilor |
+    //                       |neașteptate/atacuri
+    //|Exemplu concret       |PC nou → port nepermis = trimite imediat|PC existent → nou port permis = trimite noua info
+
+    // Exemple practice (presupunem allowed: 192.168.1.100:80,443)
+
+    //| Situație pe client                              | Listening ce face?          | Monitoring ce face?          |
+    //|-------------------------------------------------|-----------------------------|------------------------------|
+    //| 192.168.1.50:12345 → 8.8.8.8:53 (DNS)           | Trimite (nu e în allowed)   | Trimite (nu era cunoscută)   |
+    //| A doua conexiune identică                       | NU trimite (duplicat)       | NU trimite (identic)         |
+    //| 192.168.1.100:54321 → 8.8.8.8:80 (permis)       | NU trimite (permis)         | Trimite (nou port sursă)     |
+    //| A doua conexiune același IP și port sursă       | NU trimite                  | NU trimite (acum identic)    |
+    //| 192.168.1.100:54322 → 8.8.8.8:443 (alt port)    | NU trimite (permis)         | Trimite (alt port sursă)     |
+
+    // Pe scurt – diferența cheie:
+    // • Listening = „Spune-mi doar când apare ceva suspect / nou / nepermis”
+    //   → Focus pe securitate și detecție rapidă a anomaliilor
+    //   → Trimite puține date, doar excepțiile
+
+    // • Monitoring = „Ține-mă la curent cu toate conexiunile noi sau care se schimbă”
+    //   → Focus pe vizibilitate completă și actualizare continuă a hărții de rețea
+    //   → Trimite mai multe date, orice variație declanșează transmitere
+
+    // Când alegi unul sau altul?
+    // • Alege Listening dacă vrei să economisești bandă și să detectezi rapid conexiuni neașteptate/periculoase.
+    // • Alege Monitoring dacă ai nevoie de o imagine completă și actualizată a traficului (analiză, topologie,
+    // pattern-uri).
+
+    // În modul Reactive se combină comportamentul de Monitoring cu blocarea automată a celor nepermise.
+
+    // Sper că acum e clar! Dacă vrei un exemplu concret cu flux real, spune-mi. 😊
+    //  TODO:
+    int is_anomaly = 0;
+    if ((state == REACTIVE || state == LISTENING) && svm_model.loaded) {
+        int prediction = predict_anomaly(ntohs(info->sport), ntohs(info->dport), info->protocol, info->ttl,
+                                         info->total_len, info->tcp_flags);
+        is_anomaly = (prediction == -1) ? 1 : 0;
+
+        if (is_anomaly) {
+            pr_info("ANOMALY: SRC=%pI4 DPORT=%u\n", &info->saddr, ntohs(info->dport));
             if (!added) {
                 kfree(info);
             }
@@ -726,16 +971,13 @@ static int dbg_show(struct seq_file *m, void *v) {
         const __be32 copy_server_ip = server_ip;
         const u16 copy_server_port = server_port;
         mutex_unlock(&client_server_info_mutex);
-        if (!existing && !(copy_server_ip == 0 && copy_server_port == 0 &&
-                           info->daddr == copy_server_ip)) {
+        if (!existing && !(copy_server_ip == 0 && copy_server_port == 0 && info->daddr == copy_server_ip)) {
             seq_printf(m,
                        "PROTO=%u TTL=%u LEN=%u IFACE=%s\n"
                        "SRC=%pI4 SPORT=%u DST=%pI4 DPORT=%u\n"
                        "SRC_MAC=%pM DST_MAC=%pM TCP_FLAGS=%02x\n\n",
-                       info->protocol, info->ttl, info->total_len, info->indev,
-                       &info->saddr, ntohs(info->sport), &info->daddr,
-                       ntohs(info->dport), info->src_mac, info->dst_mac,
-                       info->tcp_flags);
+                       info->protocol, info->ttl, info->total_len, info->indev, &info->saddr, ntohs(info->sport),
+                       &info->daddr, ntohs(info->dport), info->src_mac, info->dst_mac, info->tcp_flags);
 
             lp = kmalloc(sizeof(*lp), GFP_ATOMIC);
             if (lp) {
@@ -773,8 +1015,7 @@ static const struct file_operations dbg_fops = {
 /**
  *  Config file read (trigger reload from disk).
  */
-static ssize_t cfg_read(struct file *file, char __user *buf, size_t count,
-                        loff_t *ppos) {
+static ssize_t cfg_read(struct file *file, char __user *buf, size_t count, loff_t *ppos) {
     ssize_t ret;
 
     /* reload into global config_buf */
@@ -783,8 +1024,7 @@ static ssize_t cfg_read(struct file *file, char __user *buf, size_t count,
         return ret;
 
     /* present the buffer to userspace via seq-like simple helper */
-    return simple_read_from_buffer(buf, count, ppos, config_buf,
-                                   strlen(config_buf));
+    return simple_read_from_buffer(buf, count, ppos, config_buf, strlen(config_buf));
 }
 
 static const struct file_operations cfg_fops = {
@@ -793,20 +1033,9 @@ static const struct file_operations cfg_fops = {
 };
 
 // ====================================================================================
-
-struct socket *conn_socket = NULL;
-static struct task_struct *client_thread;
-static atomic_t client_running = ATOMIC_INIT(0);
-static DEFINE_MUTEX(client_thread_mutex);
-#define SEND_BUF_SIZE 512
-
-static int tcp_client_send(struct socket *sock, const char *buf, size_t len,
-                           unsigned long flags) {
-    struct msghdr msg = {.msg_name = NULL,
-                         .msg_namelen = 0,
-                         .msg_control = NULL,
-                         .msg_controllen = 0,
-                         .msg_flags = flags};
+static int tcp_client_send(struct socket *sock, const char *buf, size_t len, unsigned long flags) {
+    struct msghdr msg = {
+        .msg_name = NULL, .msg_namelen = 0, .msg_control = NULL, .msg_controllen = 0, .msg_flags = flags};
     struct kvec vec;
     int written = 0;
     int left = len;
@@ -831,33 +1060,33 @@ static int tcp_client_send(struct socket *sock, const char *buf, size_t len,
     return written;
 }
 
-//TODO: Not used rn
-static int tcp_client_receive(struct socket *sock, char *buf, size_t max_len,
-                              unsigned long flags) {
-    struct msghdr msg = {.msg_name = NULL,
-                         .msg_namelen = 0,
-                         .msg_control = NULL,
-                         .msg_controllen = 0,
-                         .msg_flags = flags};
-    struct kvec vec;
-    int ret;
-
-    vec.iov_base = buf;
-    vec.iov_len = max_len;
-
-    ret = kernel_recvmsg(sock, &msg, &vec, 1, max_len, flags);
-    if (ret < 0) {
-        if (ret == -EAGAIN || ret == -ERESTARTSYS)
-            return -EAGAIN; // caller can retry
-        pr_err("recv failed: %d\n", ret);
-        return ret;
-    }
-
-    if (ret < max_len)
-        buf[ret] = '\0'; // null-terminate if string
-
-    return ret;
-}
+// TODO: Not used rn
+//  static int tcp_client_receive(struct socket *sock, char *buf, size_t max_len,
+//                                unsigned long flags) {
+//      struct msghdr msg = {.msg_name = NULL,
+//                           .msg_namelen = 0,
+//                           .msg_control = NULL,
+//                           .msg_controllen = 0,
+//                           .msg_flags = flags};
+//      struct kvec vec;
+//      int ret;
+//
+//      vec.iov_base = buf;
+//      vec.iov_len = max_len;
+//
+//      ret = kernel_recvmsg(sock, &msg, &vec, 1, max_len, flags);
+//      if (ret < 0) {
+//          if (ret == -EAGAIN || ret == -ERESTARTSYS)
+//              return -EAGAIN; // caller can retry
+//          pr_err("recv failed: %d\n", ret);
+//          return ret;
+//      }
+//
+//      if (ret < max_len)
+//          buf[ret] = '\0'; // null-terminate if string
+//
+//      return ret;
+//  }
 
 static int tcp_client_thread(void *arg) {
     mutex_lock(&client_server_info_mutex);
@@ -890,8 +1119,7 @@ static int tcp_client_thread(void *arg) {
     conn_socket->sk->sk_rcvtimeo = msecs_to_jiffies(6000);
     conn_socket->sk->sk_sndtimeo = msecs_to_jiffies(6000);
 
-    ret = conn_socket->ops->connect(conn_socket, (struct sockaddr *)&saddr,
-                                    sizeof(saddr), 0);
+    ret = conn_socket->ops->connect(conn_socket, (struct sockaddr *)&saddr, sizeof(saddr), 0);
 
     if (ret && ret != -EINPROGRESS) {
         pr_err("connect failed immediately: %d\n", ret);
@@ -901,10 +1129,9 @@ static int tcp_client_thread(void *arg) {
     if (ret == -EINPROGRESS) {
         long timeout;
 
-        timeout = wait_event_interruptible_timeout(
-            conn_socket->sk->sk_wq->wait,
-            conn_socket->sk->sk_state != TCP_SYN_SENT || kthread_should_stop(),
-            msecs_to_jiffies(3000));
+        timeout = wait_event_interruptible_timeout(conn_socket->sk->sk_wq->wait,
+                                                   conn_socket->sk->sk_state != TCP_SYN_SENT || kthread_should_stop(),
+                                                   msecs_to_jiffies(3000));
 
         if (kthread_should_stop()) {
             pr_info("connect aborted due to thread stop\n");
@@ -926,8 +1153,7 @@ static int tcp_client_thread(void *arg) {
     // Main loop – example: send once, receive once, then idle/sleep
     while (!kthread_should_stop()) {
         // Wait until there's something to send or timeout
-        wait_event_interruptible_timeout(packet_wq, kthread_should_stop(),
-                                         msecs_to_jiffies(5000));
+        wait_event_interruptible_timeout(packet_wq, kthread_should_stop(), msecs_to_jiffies(5000));
 
         if (kthread_should_stop())
             break;
@@ -953,10 +1179,8 @@ static int tcp_client_thread(void *arg) {
                             "PROTO=%u TTL=%u LEN=%u IFACE=%s "
                             "SRC=%pI4 SPORT=%u DST=%pI4 DPORT=%u "
                             "SRC_MAC=%pM DST_MAC=%pM TCP_FLAGS=%02x\n",
-                            info->protocol, info->ttl, info->total_len,
-                            info->indev, &info->saddr, ntohs(info->sport),
-                            &info->daddr, ntohs(info->dport), info->src_mac,
-                            info->dst_mac, info->tcp_flags);
+                            info->protocol, info->ttl, info->total_len, info->indev, &info->saddr, ntohs(info->sport),
+                            &info->daddr, ntohs(info->dport), info->src_mac, info->dst_mac, info->tcp_flags);
 
             if (len <= 0 || len >= sizeof(send_buf)) {
                 pr_warn("format buffer too small or error\n");
@@ -997,8 +1221,7 @@ static void restart_client_thread_if_needed(void) {
     const __be32 copy_server_ip = server_ip;
     const u16 copy_server_port = server_port;
 
-    if (copy_server_ip == prev_server_ip &&
-        copy_server_port == prev_server_port) {
+    if (copy_server_ip == prev_server_ip && copy_server_port == prev_server_port) {
         mutex_unlock(&client_server_info_mutex);
         return;
     }
@@ -1020,8 +1243,7 @@ static void restart_client_thread_if_needed(void) {
     if (copy_server_ip != 0 && copy_server_port != 0) {
         client_thread = kthread_run(tcp_client_thread, NULL, "tcp-client");
         if (IS_ERR(client_thread)) {
-            pr_err("Failed to restart client thread: %ld\n",
-                   PTR_ERR(client_thread));
+            pr_err("Failed to restart client thread: %ld\n", PTR_ERR(client_thread));
             atomic_set(&client_running, 0);
         } else {
             atomic_set(&client_running, 1);
@@ -1050,6 +1272,10 @@ static int __init mynetfilter_init(void) {
     last_mtime_allowed_file.tv_sec = 0;
     last_mtime_allowed_file.tv_nsec = 0;
 
+    // Initialise timer var for detection model bin file.
+    last_mtime_model_file.tv_sec = 0;
+    last_mtime_model_file.tv_nsec = 0;
+
     // Initialise the char[] so it can be checked if something was added.
     strcpy(allowed_file_path, "\0");
 
@@ -1065,8 +1291,7 @@ static int __init mynetfilter_init(void) {
 
     /* Setup timer for periodic modification checks */
     timer_setup(&config_timer, config_timer_callback, 0);
-    mod_timer(&config_timer,
-              jiffies + msecs_to_jiffies(CONFIG_POLL_INTERVAL_MS));
+    mod_timer(&config_timer, jiffies + msecs_to_jiffies(CONFIG_POLL_INTERVAL_MS));
 
     pr_info("Netfilter module loaded with on-demand config reload and periodic "
             "modification detection\n");
@@ -1101,5 +1326,4 @@ module_exit(mynetfilter_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("PREDESCU THEODOR");
-MODULE_DESCRIPTION(
-    "Netfilter Module with Config Reload from Disk and Modification Detection");
+MODULE_DESCRIPTION("Netfilter Module with Config Reload from Disk and Modification Detection");

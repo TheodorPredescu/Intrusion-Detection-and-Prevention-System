@@ -9,10 +9,12 @@ NetworkLogDatabase g_network_log_db("network_logs.db");
 // Implementation
 // ────────────────────────────────────────────
 
-NetworkLogDatabase::NetworkLogDatabase(const std::string &path)
-    : db_path(path) {}
-
-NetworkLogDatabase::~NetworkLogDatabase() { close(); }
+// Constructor and destructor
+NetworkLogDatabase::NetworkLogDatabase(const std::string &path) : db_path(path) {
+}
+NetworkLogDatabase::~NetworkLogDatabase() {
+    close();
+}
 
 bool NetworkLogDatabase::open() {
     if (db)
@@ -25,8 +27,8 @@ bool NetworkLogDatabase::open() {
         return false;
     }
 
-    // Enable WAL mode → better concurrency
-    exec_no_callback("PRAGMA journal_mode=WAL;");
+    // Enable WAL mode → for ability to read and write (only 1 with write ability) in the same time.
+    this->exec_no_callback("PRAGMA journal_mode=WAL;");
 
     // Create schema if missing
     const char *schema = R"(
@@ -79,12 +81,8 @@ CREATE INDEX IF NOT EXISTS idx_conn_external ON connections(is_external);
 CREATE INDEX IF NOT EXISTS idx_conn_iface ON connections(iface);
     )";
 
-    char *err = nullptr;
-    rc = sqlite3_exec(db, schema, nullptr, nullptr, &err);
-    if (rc != SQLITE_OK) {
-        std::cerr << "Schema creation failed: " << err << "\n";
-        sqlite3_free(err);
-        close();
+    const bool added_with_success = this->exec_no_callback(schema);
+    if (!added_with_success) {
         return false;
     }
 
@@ -103,15 +101,15 @@ bool NetworkLogDatabase::exec_no_callback(const char *sql) {
     char *err = nullptr;
     int rc = sqlite3_exec(db, sql, nullptr, nullptr, &err);
     if (rc != SQLITE_OK) {
-        std::cerr << "SQL error: " << err << "\n";
+        printf("SQL error\n%s\n", sql);
         sqlite3_free(err);
         return false;
     }
     return true;
 }
 
-int NetworkLogDatabase::upsert_pc(const std::string &name,
-                                  const std::string &host) {
+// TODO: not yet used.
+int NetworkLogDatabase::upsert_pc(const std::string &name, const std::string &host) {
     std::lock_guard lock(db_mutex);
     const char *sql = R"(
 INSERT INTO pc_info (name, host, last_seen) VALUES (?, ?, CURRENT_TIMESTAMP)
@@ -120,8 +118,9 @@ RETURNING pc_id;
     )";
 
     sqlite3_stmt *stmt = nullptr;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
         return -1;
+    }
 
     sqlite3_bind_text(stmt, 1, name.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 2, host.c_str(), -1, SQLITE_TRANSIENT);
@@ -140,16 +139,16 @@ bool NetworkLogDatabase::insert_connection(const ConnectionEvent &event) {
     return insert_connections_batch(batch);
 }
 
-bool NetworkLogDatabase::insert_connections_batch(
-    const std::vector<ConnectionEvent> &events) {
-    if (events.empty())
+bool NetworkLogDatabase::insert_connections_batch(const std::vector<ConnectionEvent> &events) {
+    if (events.empty()) {
         return true;
+    }
 
     std::lock_guard lock(db_mutex);
 
-    if (sqlite3_exec(db, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) !=
-        SQLITE_OK)
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK) {
         return false;
+    }
 
     const char *sql = R"(
 INSERT INTO connections (
@@ -199,8 +198,8 @@ INSERT INTO connections (
     return ok;
 }
 
-bool NetworkLogDatabase::update_allowed_ips(int pc_db_id,
-                                            const std::set<std::string> &ips) {
+// TODO: not yet used.
+bool NetworkLogDatabase::update_allowed_ips(int pc_db_id, const std::set<std::string> &ips) {
     std::lock_guard lock(db_mutex);
 
     // Clear old entries
@@ -212,8 +211,7 @@ bool NetworkLogDatabase::update_allowed_ips(int pc_db_id,
     sqlite3_finalize(stmt);
 
     // Insert new ones
-    const char *ins_sql =
-        "INSERT OR IGNORE INTO allowed_ips (pc_id, ip_address) VALUES (?, ?);";
+    const char *ins_sql = "INSERT OR IGNORE INTO allowed_ips (pc_id, ip_address) VALUES (?, ?);";
     sqlite3_prepare_v2(db, ins_sql, -1, &stmt, nullptr);
     for (const auto &ip : ips) {
         sqlite3_bind_int(stmt, 1, pc_db_id);
@@ -226,10 +224,11 @@ bool NetworkLogDatabase::update_allowed_ips(int pc_db_id,
     return true;
 }
 
-void NetworkLogDatabase::export_recent_to_csv(const std::string &filename,
-                                              int limit) const {
-    if (!db)
+// TODO: It is not yet used.
+void NetworkLogDatabase::export_recent_to_csv(const std::string &filename, int limit) const {
+    if (!db) {
         return;
+    }
 
     std::ofstream f(filename);
     if (!f) {
@@ -252,9 +251,9 @@ LIMIT )" << limit
         << ";";
 
     sqlite3_stmt *stmt = nullptr;
-    if (sqlite3_prepare_v2(db, sql.str().c_str(), -1, &stmt, nullptr) !=
-        SQLITE_OK)
+    if (sqlite3_prepare_v2(db, sql.str().c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
         return;
+    }
 
     // header
     f << "pc_id,pc_name,timestamp,src_ip,src_port,dst_ip,dst_port,"
@@ -262,20 +261,14 @@ LIMIT )" << limit
          "is_external,is_allowed\n";
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        f << sqlite3_column_int(stmt, 0) << ","
-          << (const char *)sqlite3_column_text(stmt, 1) << ","
-          << (const char *)sqlite3_column_text(stmt, 2) << ","
-          << (const char *)sqlite3_column_text(stmt, 3) << ","
-          << sqlite3_column_int(stmt, 4) << ","
-          << (const char *)sqlite3_column_text(stmt, 5) << ","
-          << sqlite3_column_int(stmt, 6) << "," << sqlite3_column_int(stmt, 7)
-          << "," << sqlite3_column_int(stmt, 8) << ","
-          << sqlite3_column_int(stmt, 9) << ","
-          << (const char *)sqlite3_column_text(stmt, 10) << ","
-          << (const char *)sqlite3_column_text(stmt, 11) << ","
-          << (const char *)sqlite3_column_text(stmt, 12) << ","
-          << sqlite3_column_int(stmt, 13) << "," << sqlite3_column_int(stmt, 14)
-          << "," << sqlite3_column_int(stmt, 15) << "\n";
+        f << sqlite3_column_int(stmt, 0) << "," << (const char *)sqlite3_column_text(stmt, 1) << ","
+          << (const char *)sqlite3_column_text(stmt, 2) << "," << (const char *)sqlite3_column_text(stmt, 3) << ","
+          << sqlite3_column_int(stmt, 4) << "," << (const char *)sqlite3_column_text(stmt, 5) << ","
+          << sqlite3_column_int(stmt, 6) << "," << sqlite3_column_int(stmt, 7) << "," << sqlite3_column_int(stmt, 8)
+          << "," << sqlite3_column_int(stmt, 9) << "," << (const char *)sqlite3_column_text(stmt, 10) << ","
+          << (const char *)sqlite3_column_text(stmt, 11) << "," << (const char *)sqlite3_column_text(stmt, 12) << ","
+          << sqlite3_column_int(stmt, 13) << "," << sqlite3_column_int(stmt, 14) << "," << sqlite3_column_int(stmt, 15)
+          << "\n";
     }
 
     sqlite3_finalize(stmt);
