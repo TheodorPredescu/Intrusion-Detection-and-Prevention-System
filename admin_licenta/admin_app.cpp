@@ -1,18 +1,22 @@
 #include "imgui/backends/imgui_impl_glfw.h"
 #include "imgui/backends/imgui_impl_opengl3.h"
 #include "imgui/imgui.h"
+
+// TODO:
+#include "imgui-node-editor/imgui_node_editor.h"
+
 #include <GLFW/glfw3.h>
 #include <libssh/libssh.h>
 #include <libssh/sftp.h>
 
 #include <fcntl.h>
-#include <linux/stat.h>
 #include <sys/stat.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <curl/curl.h>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -22,7 +26,6 @@
 #include <set>
 #include <sstream>
 #include <string>
-#include <sys/stat.h>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -35,6 +38,9 @@
 // ============================================================================
 // DATA MODEL
 // ============================================================================
+
+// TODO: I could also send with the packages the profile with what  they were selected, so that I can differenciate
+// between them and save them in continuity with their other runs.
 
 struct ExternalNode {
     std::string ip;
@@ -89,8 +95,9 @@ std::set<std::string> parse_allowed_ips(const std::string &text) {
         line.erase(0, line.find_first_not_of(" \t\r\n"));
         line.erase(line.find_last_not_of(" \t\r\n") + 1);
 
-        if (line.empty())
+        if (line.empty()) {
             continue;
+        }
 
         size_t colon = line.find(':');
         std::string ip = (colon == std::string::npos) ? line : line.substr(0, colon);
@@ -163,13 +170,51 @@ static bool read_remote_log(const ssh_session session, const char *cmd, std::str
 // LOG THREAD
 // ============================================================================
 
+static size_t write_callback(void *contents, size_t size, size_t nmemb, std::string *s) {
+    size_t newLength = size * nmemb;
+    try {
+        s->append((char *)contents, newLength);
+    } catch (std::bad_alloc &e) {
+        return 0;
+    }
+    return newLength;
+}
+
+static bool fetch_logs_from_api(const std::string &pc_ip, std::string &out) {
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        std::cerr << "Failed to initialize CURL\n";
+        return false;
+    }
+
+    // Build the API URL
+    // Example: http://192.168.0.113:8080/api/logs?ip=192.168.0.113
+    std::string url = "http://127.0.0.1:8080/logs?ip=" + pc_ip;
+
+    out.clear();
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);        // 5 second timeout
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 2L); // 2 second connect timeout
+
+    CURLcode res = curl_easy_perform(curl);
+
+    bool success = (res == CURLE_OK);
+    if (!success) {
+        std::cerr << "CURL error for " << pc_ip << ": " << curl_easy_strerror(res) << "\n";
+    }
+
+    curl_easy_cleanup(curl);
+    return success;
+}
+
 static void start_log_thread(RemotePC *pc) {
     std::cout << "Starting log thread for " << pc->name << " (" << pc->host << ")\n";
 
-    if (!pc->session) {
-        pc->logStatus = "No session available";
-        return;
-    }
+    // Get or create database ID for this PC (if you're using the database)
+    // pc->db_id = log_db.upsert_pc(pc->name, pc->host);
 
     pc->running = true;
     pc->logStatus = "Connected";
@@ -177,7 +222,9 @@ static void start_log_thread(RemotePC *pc) {
     pc->logThread = std::thread([pc] {
         while (pc->running) {
             std::string tmp;
-            const bool success = read_remote_log(pc->session, "sudo cat /sys/kernel/debug/packet_logs", tmp);
+
+            // Fetch logs from HTTP API instead of SSH
+            const bool success = fetch_logs_from_api(pc->host, tmp);
 
             {
                 std::lock_guard<std::mutex> lock(pc->logMutex);
@@ -196,10 +243,8 @@ static void start_log_thread(RemotePC *pc) {
             std::this_thread::sleep_for(std::chrono::seconds(3));
         }
 
-        // Cleanup when the thread exists
-        ssh_disconnect(pc->session);
-        ssh_free(pc->session);
-        pc->session = nullptr;
+        // No SSH cleanup needed anymore!
+        std::cout << "Log thread stopped for " << pc->name << "\n";
     });
 }
 
@@ -481,8 +526,9 @@ static void distribute_model_to_pcs(const std::string &model_code) {
     for (const auto &[_, pc_uptr] : pc_by_name_host) {
         threads.emplace_back([pc = pc_uptr.get(), model_code]() {
             ssh_session session = ssh_new();
-            if (!session)
+            if (!session) {
                 return;
+            }
 
             ssh_options_set(session, SSH_OPTIONS_HOST, pc->host.c_str());
             ssh_options_set(session, SSH_OPTIONS_USER, pc->user.c_str());
@@ -520,8 +566,9 @@ static void distribute_model_to_pcs(const std::string &model_code) {
 
             while (remaining > 0) {
                 int written = sftp_write(file, data, remaining);
-                if (written <= 0)
+                if (written <= 0) {
                     break;
+                }
                 data += written;
                 remaining -= written;
             }
@@ -568,9 +615,11 @@ static void distribute_model_to_pcs(const std::string &model_code) {
         });
     }
 
-    for (auto &t : threads)
-        if (t.joinable())
+    for (auto &t : threads) {
+        if (t.joinable()) {
             t.join();
+        }
+    }
 }
 
 static void trigger_model_training() {
@@ -1301,8 +1350,9 @@ static void draw_logs() {
         for (const auto &ip : pc->ips) {
             label += "\n\t" + ip;
         }
-        if (ImGui::Selectable(label.c_str(), selected == idx))
+        if (ImGui::Selectable(label.c_str(), selected == idx)) {
             selected = idx;
+        }
         idx++;
     }
     ImGui::EndChild();
@@ -1556,29 +1606,34 @@ int main() {
         ImGui::Begin("##root", nullptr, flags);
 
         // Create the main top buttons.
-        if (ImGui::Button("Add PC"))
+        if (ImGui::Button("Add PC")) {
             page = Page::AddPC;
+        }
         ImGui::SameLine();
-        if (ImGui::Button("Topology"))
+        if (ImGui::Button("Topology")) {
             page = Page::Topology;
+        }
         ImGui::SameLine();
-        if (ImGui::Button("Logs"))
+        if (ImGui::Button("Logs")) {
             page = Page::Logs;
+        }
         ImGui::SameLine();
-        if (ImGui::Button("Config"))
+        if (ImGui::Button("Config")) {
             page = Page::Config;
+        }
 
         ImGui::Separator();
 
         // Based on the button pressed, draw the content of the page.
-        if (page == Page::AddPC)
+        if (page == Page::AddPC) {
             draw_add_pc();
-        else if (page == Page::Topology)
+        } else if (page == Page::Topology) {
             draw_topology();
-        else if (page == Page::Logs)
+        } else if (page == Page::Logs) {
             draw_logs();
-        else if (page == Page::Config)
+        } else if (page == Page::Config) {
             draw_config_editor();
+        }
 
         ImGui::End();
 
