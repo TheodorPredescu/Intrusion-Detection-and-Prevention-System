@@ -1225,7 +1225,7 @@ static long mymodule_ioctl(struct file *file, unsigned int cmd, unsigned long ar
     }
 
     case IOCTL_ADD_WHITELIST: {
-        pr_info("[OK] /dev/mymodule registered\n");
+        pr_info("[OK] DAEMON requests a new pc to be added in the ruling.\n");
         struct allowed_entry_ioctl entry;
         struct allowed_entry *ent;
 

@@ -4,15 +4,16 @@ import time
 import struct
 import sqlite3
 import pandas as pd
-import threading
-from typing import AsyncGenerator, List, Dict
+from typing import AsyncGenerator, List, Dict, Optional
 from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
 from sklearn.svm import OneClassSVM
 from sklearn.preprocessing import StandardScaler
 import uvicorn
+import uuid
 
 SCALE = 1000000
+DATABASE = 'network_logs.db'
 
 # ============================================================================
 # PYDANTIC MODELS (Request/Response validation)
@@ -33,17 +34,154 @@ class PacketData(BaseModel):
 
 class PacketsRequest(BaseModel):
     packets: List[PacketData]
-
-class StatusResponse(BaseModel):
-    status: str
-    message: str = ""
-    packets_received: int = 0
+    pc_id: Optional[str] = None
 
 class ModelStatus(BaseModel):
     loaded: bool
     num_support_vectors: int = 0
     last_trained: str = "Never"
 
+# ============================================================================
+# DATABASE
+# ============================================================================
+
+class Database:
+    def __init__(self, db_path: str = DATABASE):
+        self.db_path = db_path
+        self.conn: Optional[sqlite3.Connection] = None
+        
+    def open(self) -> bool:
+        """Open database and create schema if needed"""
+        try:
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            
+            # Enable WAL mode for concurrent read/write
+            self.conn.execute("PRAGMA journal_mode=WAL;")
+            
+            # Create schema
+            schema = """
+            CREATE TABLE IF NOT EXISTS connections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pc_id TEXT NOT NULL,
+                ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                src_ip TEXT NOT NULL,
+                dst_ip TEXT NOT NULL,
+                src_port INTEGER,
+                dst_port INTEGER,
+                protocol INTEGER,
+                ttl INTEGER,
+                packet_len INTEGER,
+                iface TEXT,
+                src_mac TEXT,
+                dst_mac TEXT,
+                tcp_flags INTEGER
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_conn_ts ON connections(ts);
+            CREATE INDEX IF NOT EXISTS idx_conn_pc ON connections(pc_id);
+            CREATE INDEX IF NOT EXISTS idx_conn_src ON connections(src_ip);
+            CREATE INDEX IF NOT EXISTS idx_conn_dst ON connections(dst_ip);
+            CREATE INDEX IF NOT EXISTS idx_conn_src_port ON connections(src_port);
+            CREATE INDEX IF NOT EXISTS idx_conn_dst_port ON connections(dst_port);
+            CREATE INDEX IF NOT EXISTS idx_conn_protocol ON connections(protocol);
+            CREATE INDEX IF NOT EXISTS idx_conn_iface ON connections(iface);
+            """
+            
+            self.conn.executescript(schema)
+            self.conn.commit()
+            
+            print(f"[DB] Opened {self.db_path} successfully")
+            return True
+            
+        except sqlite3.Error as e:
+            print(f"[DB] Failed to open database: {e}")
+            return False
+    
+    def close(self):
+        """Close database connection"""
+        if self.conn:
+            self.conn.close()
+            self.conn = None
+            print("[DB] Database connection closed")
+    
+    def get_connection(self) -> sqlite3.Connection:
+        """Get a new connection (for thread safety)"""
+        return sqlite3.connect(self.db_path, timeout=10.0)
+    
+    def insert_packets_batch(self, packets: List['PacketData'], pc_id: str) -> int:
+        """Batch insert packets into database"""
+        if not packets:
+            return 0
+        
+        conn = None
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            insert_query = """
+                INSERT INTO connections
+                (pc_id, src_ip, dst_ip, src_port, dst_port, protocol, ttl,
+                 packet_len, tcp_flags, iface, src_mac, dst_mac)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
+            
+            values = [
+                (
+                    pc_id,
+                    pkt.saddr,
+                    pkt.daddr,
+                    pkt.sport,
+                    pkt.dport,
+                    pkt.protocol,
+                    pkt.ttl,
+                    pkt.packet_len,
+                    pkt.tcp_flags,
+                    pkt.iface,
+                    pkt.src_mac,
+                    pkt.dst_mac,
+                )
+                for pkt in packets
+            ]
+            
+            cursor.executemany(insert_query, values)
+            conn.commit()
+            processed = len(values)
+            
+            print(f"[DB] Inserted {processed} packets")
+            return processed
+            
+        except sqlite3.Error as e:
+            print(f"[DB] Batch insert failed: {e}")
+            if conn:
+                conn.rollback()
+            return 0
+        finally:
+            if conn:
+                conn.close()
+    
+    
+    # def export_for_training(self, limit: int = 100000) -> Optional[pd.DataFrame]:
+    #     """Export data for ML training"""
+    #     try:
+    #         conn = self.get_connection()
+    #
+    #         query = """
+    #             SELECT src_port, dst_port, protocol, ttl, packet_len, tcp_flags
+    #             FROM connections
+    #             LIMIT ?
+    #         """
+    #
+    #         df = pd.read_sql_query(query, conn, params=(limit,))
+    #         conn.close()
+    #
+    #         return df if len(df) > 0 else None
+    #
+    #     except Exception as e:
+    #         print(f"[DB] Failed to export data: {e}")
+    #         return None
+
+# Global database instance
+db = Database()
 # ============================================================================
 # ML MODEL CLASS
 # ============================================================================
@@ -90,6 +228,7 @@ class MLModel:
         except Exception as e:
             print(f"[ML] Failed to load model: {e}")
     
+    # TODO: Not used rn.
     def predict(self, features: Dict[str, int]) -> int:
         """Predict if packet is anomaly (-1) or normal (1)"""
         if not self.loaded:
@@ -119,30 +258,6 @@ class MLModel:
 # DATABASE FUNCTIONS
 # ============================================================================
 
-def insert_packet_to_db(
-    saddr: str, daddr: str, sport: int, dport: int, 
-    protocol: int = 6, ttl: int = 64, packet_len: int = 0, 
-    tcp_flags: int = 0, iface: str = '', src_mac: str = '', 
-    dst_mac: str = '', pc_id: int = 1, is_external: int = 0, 
-    is_allowed: int = 0
-):
-    """Insert packet into database"""
-    try:
-        conn = sqlite3.connect('../network_logs.db', timeout=10.0)
-        c = conn.cursor()
-        c.execute("""
-            INSERT INTO connections 
-            (pc_id, src_ip, dst_ip, src_port, dst_port, protocol, ttl, 
-             packet_len, tcp_flags, iface, src_mac, dst_mac, is_external, is_allowed)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (pc_id, saddr, daddr, sport, dport, protocol, ttl, 
-              packet_len, tcp_flags, iface, src_mac, dst_mac, is_external, is_allowed))
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        print(f"[DB] Insert error: {e}")
-        return False
 
 # TODO: Not used.
 def export_oneclass_svm_binary(model, scaler, filename='model.bin'):
@@ -180,11 +295,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Run on application startup"""
     print("[APP] Starting Network Packet Receiver")
     
-    # Start training watcher in background thread
-    watcher_thread = threading.Thread(target=watch_for_trigger, daemon=True)
-    watcher_thread.start()
-    
-    print("[APP] Training watcher started")
+    if not db.open():
+        print("[APP] FATAL: Failed to initialize database")
+        raise RuntimeError("Database initialization failed")
 
     yield
 
@@ -215,7 +328,7 @@ async def health():
     """Detailed health check"""
     return {
         "status": "healthy",
-        "database": os.path.exists('../network_logs.db'),
+        "database": os.path.exists(DATABASE),
         "model_loaded": ml_model.loaded,
         "timestamp": time.strftime('%Y-%m-%d %H:%M:%S')
     }
@@ -229,76 +342,50 @@ async def model_status():
         last_trained=ml_model.last_trained
     )
 
-@app.post("/packets", response_model=StatusResponse)
+@app.post("/packets")
 async def receive_packets(request: PacketsRequest):
     """
     Receive batch of network packets
     
     - **packets**: List of packet data to process
     """
+    print(request)
+    pc_id = request.pc_id
+    generated_pc_id: str | None = None
+
+    if not pc_id:
+        generated_pc_id = str(uuid.uuid4())
+        pc_id = generated_pc_id
+
     packets = request.packets
+    if packets and len(packets) == 0:
+        response_data = {
+                "status": "ok",
+                "message": "Empty request",
+                "packets_received": 0,
+            }
+
+        if generated_pc_id is not None:
+            print("\nsending the pc_id\n")
+            response_data["pc_id"] = generated_pc_id
+
+        return response_data
+
     n = len(packets)
-    if n == 0:
-        return StatusResponse(status="ok", packets_received=0, message="Empty request")
-
     print(f"[API] Received batch of {n} packets")
+    
+    processed = db.insert_packets_batch(packets=packets, pc_id=pc_id)
 
-    processed = 0
+    response_data = {
+            "status": "ok",
+            "message": f"Processed {processed}/{n} packets request",
+            "packets_received": n,
+        }
 
-    conn = None
-    try:
-        conn = sqlite3.connect('../network_logs.db', timeout=10.0)
-        cursor = conn.cursor()
+    if generated_pc_id is not None:
+        response_data["pc_id"] = generated_pc_id
 
-        insert_query = """
-            INSERT INTO connections
-            (pc_id, src_ip, dst_ip, src_port, dst_port, protocol, ttl,
-             packet_len, tcp_flags, iface, src_mac, dst_mac, is_external, is_allowed)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """
-
-        values = []
-        for pkt in packets:
-
-            values.append(
-                (
-                    1, 
-                    pkt.saddr,
-                    pkt.daddr,
-                    pkt.sport,
-                    pkt.dport,
-                    pkt.protocol,
-                    pkt.ttl,
-                    pkt.packet_len,
-                    pkt.tcp_flags,
-                    pkt.iface,
-                    pkt.src_mac,
-                    pkt.dst_mac,
-                    0,  # is_external — compute if needed
-                    0,  # is_allowed   — compute if needed
-                )
-            )
-
-        if values:
-            cursor.executemany(insert_query, values)
-            conn.commit()
-            processed = len(values)
-
-        print(f"[DB] Inserted {processed}/{n} packets")
-
-    except Exception as e:
-        print(f"[DB] Batch insert failed: {e}")
-        if conn:
-            conn.rollback()
-    finally:
-        if conn:
-            conn.close()
-
-    return StatusResponse(
-        status="ok",
-        message=f"Processed {processed}/{n} packets",
-        packets_received=n,
-    )
+    return response_data
 
 @app.post("/model/train")
 async def train_model(background_tasks: BackgroundTasks):
@@ -325,6 +412,30 @@ async def reload_model():
         "num_support_vectors": ml_model.num_support_vectors
     }
 
+@app.post("/config/")
+async def provide_config(request: dict):
+    pc_id = request.get("pc_id")
+    if not pc_id:
+        return {"error": "missing pc_id"}
+
+    # Here you decide what config to send for this pc_id
+    # For example: read from DB, file, or generate dynamically
+    config_content = """server IP 192.168.0.114
+server port 8080
+Monitoring
+allowed_file /etc/allowed_file.txt
+"""
+
+    allowed_content = """192.168.0.125:8080, 8081
+8.8.8.8
+1.1.1.1
+"""
+
+    return {
+        "status": "ok"
+        # "config": config_content
+        # "allowed": allowed_content
+    }
 # ============================================================================
 # BACKGROUND TASKS
 # ============================================================================
@@ -334,7 +445,7 @@ def train_model_task():
     print("[ML] Training model...")
     
     try:
-        conn = sqlite3.connect('../network_logs.db')
+        conn = db.get_connection()
         df = pd.read_sql_query("""
             SELECT src_port, dst_port, protocol, ttl, packet_len, tcp_flags
             FROM connections
@@ -364,19 +475,6 @@ def train_model_task():
     except Exception as e:
         print(f"[ML] Training error: {e}")
 
-def watch_for_trigger():
-    """Watch for training trigger file"""
-    print("[ML] Watching for train trigger...")
-    
-    while True:
-        if os.path.exists('train_trigger.txt'):
-            print("[ML] Training triggered!")
-            train_model_task()
-            os.remove('train_trigger.txt')
-            time.sleep(5)
-        
-        time.sleep(1)
-
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -384,9 +482,9 @@ def watch_for_trigger():
 if __name__ == '__main__':
     # Run with uvicorn
     uvicorn.run(
-        "train:app",  # Change "main" to your filename if different
+        "server:app",
         host="0.0.0.0",
         port=8080,
-        reload=True,  # Auto-reload on code changes
+        reload=True,
         log_level="info"
     )

@@ -1,14 +1,17 @@
 #include <arpa/inet.h>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <curl/curl.h>
 #include <fcntl.h>
 #include <fstream>
 #include <iostream>
+#include <netinet/in.h>
 #include <signal.h>
 #include <sstream>
 #include <string>
@@ -19,12 +22,16 @@
 #include <vector>
 
 #include "daemon.h"
+#include "json.hpp"
+using json = nlohmann::json;
 
 static bool running = true;
 
 class ConfigDaemon {
   private:
     std::string config_file = "/etc/mymodule.conf";
+    std::string pc_id_file = "/etc/mymodule_id";
+    std::string pc_id = "";
     std::string allowed_file;
     int module_fd = -1;
 
@@ -32,7 +39,9 @@ class ConfigDaemon {
     time_t last_allowed_mtime = 0;
 
     uint32_t current_server_ip = 0;
+    std::string current_server_ip_str = "";
     uint16_t current_server_port = 0;
+    std::string current_server_port_str = "";
     uint8_t current_state = DISABLED;
 
     const char *STATE_NAMES[4] = {"LISTENING", "MONITORING", "REACTIVE", "DISABLED"};
@@ -55,6 +64,30 @@ class ConfigDaemon {
             return false;
         }
         std::cout << "[DAEMON] Connected to kernel module via /dev/mymodule\n";
+
+        std::ifstream infile(pc_id_file);
+
+        if (infile.is_open()) {
+            // File exists → read first line
+            if (std::getline(infile, pc_id) && !pc_id.empty()) {
+                // Trim trailing whitespace
+                pc_id.erase(pc_id.find_last_not_of(" \t\r\n") + 1);
+
+                std::cout << "[DAEMON] Loaded PC ID: " << pc_id << "\n";
+                return true;
+            }
+
+            std::cout << "[DAEMON] PC ID file exists but is empty\n";
+        }
+
+        // File does not exist → create it
+        std::ofstream outfile(pc_id_file);
+        if (!outfile.is_open()) {
+            std::cerr << "[DAEMON] Failed to create PC ID file: " << pc_id_file << "\n";
+            return false;
+        }
+
+        std::cout << "[DAEMON] Created PC ID file: " << pc_id_file << "\n";
         return true;
     }
 
@@ -72,8 +105,6 @@ class ConfigDaemon {
             std::cerr << "[DAEMON] Cannot open config file: " << config_file << "\n";
             return false;
         }
-
-        last_config_mtime = get_mtime(config_file);
 
         std::string line;
         //  Those will be in `__be` format saved.
@@ -95,7 +126,7 @@ class ConfigDaemon {
                 unsigned int a, b, c, d;
                 sscanf(line.c_str(), "server IP %u.%u.%u.%u", &a, &b, &c, &d);
                 parsed_ip = htonl((a << 24) | (b << 16) | (c << 8) | d);
-                std::cout << "[DAEMON] Parsed server IP\n";
+                std::cout << "[DAEMON] Parsed" << line << "\n";
             }
             // Parse "server port xxx"
             else if (line.find("server port") == 0) {
@@ -103,16 +134,6 @@ class ConfigDaemon {
                 sscanf(line.c_str(), "server port %hu", &port);
                 parsed_port = port;
                 std::cout << "[DAEMON] Parsed server port: " << parsed_port << "\n";
-            }
-            // Parse state
-            else if (line == "Listening") {
-                parsed_state = LISTENING;
-            } else if (line == "Monitoring") {
-                parsed_state = MONITORING;
-            } else if (line == "Reactive") {
-                parsed_state = REACTIVE;
-            } else if (line == "Disabled") {
-                parsed_state = DISABLED;
             }
             // Parse allowed file path
             else if (line.find("allowed_file") == 0) {
@@ -138,6 +159,33 @@ class ConfigDaemon {
                 parsed_allowed_file = std::move(path);
 
                 std::cout << "[DAEMON] Parsed allowed_file: \"" << parsed_allowed_file << "\"\n";
+
+            } else {
+                std::string trimmed_line = line;
+                size_t first = line.find_first_not_of(" \t\r\n");
+                size_t last = line.find_last_not_of(" \t\r\n");
+
+                if (first != std::string::npos && last != std::string::npos) {
+                    trimmed_line = line.substr(first, last - first + 1);
+                }
+
+                for (size_t i = 0; i < trimmed_line.length(); ++i) {
+                    trimmed_line[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(trimmed_line[i])));
+                }
+
+                if (trimmed_line == "listening") {
+                    parsed_state = LISTENING;
+                    std::cout << "[DAEMON] state changed to " << STATE_NAMES[parsed_state] << "\n";
+                } else if (trimmed_line == "monitoring") {
+                    parsed_state = MONITORING;
+                    std::cout << "[DAEMON] state changed to " << STATE_NAMES[parsed_state] << "\n";
+                } else if (trimmed_line == "reactive") {
+                    parsed_state = REACTIVE;
+                    std::cout << "[DAEMON] state changed to " << STATE_NAMES[parsed_state] << "\n";
+                } else if (trimmed_line == "disabled") {
+                    parsed_state = DISABLED;
+                    std::cout << "[DAEMON] state changed to " << STATE_NAMES[parsed_state] << "\n";
+                }
             }
         }
 
@@ -145,6 +193,18 @@ class ConfigDaemon {
 
         // Check if anything changed
         if (parsed_ip != current_server_ip || parsed_port != current_server_port) {
+
+            uint32_t host_ip = ntohl(parsed_ip);
+
+            uint8_t a = (host_ip >> 24) & 0xFF;
+            uint8_t b = (host_ip >> 16) & 0xFF;
+            uint8_t c = (host_ip >> 8) & 0xFF;
+            uint8_t d = (host_ip >> 0) & 0xFF;
+
+            current_server_ip_str =
+                std::to_string(a) + "." + std::to_string(b) + "." + std::to_string(c) + "." + std::to_string(d);
+            current_server_port_str = std::to_string(parsed_port);
+
             current_server_ip = parsed_ip;
             current_server_port = parsed_port;
 
@@ -154,19 +214,20 @@ class ConfigDaemon {
 
             if (ioctl(module_fd, IOCTL_SET_SERVER_INFO, &info) < 0) {
                 std::cerr << "[DAEMON] ioctl SET_SERVER_INFO failed: " << strerror(errno) << "\n";
-                return false;
+            } else {
+                std::cout << "[DAEMON] ✓ Sent server info to kernel\n";
             }
-            std::cout << "[DAEMON] ✓ Sent server info to kernel\n";
         }
 
         if (parsed_state != current_state) {
             current_state = parsed_state;
+            std::cout << "[DAEMON] Atempting to change the state on server to : " << STATE_NAMES[parsed_state] << "\n";
 
             if (ioctl(module_fd, IOCTL_SET_STATE, &parsed_state) < 0) {
                 std::cerr << "[DAEMON] ioctl SET_STATE failed: " << strerror(errno) << "\n";
-                return false;
+            } else {
+                std::cout << "[DAEMON] ✓ State changed to: " << STATE_NAMES[parsed_state] << "\n";
             }
-            std::cout << "[DAEMON] ✓ State changed to: " << STATE_NAMES[parsed_state] << "\n";
         }
 
         if (!parsed_allowed_file.empty() && parsed_allowed_file != allowed_file) {
@@ -182,8 +243,6 @@ class ConfigDaemon {
             std::cout << "[DAEMON] No allowed_file specified\n";
             return true;
         }
-
-        last_allowed_mtime = get_mtime(allowed_file);
 
         std::ifstream file(allowed_file);
         if (!file.is_open()) {
@@ -257,58 +316,126 @@ class ConfigDaemon {
         return true;
     }
 
+    bool save_pc_id_to_file() {
+        std::ofstream file(pc_id_file, std::ios::trunc);
+        if (!file.is_open()) {
+            return false;
+        }
+
+        file << pc_id << "\n";
+        return true;
+    }
+
+    bool extract_and_store_pc_id(const std::string &response) {
+        const std::string key = "\"pc_id\"";
+        size_t pos = response.find(key);
+        if (pos == std::string::npos) {
+            return false;
+        }
+
+        size_t start = response.find('"', pos + key.length());
+        if (start == std::string::npos) {
+            return false;
+        }
+
+        start++; // move past first quote
+
+        size_t end = response.find('"', start);
+        if (end == std::string::npos) {
+            return false;
+        }
+
+        std::string new_id = response.substr(start, end - start);
+
+        if (new_id.empty()) {
+            return false;
+        }
+
+        pc_id = new_id;
+
+        if (!save_pc_id_to_file()) {
+            std::cerr << "[DAEMON] Failed to persist PC ID\n";
+            return false;
+        }
+
+        std::cout << "[DAEMON] Registered PC ID: " << pc_id << "\n";
+        return true;
+    }
+
     void send_to_backend(const std::vector<packet_data> &packets) {
         if (packets.empty()) {
             return;
         }
 
+        json payload = json::object();
         // Build JSON manually as string
-        std::string json = "{\"packets\":[";
-        for (size_t i = 0; i < packets.size(); i++) {
-            if (i > 0) {
-                json += ",";
-            }
 
-            char saddr[16], daddr[16];
-            inet_ntop(AF_INET, &packets[i].saddr, saddr, sizeof(saddr));
-            inet_ntop(AF_INET, &packets[i].daddr, daddr, sizeof(daddr));
-
-            // Format MAC addresses as XX:XX:XX:XX:XX:XX
-            char src_mac_str[18], dst_mac_str[18];
-            snprintf(src_mac_str, sizeof(src_mac_str), "%02x:%02x:%02x:%02x:%02x:%02x", packets[i].src_mac[0],
-                     packets[i].src_mac[1], packets[i].src_mac[2], packets[i].src_mac[3], packets[i].src_mac[4],
-                     packets[i].src_mac[5]);
-            snprintf(dst_mac_str, sizeof(dst_mac_str), "%02x:%02x:%02x:%02x:%02x:%02x", packets[i].dst_mac[0],
-                     packets[i].dst_mac[1], packets[i].dst_mac[2], packets[i].dst_mac[3], packets[i].dst_mac[4],
-                     packets[i].dst_mac[5]);
-
-            json += "{\"saddr\":\"" + std::string(saddr) + "\"," + "\"daddr\":\"" + std::string(daddr) + "\"," +
-                    "\"sport\":" + std::to_string(ntohs(packets[i].sport)) + "," +
-                    "\"dport\":" + std::to_string(ntohs(packets[i].dport)) + "," +
-                    "\"protocol\":" + std::to_string(packets[i].protocol) + "," +
-                    "\"ttl\":" + std::to_string(packets[i].ttl) + "," +
-                    "\"packet_len\":" + std::to_string(packets[i].total_len) + "," +
-                    "\"tcp_flags\":" + std::to_string(packets[i].tcp_flags) + "," + "\"iface\":\"" +
-                    std::string(packets[i].indev) + "\"," + "\"src_mac\":\"" + std::string(src_mac_str) + "\"," +
-                    "\"dst_mac\":\"" + std::string(dst_mac_str) + "\"}";
+        if (!pc_id.empty()) {
+            payload["pc_id"] = pc_id;
         }
-        json += "]}";
+
+        json packets_array = json::array();
+        for (const auto &pkt : packets) {
+            char saddr[16], daddr[16];
+            inet_ntop(AF_INET, &pkt.saddr, saddr, sizeof(saddr));
+            inet_ntop(AF_INET, &pkt.daddr, daddr, sizeof(daddr));
+
+            // Format MACs
+            char src_mac_str[18], dst_mac_str[18];
+            snprintf(src_mac_str, sizeof(src_mac_str), "%02x:%02x:%02x:%02x:%02x:%02x", pkt.src_mac[0], pkt.src_mac[1],
+                     pkt.src_mac[2], pkt.src_mac[3], pkt.src_mac[4], pkt.src_mac[5]);
+            snprintf(dst_mac_str, sizeof(dst_mac_str), "%02x:%02x:%02x:%02x:%02x:%02x", pkt.dst_mac[0], pkt.dst_mac[1],
+                     pkt.dst_mac[2], pkt.dst_mac[3], pkt.dst_mac[4], pkt.dst_mac[5]);
+
+            json packet_obj = {{"saddr", saddr},
+                               {"daddr", daddr},
+                               {"sport", ntohs(pkt.sport)},
+                               {"dport", ntohs(pkt.dport)},
+                               {"protocol", pkt.protocol},
+                               {"ttl", pkt.ttl},
+                               {"packet_len", pkt.total_len},
+                               {"tcp_flags", pkt.tcp_flags},
+                               {"iface", std::string(pkt.indev)},
+                               {"src_mac", src_mac_str},
+                               {"dst_mac", dst_mac_str}};
+
+            packets_array.push_back(std::move(packet_obj));
+        }
+
+        payload["packets"] = std::move(packets_array);
+        std::string json_str = payload.dump();
 
         CURL *curl = curl_easy_init();
         if (!curl) {
             return;
         }
 
-        curl_easy_setopt(curl, CURLOPT_URL, "http://127.0.0.1:8080/packets");
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json.c_str());
+        const std::string base_url = "http://" + current_server_ip_str + ":" + current_server_port_str + "/packets";
+        curl_easy_setopt(curl, CURLOPT_URL, base_url.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_str.c_str());
 
         struct curl_slist *headers = NULL;
         headers = curl_slist_append(headers, "Content-Type: application/json");
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
+        std::string response;
+
+        curl_easy_setopt(
+            curl, CURLOPT_WRITEFUNCTION, +[](char *ptr, size_t size, size_t nmemb, void *userdata) -> size_t {
+                auto *resp = static_cast<std::string *>(userdata);
+                resp->append(ptr, size * nmemb);
+                return size * nmemb;
+            });
+
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
         CURLcode res = curl_easy_perform(curl);
         if (res == CURLE_OK) {
             std::cout << "[DAEMON] ✓ Sent " << packets.size() << " packets\n";
+            if (!response.empty()) {
+                std::cout << "[DAEMON] Backend response: " << response << "\n";
+                extract_and_store_pc_id(response);
+            }
         } else {
             std::cerr << "[DAEMON] Failed: " << curl_easy_strerror(res) << "\n";
         }
@@ -336,7 +463,7 @@ class ConfigDaemon {
                 }
             }
 
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+            std::this_thread::sleep_for(std::chrono::seconds(15));
         }
         std::cout << "[DAEMON] Config monitor exiting\n";
     }
@@ -358,6 +485,167 @@ class ConfigDaemon {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
         std::cout << "[DAEMON] Packet collector exiting\n";
+    }
+
+    void run_request_to_change_config_loop() {
+        std::cout << "[DAEMON] Starting listening to request to change from server...\n";
+
+        while (running) {
+
+            if (pc_id.empty()) {
+                std::this_thread::sleep_for(::std::chrono::seconds(10));
+                continue;
+            }
+
+            CURL *curl = curl_easy_init();
+            if (!curl) {
+                std::this_thread::sleep_for(::std::chrono::seconds(10));
+                return;
+            }
+
+            json payload = json::object();
+            payload["pc_id"] = pc_id;
+
+            std::string json_str = payload.dump();
+
+            const std::string base_url = "http://" + current_server_ip_str + ":" + current_server_port_str + "/config/";
+            curl_easy_setopt(curl, CURLOPT_URL, base_url.c_str());
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_str.c_str());
+
+            struct curl_slist *headers = nullptr;
+            headers = curl_slist_append(headers, "Content-Type: application/json");
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+            std::string response;
+
+            curl_easy_setopt(
+                curl, CURLOPT_WRITEFUNCTION, +[](char *ptr, size_t size, size_t nmemb, void *userdata) -> size_t {
+                    auto *resp = static_cast<std::string *>(userdata);
+                    resp->append(ptr, size * nmemb);
+                    return size * nmemb;
+                });
+
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
+            CURLcode res = curl_easy_perform(curl);
+            if (res == CURLE_OK) {
+                std::cout << "[DAEMON] received connection\n";
+                if (!response.empty()) {
+                    try {
+                        json resp_json = json::parse(response);
+
+                        // Example: server returns new config content
+                        if (resp_json.contains("config") && resp_json["config"].is_string()) {
+                            std::string new_config = resp_json["config"].get<std::string>();
+
+                            if (new_config.empty()) {
+                                std::cerr << "[DAEMON] Server sent empty config → refusing to overwrite\n";
+                            } else {
+                                // Write to disk and reload
+                                std::string tmp_path = config_file + ".tmp";
+                                std::string old_path = config_file + ".old";
+
+                                std::ofstream tmp_file(tmp_path, std::ios::trunc);
+                                std::cout << "[DAEMON] Updating config file from server\n";
+
+                                if (tmp_file.is_open()) {
+                                    tmp_file << new_config << std::flush;
+
+                                    if (tmp_file.fail()) {
+                                        std::cerr << "[DAEMON] Write to temp file failed: " << tmp_path << "\n";
+                                        tmp_file.close();
+                                        std::remove(tmp_path.c_str());
+                                        continue;
+                                    }
+
+                                    tmp_file.close();
+
+                                    std::remove(old_path.c_str());
+                                    bool backup = false;
+
+                                    if (std::rename(config_file.c_str(), old_path.c_str()) == 0) {
+                                        backup = true;
+                                    }
+
+                                    if (std::rename(tmp_path.c_str(), config_file.c_str()) == 0) {
+                                        std::cout << "[DAEMON] new config file added\n";
+                                        std::remove(tmp_path.c_str());
+
+                                    } else {
+                                        std::cout << "[DAEMON] failed to add a new allowed file\n";
+
+                                        if (backup) {
+                                            std::rename(old_path.c_str(), config_file.c_str());
+                                            std::remove(tmp_path.c_str());
+                                        }
+                                    }
+                                } else {
+                                    std::remove(tmp_path.c_str());
+                                }
+                            }
+                        }
+
+                        // Same for allowed file
+                        if (resp_json.contains("allowed") && resp_json["allowed"].is_string()) {
+                            if (!allowed_file.empty()) {
+                                std::string new_allowed_conf = resp_json["allowed"].get<std::string>();
+
+                                // Write to disk and reload
+                                std::string tmp_path = allowed_file + ".tmp";
+                                std::string old_path = allowed_file + ".old";
+
+                                std::ofstream tmp_file(tmp_path, std::ios::trunc);
+                                std::cout << "[DAEMON] Updating allowed file from server\n";
+
+                                if (tmp_file.is_open()) {
+                                    tmp_file << new_allowed_conf << std::flush;
+
+                                    if (tmp_file.fail()) {
+                                        std::cerr << "[DAEMON] Write to temp file failed: " << tmp_path << "\n";
+                                        tmp_file.close();
+                                        std::remove(tmp_path.c_str());
+                                        continue;
+                                    }
+
+                                    tmp_file.close();
+
+                                    std::remove(old_path.c_str());
+                                    bool backup = false;
+
+                                    if (std::rename(allowed_file.c_str(), old_path.c_str()) == 0) {
+                                        backup = true;
+                                    }
+
+                                    if (std::rename(tmp_path.c_str(), allowed_file.c_str()) == 0) {
+                                        std::cout << "[DAEMON] new config file added\n";
+                                        std::remove(tmp_path.c_str());
+                                    } else {
+                                        std::cout << "[DAEMON] failed to add a new allowed file\n";
+
+                                        if (backup) {
+                                            std::rename(old_path.c_str(), allowed_file.c_str());
+                                            std::remove(tmp_path.c_str());
+                                        }
+                                    }
+                                } else {
+                                    std::remove(tmp_path.c_str());
+                                }
+                            }
+                        }
+                    } catch (const json::exception &e) {
+                        std::cerr << "[DAEMON] Failed to parse config response: " << e.what() << "\n";
+                    }
+                }
+            } else {
+                std::cerr << "[DAEMON] Failed: " << curl_easy_strerror(res) << "\n";
+            }
+
+            curl_slist_free_all(headers);
+            curl_easy_cleanup(curl);
+            std::this_thread::sleep_for(::std::chrono::seconds(10));
+        }
+
+        std::cout << "[DAEMON] Config update request loop exiting\n";
     }
 };
 
@@ -391,9 +679,11 @@ int main(int argc, char *argv[]) {
     // Start watching for changes
     std::thread config_thread(&ConfigDaemon::run_config_loop, &daemon);
     std::thread packet_thread(&ConfigDaemon::run_packet_loop, &daemon);
+    std::thread change_thread(&ConfigDaemon::run_request_to_change_config_loop, &daemon);
 
     config_thread.join();
     packet_thread.join();
+    change_thread.join();
 
     std::cout << "[DAEMON] Exited cleanly\n";
     return 0;
