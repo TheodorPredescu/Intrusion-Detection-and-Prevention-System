@@ -1,4 +1,5 @@
 .*
+!.venv
 kernel_module/kernel_module*
 !kernel_module/kernel_module.c
 Module.symvers
