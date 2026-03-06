@@ -84,9 +84,8 @@ static struct rhashtable_params logged_params = {
 };
 
 static LIST_HEAD(packet_list);
-static spinlock_t list_lock;
+static DEFINE_SPINLOCK(packet_list_lock);
 
-static struct dentry *dbg_file;
 static struct nf_hook_ops netfilter_ops;
 
 /**
@@ -99,7 +98,7 @@ struct allowed_entry {
     int port_count;
 };
 
-static struct rhashtable allowed_table;
+static struct rhashtable *__rcu allowed_table_ptr;
 static struct rhashtable_params allowed_params = {
     .nelem_hint = 65,
     .key_len = sizeof(__be32),
@@ -116,7 +115,11 @@ static u16 server_port = 0;
 /** Used to block the reading of server_ip and server_port. */
 static DEFINE_MUTEX(client_server_info_mutex);
 
-static DEFINE_SPINLOCK(allowed_lock);
+/** Used for distruct and construct */
+
+/** Used for lookups */
+// static DEFINE_SPINLOCK(allowed_spinlock);
+static DEFINE_MUTEX(allowed_mutex);
 // ============================================================
 
 struct socket *conn_socket = NULL;
@@ -159,43 +162,79 @@ static void allowed_free_fn(void *head, void *arg) {
 
 static void reset_in_memory_allowed_var(void) {
     /* Free existing entries and re-init the table */
-    spin_lock(&allowed_lock);
-    rhashtable_free_and_destroy(&allowed_table, allowed_free_fn, NULL);
-    /* Re-initialize; ignore error here (caller will log if needed) */
-    rhashtable_init(&allowed_table, &allowed_params);
-    spin_unlock(&allowed_lock);
+
+    // spin_lock(&allowed_spinlock);
+    // rhashtable_free_and_destroy(&allowed_table, allowed_free_fn, NULL);
+    // /* Re-initialize; ignore error here (caller will log if needed) */
+    // rhashtable_init(&allowed_table, &allowed_params);
+    // spin_unlock(&allowed_spinlock);
+
+    struct rhashtable *old_table;
+    struct rhashtable *new_table;
+
+    new_table = kzalloc(sizeof(*new_table), GFP_KERNEL);
+    if (!new_table) {
+        pr_err("OOM allocating new allowed_table\n");
+        return;
+    }
+
+    if (rhashtable_init(new_table, &allowed_params)) {
+        pr_err("Failed to init new allowed_table\n");
+        kfree(new_table);
+        return;
+    }
+
+    mutex_lock(&allowed_mutex);
+
+    // Atomically swap the pointer — readers using rcu_read_lock will
+    // finish with the old table before we free it.
+    old_table = rcu_dereference_protected(allowed_table_ptr, lockdep_is_held(&allowed_mutex));
+    rcu_assign_pointer(allowed_table_ptr, new_table);
+
+    mutex_unlock(&allowed_mutex);
+
+    // Wait for all in-progress rcu_read_lock readers to finish
+    // with old_table before we destroy it. This is the key step.
+    synchronize_rcu();
+
+    rhashtable_free_and_destroy(old_table, allowed_free_fn, NULL);
+    kfree(old_table);
 }
 
-/* Count of entries in allowed_table (useful for reporting) */
-
-static bool ip_is_in_allowed_table(__be32 ip) {
-    struct allowed_entry *ent;
-    spin_lock(&allowed_lock);
-    ent = rhashtable_lookup_fast(&allowed_table, &ip, allowed_params);
-    spin_unlock(&allowed_lock);
-    return ent ? true : false;
-    ;
-}
-
-static bool ip_allows_port(__be32 ip, u16 port_host) {
+static bool allowed_connection(__be32 ip, u16 port_host) {
+    struct rhashtable *tbl;
     struct allowed_entry *ent;
     bool ok = false;
-    spin_lock(&allowed_lock);
-    ent = rhashtable_lookup_fast(&allowed_table, &ip, allowed_params);
-    if (ent) {
-        if (ent->port_count == 0) {
-            ok = true; /* port wildcard */
-        } else {
-            int i;
-            for (i = 0; i < ent->port_count; i++) {
-                if (ent->ports[i] == port_host) {
-                    ok = true;
-                    break;
-                }
+
+    rcu_read_lock();
+    tbl = rcu_dereference(allowed_table_ptr);
+    if (!tbl) {
+        goto end;
+    }
+
+    ent = rhashtable_lookup_fast(tbl, &ip, allowed_params);
+    // ent = rhashtable_lookup_fast(&allowed_table, &ip, allowed_params);
+
+    ok = ent ? true : false;
+    if (port_host == 0 || ok == false) {
+        goto end;
+    }
+
+    if (ent->port_count == 0) {
+        ok = true;
+    } else {
+        int i;
+        for (i = 0; i < ent->port_count; i++) {
+            if (ent->ports[i] == port_host) {
+                ok = true;
+                break;
             }
         }
     }
-    spin_unlock(&allowed_lock);
+
+end:
+
+    rcu_read_unlock();
     return ok;
 }
 
@@ -205,12 +244,12 @@ static bool ip_allows_port(__be32 ip, u16 port_host) {
 static void free_packet_list(void) {
     struct packet_info *info, *tmp;
 
-    spin_lock(&list_lock);
+    spin_lock_bh(&packet_list_lock);
     list_for_each_entry_safe(info, tmp, &packet_list, list) {
         list_del(&info->list);
         kfree(info);
     }
-    spin_unlock(&list_lock);
+    spin_unlock_bh(&packet_list_lock);
 }
 
 // static void free_packet_list_sent(void) {
@@ -228,17 +267,16 @@ static void free_packet_list(void) {
  * Returns true if it should be added to packet_list / sent to server.
  */
 static bool should_log_packet(const struct packet_info *info) {
-    bool in_allowed_ip_list = ip_is_in_allowed_table(info->saddr);
-    bool in_allowed_port_list = ip_allows_port(info->saddr, ntohs(info->dport));
+    bool in_allowed_list = allowed_connection(info->saddr, ntohs(info->dport));
 
     const u8 local_state = READ_ONCE(state);
 
     // Same as dbg_show
-    if (in_allowed_ip_list && in_allowed_port_list && (local_state == MONITORING || local_state == REACTIVE)) {
+    if (in_allowed_list && (local_state == MONITORING || local_state == REACTIVE)) {
         return false;
     }
 
-    if ((!in_allowed_ip_list || !in_allowed_port_list) && local_state == LISTENING) {
+    if (!in_allowed_list && local_state == LISTENING) {
         return false;
     }
 
@@ -717,19 +755,10 @@ static bool add_log_if_necessary(struct packet_info *info) {
     if (!should_log_packet(info)) {
         return false;
     }
-    // === Add copy to permanent history (debugfs) ===
-    struct packet_info *history = kmalloc(sizeof(*history), GFP_ATOMIC);
-    if (history) {
-        memcpy(history, info, sizeof(*info)); // copy all fields
-        INIT_LIST_HEAD(&history->list);       // independent node
 
-        // TODO: This will dissapear later, I will not log it localy, only send it all to the server.
-        spin_lock(&list_lock);
-        list_add_tail(&history->list, &packet_list);
-        spin_unlock(&list_lock);
-    } else {
-        pr_warn("Failed to allocate history copy – skipping local log\n");
-    }
+    spin_lock_bh(&packet_list_lock);
+    list_add_tail(&info->list, &packet_list);
+    spin_unlock_bh(&packet_list_lock);
 
     // spin_lock(&list_lock);
     // list_add_tail(&info->list, &packet_list_sent);
@@ -761,10 +790,8 @@ static unsigned int packet_hook(void *priv, struct sk_buff *skb, const struct nf
         return NF_ACCEPT;
     }
 
-    mutex_lock(&client_server_info_mutex);
-    const __be32 copy_server_ip = server_ip;
-    const u16 copy_server_port = server_port;
-    mutex_unlock(&client_server_info_mutex);
+    const __be32 copy_server_ip = READ_ONCE(server_ip);
+    const u16 copy_server_port = READ_ONCE(server_port);
 
     // Skip if packet matches server IP and destination port.
     if (copy_server_ip != 0 && copy_server_port != 0 && ip->saddr == copy_server_ip) {
@@ -836,24 +863,22 @@ static unsigned int packet_hook(void *priv, struct sk_buff *skb, const struct nf
      not blocked; it will be a filtering before printing it.*/
     if (local_state == REACTIVE || local_state == LISTENING) {
         bool should_drop = true;
-        /* Check if source IP is known in allowed table */
-        bool allowed_ip = ip_is_in_allowed_table(ip->saddr);
 
         /* If the IP is known, check whether the destination port is allowed
          * (use host-order port for comparison). If the entry has port_count==0,
          * it means any port is allowed for that IP.
          */
-        bool allowed_port = false;
+        bool allowed_ip = false;
         if (ip->protocol == IPPROTO_TCP || ip->protocol == IPPROTO_UDP) {
             u16 dport_host = ntohs(info->dport);
-            allowed_port = ip_allows_port(ip->saddr, dport_host);
+            allowed_ip = allowed_connection(ip->saddr, dport_host);
         }
 
-        if (allowed_ip && allowed_port) {
+        if (allowed_ip) {
             should_drop = false;
         }
 
-        if (should_drop && svm_model.loaded) {
+        if (should_drop && READ_ONCE(svm_model.loaded)) {
             int prediction = predict_anomaly(ntohs(info->sport), ntohs(info->dport), info->protocol, info->ttl,
                                              info->total_len, info->tcp_flags);
             const int is_anomaly = (prediction == -1) ? 1 : 0;
@@ -891,7 +916,7 @@ static int dbg_show(struct seq_file *m, void *v) {
         return -ENOMEM; // Return error to indicate failure
     }
 
-    spin_lock(&list_lock);
+    spin_lock_bh(&packet_list_lock);
     list_for_each_entry(info, &packet_list, list) {
         if (!(should_log_packet(info))) {
             continue;
@@ -906,10 +931,9 @@ static int dbg_show(struct seq_file *m, void *v) {
         existing = rhashtable_lookup_fast(&logged_table, &key, logged_params);
         spin_unlock(&logged_lock);
 
-        mutex_lock(&client_server_info_mutex);
-        const __be32 copy_server_ip = server_ip;
-        const u16 copy_server_port = server_port;
-        mutex_unlock(&client_server_info_mutex);
+        const __be32 copy_server_ip = READ_ONCE(server_ip);
+        const u16 copy_server_port = READ_ONCE(server_port);
+
         if (!existing && !(copy_server_ip == 0 && copy_server_port == 0 && info->daddr == copy_server_ip)) {
             seq_printf(m,
                        "PROTO=%u TTL=%u LEN=%u IFACE=%s\n"
@@ -929,7 +953,7 @@ static int dbg_show(struct seq_file *m, void *v) {
             }
         }
     }
-    spin_unlock(&list_lock);
+    spin_unlock_bh(&packet_list_lock);
 
     /* Destroy logged_table at the end of dbg_show. */
     spin_lock(&logged_lock);
@@ -942,14 +966,6 @@ static int dbg_show(struct seq_file *m, void *v) {
 static int dbg_open(struct inode *inode, struct file *file) {
     return single_open(file, dbg_show, NULL);
 }
-
-static const struct file_operations dbg_fops = {
-    .owner = THIS_MODULE,
-    .open = dbg_open,
-    .read = seq_read,
-    .llseek = seq_lseek,
-    .release = single_release,
-};
 
 /**
  *  Config file read (trigger reload from disk).
@@ -1195,118 +1211,124 @@ static const struct file_operations dbg_fops = {
 
 static long mymodule_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     switch (cmd) {
-    case IOCTL_SET_STATE: {
-        u8 new_state;
-        // Copia data din userspace în kernel
-        if (copy_from_user(&new_state, (void __user *)arg, sizeof(__u8))) {
-            return -EFAULT;
-        }
-
-        // Actualizează variabila kernel
-        pr_info("[IOCTL] State: %u → %u\n", READ_ONCE(state), new_state);
-        WRITE_ONCE(state, new_state); // ← Forces write to memory
-        pr_info("[IOCTL] ✓ State changed\n");
-        return 0;
-    }
-
-    case IOCTL_SET_SERVER_INFO: {
-        struct server_info_ioctl info;
-        if (copy_from_user(&info, (void __user *)arg, sizeof(info))) {
-            return -EFAULT;
-        }
-
-        mutex_lock(&client_server_info_mutex);
-        server_ip = info.server_ip;
-        server_port = info.server_port;
-        mutex_unlock(&client_server_info_mutex);
-
-        // restart_client_thread_if_needed();
-        return 0;
-    }
-
-    case IOCTL_ADD_WHITELIST: {
-        pr_info("[OK] DAEMON requests a new pc to be added in the ruling.\n");
-        struct allowed_entry_ioctl entry;
-        struct allowed_entry *ent;
-
-        if (copy_from_user(&entry, (void __user *)arg, sizeof(entry))) {
-            return -EFAULT;
-        }
-
-        ent = kzalloc(sizeof(*ent), GFP_KERNEL);
-        if (!ent) {
-            return -ENOMEM;
-        }
-
-        ent->ip = entry.ip;
-        ent->port_count = entry.port_count;
-        for (int i = 0; i < entry.port_count; i++) {
-            ent->ports[i] = entry.ports[i];
-        }
-
-        spin_lock(&allowed_lock);
-        rhashtable_insert_fast(&allowed_table, &ent->node, allowed_params);
-        spin_unlock(&allowed_lock);
-
-        return 0;
-    }
-
-    case IOCTL_CLEAR_WHITELIST: {
-        reset_in_memory_allowed_var();
-        return 0;
-    }
-
-    case IOCTL_GET_PACKETS: {
-        struct packet_batch *batch_kernel;
-        struct packet_info *info, *tmp;
-        int count = 0;
-
-        batch_kernel = kmalloc(sizeof(struct packet_batch), GFP_KERNEL);
-        if (!batch_kernel) {
-            return -ENOMEM;
-        }
-
-        memset(batch_kernel, 0, sizeof(struct packet_batch));
-
-        spin_lock(&list_lock);
-        list_for_each_entry_safe(info, tmp, &packet_list, list) {
-            if (count >= MAX_PACKET_BATCH) {
-                break;
+        case IOCTL_SET_STATE: {
+            u8 new_state;
+            // Copia data din userspace în kernel
+            if (copy_from_user(&new_state, (void __user *)arg, sizeof(__u8))) {
+                return -EFAULT;
             }
 
-            batch_kernel->packets[count].saddr = info->saddr;
-            batch_kernel->packets[count].daddr = info->daddr;
-            batch_kernel->packets[count].sport = info->sport;
-            batch_kernel->packets[count].dport = info->dport;
-            batch_kernel->packets[count].protocol = info->protocol;
-            batch_kernel->packets[count].ttl = info->ttl;
-            batch_kernel->packets[count].total_len = info->total_len;
-            batch_kernel->packets[count].tcp_flags = info->tcp_flags;
-            strncpy(batch_kernel->packets[count].indev, info->indev, 16);
-            batch_kernel->packets[count].indev[15] = '\0';
-
-            memcpy(batch_kernel->packets[count].dst_mac, info->dst_mac, 6);
-            memcpy(batch_kernel->packets[count].src_mac, info->src_mac, 6);
-
-            list_del(&info->list);
-            kfree(info);
-            count++;
-        }
-        spin_unlock(&list_lock);
-
-        batch_kernel->count = count;
-
-        if (copy_to_user((void __user *)arg, batch_kernel, sizeof(struct packet_batch))) {
-            return -EFAULT;
+            // Actualizează variabila kernel
+            pr_info("[IOCTL] State: %u → %u\n", READ_ONCE(state), new_state);
+            WRITE_ONCE(state, new_state); // ← Forces write to memory
+            pr_info("[IOCTL] ✓ State changed\n");
+            return 0;
         }
 
-        kfree(batch_kernel);
+        case IOCTL_SET_SERVER_INFO: {
+            struct server_info_ioctl info;
+            if (copy_from_user(&info, (void __user *)arg, sizeof(info))) {
+                return -EFAULT;
+            }
 
-        return 0;
-    }
+            mutex_lock(&client_server_info_mutex);
+            server_ip = info.server_ip;
+            server_port = info.server_port;
+            mutex_unlock(&client_server_info_mutex);
 
-    default:
-        return -ENOTTY;
+            // restart_client_thread_if_needed();
+            return 0;
+        }
+
+        case IOCTL_ADD_WHITELIST: {
+            pr_info("[OK] DAEMON requests a new pc to be added in the ruling.\n");
+            struct allowed_entry_ioctl entry;
+            struct allowed_entry *ent;
+            struct rhashtable *tbl;
+
+            if (copy_from_user(&entry, (void __user *)arg, sizeof(entry))) {
+                return -EFAULT;
+            }
+
+            ent = kzalloc(sizeof(*ent), GFP_KERNEL);
+            if (!ent) {
+                return -ENOMEM;
+            }
+
+            ent->ip = entry.ip;
+            ent->port_count = entry.port_count;
+            for (int i = 0; i < entry.port_count; i++) {
+                ent->ports[i] = entry.ports[i];
+            }
+
+            mutex_lock(&allowed_mutex);
+            tbl = rcu_dereference_protected(allowed_table_ptr, lockdep_is_held(&allowed_mutex));
+            rhashtable_insert_fast(tbl, &ent->node, allowed_params);
+            mutex_unlock(&allowed_mutex);
+
+            // spin_lock(&allowed_spinlock);
+            // rhashtable_insert_fast(&allowed_table, &ent->node, allowed_params);
+            // spin_unlock(&allowed_spinlock);
+
+            return 0;
+        }
+
+        case IOCTL_CLEAR_WHITELIST: {
+            reset_in_memory_allowed_var();
+            return 0;
+        }
+
+        case IOCTL_GET_PACKETS: {
+            struct packet_batch *batch_kernel;
+            struct packet_info *info, *tmp;
+            int count = 0;
+
+            batch_kernel = kmalloc(sizeof(struct packet_batch), GFP_KERNEL);
+            if (!batch_kernel) {
+                return -ENOMEM;
+            }
+
+            memset(batch_kernel, 0, sizeof(struct packet_batch));
+
+            spin_lock_bh(&packet_list_lock);
+            list_for_each_entry_safe(info, tmp, &packet_list, list) {
+                if (count >= MAX_PACKET_BATCH) {
+                    break;
+                }
+
+                batch_kernel->packets[count].saddr = info->saddr;
+                batch_kernel->packets[count].daddr = info->daddr;
+                batch_kernel->packets[count].sport = info->sport;
+                batch_kernel->packets[count].dport = info->dport;
+                batch_kernel->packets[count].protocol = info->protocol;
+                batch_kernel->packets[count].ttl = info->ttl;
+                batch_kernel->packets[count].total_len = info->total_len;
+                batch_kernel->packets[count].tcp_flags = info->tcp_flags;
+                strncpy(batch_kernel->packets[count].indev, info->indev, 16);
+                batch_kernel->packets[count].indev[15] = '\0';
+
+                memcpy(batch_kernel->packets[count].dst_mac, info->dst_mac, 6);
+                memcpy(batch_kernel->packets[count].src_mac, info->src_mac, 6);
+
+                list_del(&info->list);
+                kfree(info);
+                count++;
+            }
+            spin_unlock_bh(&packet_list_lock);
+
+            batch_kernel->count = count;
+
+            if (copy_to_user((void __user *)arg, batch_kernel, sizeof(struct packet_batch))) {
+                return -EFAULT;
+            }
+
+            kfree(batch_kernel);
+
+            return 0;
+        }
+
+        default:
+            return -ENOTTY;
     }
 }
 
@@ -1326,13 +1348,30 @@ static struct miscdevice mymodule_device = {
  * Module init/exit.
  */
 static int __init mynetfilter_init(void) {
-    spin_lock_init(&list_lock);
-    spin_lock_init(&logged_lock);
+    struct rhashtable *tbl;
+    int hret;
+
+    tbl = kzalloc(sizeof(*tbl), GFP_KERNEL);
+
+    if (!tbl) {
+        return -ENOMEM;
+    }
+
+    hret = rhashtable_init(tbl, &allowed_params);
+    if (hret) {
+        kfree(tbl);
+        return hret;
+    }
+
+    RCU_INIT_POINTER(allowed_table_ptr, tbl);
+
+    // allowed_table_ptr = kzalloc(sizeof(*allowed_table_ptr), GFP_KERNEL);
+    // rhashtable_init(allowed_table_ptr, &allowed_params);
 
     /* initialize allowed_table */
-    if (rhashtable_init(&allowed_table, &allowed_params)) {
-        pr_warn("Failed to initialize allowed_table\n");
-    }
+    // if (rhashtable_init(&allowed_table, &allowed_params)) {
+    //     pr_warn("Failed to initialize allowed_table\n");
+    // }
 
     // Initialise timer var for detection model bin file.
     last_mtime_model_file.tv_sec = 0;
@@ -1348,8 +1387,6 @@ static int __init mynetfilter_init(void) {
     netfilter_ops.priority = NF_IP_PRI_FIRST;
 
     nf_register_net_hook(&init_net, &netfilter_ops);
-
-    dbg_file = debugfs_create_file("packet_logs", 0444, NULL, NULL, &dbg_fops);
 
     /* Setup timer for periodic modification checks */
     // timer_setup(&config_timer, config_timer_callback, 0);
@@ -1369,19 +1406,29 @@ static int __init mynetfilter_init(void) {
 }
 
 static void __exit mynetfilter_exit(void) {
+    struct rhashtable *tbl;
+
     misc_deregister(&mymodule_device);
     nf_unregister_net_hook(&init_net, &netfilter_ops);
-    debugfs_remove(dbg_file);
+
     // del_timer_sync(&config_timer);
     // cancel_work_sync(&config_work);
     free_packet_list();
     // free_packet_list_sent();
 
     /* free allowed_table entries */
-    spin_lock(&allowed_lock);
-    rhashtable_free_and_destroy(&allowed_table, allowed_free_fn, NULL);
-    spin_unlock(&allowed_lock);
+    // spin_lock(&allowed_spinlock);
+    // rhashtable_free_and_destroy(&allowed_table, allowed_free_fn, NULL);
+    // spin_unlock(&allowed_spinlock);
+    mutex_lock(&allowed_mutex);
+    tbl = rcu_dereference_protected(allowed_table_ptr, lockdep_is_held(&allowed_mutex));
+    rcu_assign_pointer(allowed_table_ptr, NULL);
+    mutex_unlock(&allowed_mutex);
 
+    synchronize_rcu(); // wait for all readers to finish
+
+    rhashtable_free_and_destroy(tbl, allowed_free_fn, NULL);
+    kfree(tbl);
     mutex_lock(&client_server_info_mutex);
     if (atomic_read(&client_running)) {
         kthread_stop(client_thread);

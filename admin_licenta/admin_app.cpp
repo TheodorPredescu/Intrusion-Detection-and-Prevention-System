@@ -31,9 +31,12 @@
 #include <utility>
 #include <vector>
 
+#include "../daemon/json.hpp"
 #include "database_handle.h"
 #include "shared_network_types.h"
 #include "tcp_log_receiver.h"
+
+using json = nlohmann::json;
 
 // ============================================================================
 // DATA MODEL
@@ -399,6 +402,53 @@ static bool remove_pc_by_ip(const std::string &ip) {
     return remove_pc(name, host);
 }
 
+// TODO: I need to check this. NOT TESTED!!
+static int read_pc_logs(const std::string pc_id = "") {
+
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        return -1;
+    }
+
+    std::string base_url = "http://127.0.0.1:8080/logs";
+    if (pc_id != "") {
+        base_url += "?pc_id=" + pc_id;
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, base_url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+    std::string response;
+
+    curl_easy_setopt(
+        curl, CURLOPT_WRITEFUNCTION, +[](char *ptr, size_t size, size_t nmemb, void *userdata) -> size_t {
+            auto *resp = static_cast<std::string *>(userdata);
+            resp->append(ptr, size * nmemb);
+            return size * nmemb;
+        });
+
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
+    CURLcode res = curl_easy_perform(curl);
+    if (res == CURLE_OK) {
+        std::cout << "[DAEMON] ✓ Sent " << response << " packets\n";
+        if (!response.empty()) {
+            // std::cout << "[DAEMON] Backend response: " << response << "\n";
+            // extract_and_store_pc_id(response);
+        }
+    } else {
+        std::cerr << "[DAEMON] Failed: " << curl_easy_strerror(res) << "\n";
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    return 0;
+}
 // ============================================================================
 // SSH Save
 // ============================================================================

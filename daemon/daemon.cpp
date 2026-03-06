@@ -78,6 +78,7 @@ class ConfigDaemon {
             }
 
             std::cout << "[DAEMON] PC ID file exists but is empty\n";
+            return true;
         }
 
         // File does not exist → create it
@@ -444,14 +445,98 @@ class ConfigDaemon {
         curl_easy_cleanup(curl);
     }
 
+    // TODO: Remained here.
+    bool send_configuration_profile(const bool config_changed, const bool allowed_changed) {
+
+        if (config_changed == false && allowed_changed == false) {
+            std::cerr << "[DAEMON] Tried to send modified files, but none were modified.\n";
+            return false;
+        }
+
+        json payload = json::object();
+        std::ostringstream ss;
+        // Build JSON manually as string
+
+        if (pc_id.empty()) {
+            return false;
+        }
+
+        if (config_changed) {
+            std::ifstream config_file_handle(config_file);
+            if (!config_file_handle.is_open()) {
+                std::cerr << "[DAEMON] Cannot open config file: " << config_file << "\n";
+                return false;
+            }
+
+            ss << config_file_handle.rdbuf();
+            payload["config_file"] = ss.str();
+            payload["current_mode"] = current_state;
+        }
+
+        if (allowed_changed) {
+            std::ifstream allowed_file_handle(allowed_file);
+
+            if (!allowed_file_handle.is_open()) {
+                std::cerr << "[DAEMON] Cannot open allowed file: " << allowed_file << "\n";
+                return false;
+            }
+
+            ss << allowed_file_handle.rdbuf();
+            payload["allowed_file"] = ss.str();
+        }
+
+        std::string json_str = payload.dump();
+
+        CURL *curl = curl_easy_init();
+        if (!curl) {
+            return false;
+        }
+
+        const std::string base_url =
+            "http://" + current_server_ip_str + ":" + current_server_port_str + "/config?pc_id=" + pc_id;
+        curl_easy_setopt(curl, CURLOPT_URL, base_url.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_str.c_str());
+
+        struct curl_slist *headers = NULL;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+        std::string response;
+
+        curl_easy_setopt(
+            curl, CURLOPT_WRITEFUNCTION, +[](char *ptr, size_t size, size_t nmemb, void *userdata) -> size_t {
+                auto *resp = static_cast<std::string *>(userdata);
+                resp->append(ptr, size * nmemb);
+                return size * nmemb;
+            });
+
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
+        CURLcode res = curl_easy_perform(curl);
+        if (res == CURLE_OK) {
+            std::cout << "[DAEMON] ✓ new config send to the server.\n";
+        } else {
+            std::cerr << "[DAEMON] Failed: " << curl_easy_strerror(res) << "\n";
+        }
+
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+        return true;
+    }
+
+    // TODO: I need to add the logic that sends the new configuration via api call to the backend.
     void run_config_loop() {
         std::cout << "[DAEMON] Starting config monitor...\n";
         while (running) {
+            bool entered_config = false;
+            bool entered_allowed_file = false;
             time_t config_mtime = get_mtime(config_file);
+
             if (config_mtime > last_config_mtime) {
                 std::cout << "[DAEMON] Config file changed, reloading...\n";
                 if (parse_config()) {
                     last_config_mtime = config_mtime;
+                    entered_config = true;
                 }
             }
 
@@ -460,7 +545,12 @@ class ConfigDaemon {
                 std::cout << "[DAEMON] Whitelist file changed, reloading...\n";
                 if (parse_allowed_file()) {
                     last_allowed_mtime = allowed_mtime;
+                    entered_allowed_file = true;
                 }
+            }
+
+            if (entered_config || entered_allowed_file) {
+                send_configuration_profile();
             }
 
             std::this_thread::sleep_for(std::chrono::seconds(15));
@@ -500,20 +590,16 @@ class ConfigDaemon {
             CURL *curl = curl_easy_init();
             if (!curl) {
                 std::this_thread::sleep_for(::std::chrono::seconds(10));
-                return;
+                continue;
             }
 
-            json payload = json::object();
-            payload["pc_id"] = pc_id;
-
-            std::string json_str = payload.dump();
-
-            const std::string base_url = "http://" + current_server_ip_str + ":" + current_server_port_str + "/config/";
+            const std::string base_url =
+                "http://" + current_server_ip_str + ":" + current_server_port_str + "/config?pc_id=" + pc_id;
             curl_easy_setopt(curl, CURLOPT_URL, base_url.c_str());
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_str.c_str());
+            curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
 
             struct curl_slist *headers = nullptr;
-            headers = curl_slist_append(headers, "Content-Type: application/json");
+            headers = curl_slist_append(headers, "Accept: application/json");
             curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
             std::string response;
@@ -642,6 +728,7 @@ class ConfigDaemon {
 
             curl_slist_free_all(headers);
             curl_easy_cleanup(curl);
+
             std::this_thread::sleep_for(::std::chrono::seconds(10));
         }
 
@@ -662,17 +749,6 @@ int main(int argc, char *argv[]) {
 
     if (!daemon.init()) {
         std::cerr << "[DAEMON] Initialization failed\n";
-        return 1;
-    }
-
-    // Initial load
-    if (!daemon.parse_config()) {
-        std::cerr << "[DAEMON] Failed to parse config\n";
-        return 1;
-    }
-
-    if (!daemon.parse_allowed_file()) {
-        std::cerr << "[DAEMON] Failed to parse allowed file\n";
         return 1;
     }
 
