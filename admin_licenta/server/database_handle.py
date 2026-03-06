@@ -1,14 +1,19 @@
 import sqlite3
 from models import PacketData, FilesConfig
-from typing import Optional, List
+from typing import Optional, List, Any, overload
+import base64
+from datetime import datetime
 
 DATABASE = "network_logs.db"
+
+DEFAULT_ICON_PATH: str = "default_icon.png"
 
 
 class Database:
     def __init__(self, db_path: str = DATABASE):
         self.db_path = db_path
         self.conn: Optional[sqlite3.Connection] = None
+        self.DEFAULT_ICON: bytes
 
     def open(self) -> bool:
         """Open database and create schema if needed"""
@@ -51,6 +56,8 @@ class Database:
                 config_file TEXT,
                 allowed_file TEXT,
                 current_mode INTEGER DEFAULT 3,
+                icon BLOB,
+                name TEXT DEFAULT "",
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -61,6 +68,10 @@ class Database:
             self.conn.commit()
 
             print(f"[DB] Opened {self.db_path} successfully")
+
+            with open(DEFAULT_ICON_PATH, "rb") as file:
+                self.DEFAULT_ICON = file.read()
+
             return True
 
         except sqlite3.Error as e:
@@ -78,46 +89,149 @@ class Database:
         """Get a new connection (for thread safety)"""
         return sqlite3.connect(self.db_path, timeout=10.0)
 
-    def get_pcs(self) -> List[dict]:
-        """Get all PCs from pc_configs"""
+    @overload
+    def get_config(self, pc_id: None = None) -> Optional[List[FilesConfig]]: ...
+
+    @overload
+    def get_config(self, pc_id: str) -> Optional[FilesConfig]: ...
+
+    def get_config(self, pc_id: str | None = None):
+        """Get PC configuration"""
         conn = None
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
 
-            query = """
-                SELECT 
-                    pc_id,
-                    config_file,
-                    allowed_file,
-                    current_mode,
-                    updated_at
-                FROM pc_configs
-                ORDER BY updated_at DESC
-            """
+            if pc_id is None:
+                query = """
+                    SELECT 
+                        pc_id,
+                        config_file,
+                        allowed_file,
+                        current_mode,
+                        icon,
+                        name,
+                        updated_at
+                    FROM pc_configs
+                    ORDER BY updated_at DESC
+                """
 
-            cursor.execute(query)
-            rows = cursor.fetchall()
+                cursor.execute(query)
+                rows = cursor.fetchall()
 
-            pcs = []
-            for row in rows:
-                pcs.append(
-                    {
-                        "pc_id": row[0],
-                        "config_file": row[1],
-                        "allowed_file": row[2],
-                        "current_mode": row[3],
-                        "updated_at": row[4],
-                    }
+                pcs = []
+                for row in rows:
+                    pcs.append(self.formatRow(row))
+
+                print(f"[DB] Retrieved {len(pcs)} PCs from config")
+                return pcs
+
+            else:
+                cursor.execute(
+                    """
+                    SELECT pc_id, config_file, allowed_file, current_mode, icon, name, updated_at
+                    FROM pc_configs
+                    WHERE pc_id = ?
+                """,
+                    (pc_id,),
                 )
 
-            print(f"[DB] Retrieved {len(pcs)} PCs from config")
-            return pcs
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                return self.formatRow(row)
 
         except sqlite3.Error as e:
-            print(f"[DB] Failed to fetch PCs: {e}")
-            return []
+            print(f"[DB] Failed to get config: {e}")
+            return None
+        finally:
+            if conn:
+                conn.close()
 
+    def formatRow(self, row: Any) -> FilesConfig:
+        raw_icon: bytes = row[4] if row[4] is not None else self.DEFAULT_ICON
+        return FilesConfig(
+            pc_id=row[0],
+            config_file=row[1],
+            allowed_file=row[2],
+            current_mode=row[3],
+            icon=base64.b64encode(raw_icon).decode("utf-8") if raw_icon else None,
+            name=row[5],
+            updated_at=row[6],
+        )
+
+    def save_config(
+        self,
+        pc_id: str,
+        config_file: Optional[str] = None,
+        allowed_file: Optional[str] = None,
+        current_mode: Optional[int] = None,
+        icon: Optional[bytes] = None,
+        name: Optional[str] = None,
+    ) -> bool:
+        """Save or update PC configuration (only updates provided fields)"""
+        conn = None
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+
+            # Check if record exists
+            cursor.execute("SELECT 1 FROM pc_configs WHERE pc_id = ?", (pc_id,))
+            exists = cursor.fetchone() is not None
+
+            if exists:
+                # Update only provided fields
+                updates = []
+                params = []
+
+                if config_file is not None:
+                    updates.append("config_file = ?")
+                    params.append(config_file)
+
+                if allowed_file is not None:
+                    updates.append("allowed_file = ?")
+                    params.append(allowed_file)
+
+                if current_mode is not None:
+                    updates.append("current_mode = ?")
+                    params.append(current_mode)
+
+                if icon is not None:
+                    updates.append("icon = ?")
+                    params.append(icon)
+
+                if name is not None:
+                    updates.append("name = ?")
+                    params.append(name)
+
+                if not updates:
+                    # Nothing to update
+                    return True
+
+                updates.append("updated_at = CURRENT_TIMESTAMP")
+                params.append(pc_id)
+
+                query = f"UPDATE pc_configs SET {', '.join(updates)} WHERE pc_id = ?"
+                cursor.execute(query, params)
+            else:
+                # Insert new record (both can be NULL)
+                cursor.execute(
+                    """
+                    INSERT INTO pc_configs (pc_id, config_file, allowed_file, current_mode, icon, name, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                    (pc_id, config_file, allowed_file, current_mode, icon, name or ""),
+                )
+
+            conn.commit()
+            print(f"[DB] Saved config for pc_id={pc_id}")
+            return True
+
+        except sqlite3.Error as e:
+            print(f"[DB] Failed to save config: {e}")
+            if conn:
+                conn.rollback()
+            return False
         finally:
             if conn:
                 conn.close()
@@ -250,101 +364,6 @@ class Database:
             if conn:
                 conn.rollback()
             return 0
-        finally:
-            if conn:
-                conn.close()
-
-    def save_config(
-        self,
-        pc_id: str,
-        config_file: Optional[str] = None,
-        allowed_file: Optional[str] = None,
-        current_mode: Optional[int] = None,
-    ) -> bool:
-        """Save or update PC configuration (only updates provided fields)"""
-        conn = None
-        try:
-            conn = self.get_connection()
-            cursor = conn.cursor()
-
-            # Check if record exists
-            cursor.execute("SELECT 1 FROM pc_configs WHERE pc_id = ?", (pc_id,))
-            exists = cursor.fetchone() is not None
-
-            if exists:
-                # Update only provided fields
-                updates = []
-                params = []
-
-                if config_file is not None:
-                    updates.append("config_file = ?")
-                    params.append(config_file)
-
-                if allowed_file is not None:
-                    updates.append("allowed_file = ?")
-                    params.append(allowed_file)
-
-                if current_mode is not None:
-                    updates.append("current_mode = ?")
-                    params.append(current_mode)
-
-                if not updates:
-                    # Nothing to update
-                    return True
-
-                updates.append("updated_at = CURRENT_TIMESTAMP")
-                params.append(pc_id)
-
-                query = f"UPDATE pc_configs SET {', '.join(updates)} WHERE pc_id = ?"
-                cursor.execute(query, params)
-            else:
-                # Insert new record (both can be NULL)
-                cursor.execute(
-                    """
-                    INSERT INTO pc_configs (pc_id, config_file, allowed_file, current_mode, updated_at)
-                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                """,
-                    (pc_id, config_file, allowed_file, current_mode),
-                )
-
-            conn.commit()
-            print(f"[DB] Saved config for pc_id={pc_id}")
-            return True
-
-        except sqlite3.Error as e:
-            print(f"[DB] Failed to save config: {e}")
-            if conn:
-                conn.rollback()
-            return False
-        finally:
-            if conn:
-                conn.close()
-
-    def get_config(self, pc_id: str) -> Optional[FilesConfig]:
-        """Get PC configuration"""
-        conn = None
-        try:
-            conn = self.get_connection()
-            cursor = conn.cursor()
-
-            cursor.execute(
-                """
-                SELECT config_file, allowed_file, current_mode, updated_at
-                FROM pc_configs
-                WHERE pc_id = ?
-            """,
-                (pc_id,),
-            )
-
-            row = cursor.fetchone()
-            if row:
-                return FilesConfig(config_file=row[0], allowed_file=row[1], current_mode=row[2])
-
-            return None
-
-        except sqlite3.Error as e:
-            print(f"[DB] Failed to get config: {e}")
-            return None
         finally:
             if conn:
                 conn.close()

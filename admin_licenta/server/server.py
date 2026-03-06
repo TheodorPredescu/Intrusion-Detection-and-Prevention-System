@@ -8,7 +8,7 @@ from fastapi import FastAPI, Query
 from sklearn.svm import OneClassSVM
 from contextlib import asynccontextmanager
 from sklearn.preprocessing import StandardScaler
-from typing import AsyncGenerator, Dict, Optional
+from typing import AsyncGenerator, Dict, Optional, List, Union
 
 import models
 from database_handle import Database
@@ -19,7 +19,7 @@ db = Database()
 ml_model = models.MLModel()
 
 
-config_content: Dict[str, models.FilesConfig] = {}
+config_content: Dict[str, models.ConfigEntity] = {}
 """ All the current configuration content of each pc saved 
 in a map, with the pc_id as its key and the value a instance
 of the class `FilesConfig`."""
@@ -69,6 +69,19 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
 
     yield
 
+    print("[server] Adding entities into the db")
+    for pc_id, config_entity in config_content.items():
+        print(config_entity["config"])
+        added_with_success = db.save_config(
+            pc_id=pc_id,
+            config_file=config_entity["config"].config_file,
+            allowed_file=config_entity["config"].allowed_file,
+            current_mode=config_entity["config"].current_mode,
+            name=config_entity["config"].name,
+        )
+        if not added_with_success:
+            print(f"[server] failed to add config for the user {pc_id}")
+
     """Run on application shutdown"""
     print("[APP] Shutting down")
 
@@ -87,7 +100,6 @@ async def receive_packets(request: models.PacketsRequest):
     Receive batch of network packets
     - **packets**: List of packet data to process
     """
-    print(request)
     pc_id = request.pc_id
     generated_pc_id: str | None = None
 
@@ -126,92 +138,141 @@ async def receive_packets(request: models.PacketsRequest):
     return response_data
 
 
-# @app.post("/model/train")
-# async def train_model(background_tasks: BackgroundTasks):
-#     """
-#     Trigger model training on stored data
-#     """
-#     background_tasks.add_task(train_model_task)
-#     return {
-#         "status": "training_started",
-#         "message": "Model training started in background"
-#     }
+@app.get(
+    "/config/user",
+    response_model=Union[models.FilesConfig, dict[str, str]],
+    response_model_exclude={"icon", "name", "updated_at"},
+)
+async def provide_config_for_user(
+    pc_id: str = Query(...),
+) -> models.FilesConfig | dict[str, str]:
+    """
+    Used by the user to update when a change is wanted.
+    A change is requested by the `update` boolean from `config_content`.
+    The user will call this function every N seconds and if it gets information, it will update.
+    """
 
-# @app.post("/model/reload")
-# async def reload_model():
-#     """
-#     Reload model from disk
-#     """
-#     global ml_model
-#     ml_model = MLModel()
-#
-#     return {
-#         "status": "reloaded",
-#         "loaded": ml_model.loaded,
-#         "num_support_vectors": ml_model.num_support_vectors
-#     }
+    no_need_resp = {"missing": "No config files found."}
 
-
-# TODO: not used, but it should be implemented next.
-@app.get("/config")
-async def provide_config(pc_id: str = Query(...)):
-
-    if pc_id is not None and pc_id in config_content:
-        return config_content[pc_id]
+    if pc_id in config_content:
+        if config_content[pc_id]["update"]:
+            config_content[pc_id]["update"] = False
+            return config_content[pc_id]["config"]
+        else:
+            return no_need_resp
 
     result = db.get_config(pc_id=pc_id)
+    print("Gotten from the db")
+    print(result)
+
     if result is not None:
-        config_content[pc_id] = result
+        config_content[pc_id] = {"config": result, "update": False}
+
+    return no_need_resp
+
+
+@app.get("/config/admin")
+async def provide_config_for_admin(
+    pc_id: str | None = Query(default=None),
+) -> List[models.FilesConfig] | models.FilesConfig | dict[str, str]:
+
+    no_need_resp = {"missing": "No config files found."}
+
+    if pc_id is None:
+        pc_dict = {}
+
+        for entity in config_content.values():
+            pc_dict[entity["config"].pc_id] = entity["config"]
+
+        pc_list_db = db.get_config()
+        if pc_list_db:
+            for entity in pc_list_db:
+                if entity.pc_id not in pc_dict:
+                    pc_dict[entity.pc_id] = entity
+
+        pc_list = list(pc_dict.values())
+
+        return pc_list if pc_list else no_need_resp
+
+    if pc_id in config_content:
+        return config_content[pc_id]["config"]
+
+    result = db.get_config(pc_id=pc_id)
+    print("Gotten from the db")
+    print(result)
+
+    if result is not None:
+        config_content[pc_id] = {"config": result, "update": False}
         return result
 
-    return {"missing": "No config files found."}
+    return no_need_resp
 
 
-@app.post("/config")
-async def set_config(pc_id: str = Query(...), body: Optional[models.FilesConfig] = None):
+@app.post("/config/user", response_model=models.FilesConfig, response_model_exclude={"icon", "name", "updated_at"})
+async def set_config_user(pc_id: str = Query(...), body: Optional[models.FilesConfig] = None):
+    """
+    The client will send only the specific configuration that will be updated.
+    This call will update the map from RAM.
+    If some fields are missing, they will not be nulled (the update function supports optional parameters)
+    """
+
     if pc_id not in config_content:
         db_config = db.get_config(pc_id)
 
-        if db_config:
-            config_content[pc_id] = models.FilesConfig(
-                config_file=db_config.config_file,
-                allowed_file=db_config.allowed_file,
-                current_mode=db_config.current_mode,
-            )
-        else:
-            config_content[pc_id] = models.FilesConfig()
+        config_content[pc_id] = {
+            "config": db_config if db_config else models.FilesConfig(),
+            "update": False,
+        }
 
-    # If body provided, update fields
+    # If body provided, update fields in RAM, not in db
     if body is not None:
         if body.config_file is not None:
-            config_content[pc_id].config_file = body.config_file
+            config_content[pc_id]["config"].config_file = body.config_file
 
         if body.allowed_file is not None:
-            config_content[pc_id].allowed_file = body.allowed_file
+            config_content[pc_id]["config"].allowed_file = body.allowed_file
 
         if body.current_mode is not None:
-            config_content[pc_id].current_mode = body.current_mode
+            config_content[pc_id]["config"].current_mode = body.current_mode
 
-        added_with_success = db.save_config(
-            pc_id=pc_id,
-            config_file=config_content[pc_id].config_file,
-            allowed_file=config_content[pc_id].allowed_file,
-            current_mode=config_content[pc_id].current_mode,
-        )
+    return config_content[pc_id]["config"]
 
-        print(f"Tried to add it in the db the new configuration, result: {added_with_success}")
 
+@app.post("/config/admin")
+async def set_config_admin(pc_id: str = Query(...), body: Optional[models.FilesConfig] = None):
+
+    if pc_id not in config_content:
+        db_config = db.get_config(pc_id)
+
+        config_content[pc_id] = {
+            "config": db_config if db_config else models.FilesConfig(),
+            "update": True,
+        }
+
+    # If body provided, update fields in RAM, not in db
+    if body is not None:
+        if body.config_file is not None:
+            config_content[pc_id]["config"].config_file = body.config_file
+
+        if body.allowed_file is not None:
+            config_content[pc_id]["config"].allowed_file = body.allowed_file
+
+        if body.current_mode is not None:
+            config_content[pc_id]["config"].current_mode = body.current_mode
+
+        if body.icon is not None:
+            config_content[pc_id]["config"].icon = body.icon
+
+        if body.name:
+            config_content[pc_id]["config"].name = body.name
+
+    config_content[pc_id]["update"] = True
     return config_content[pc_id]
 
 
 @app.get("/logs")
 async def get_pc_logs(pc_id: Optional[str] = Query(None), limit: int = Query(20)):
     return {"logs": db.get_logs(pc_id, limit)}
-
-
-@app.get("/pcs")
-async def get_pcs():
-    return {"pcs": db.get_pcs()}
 
 
 # ============================================================================

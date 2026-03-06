@@ -1,7 +1,8 @@
+from datetime import datetime
 import os
 import time
 import struct
-from typing import Dict
+from typing import Dict, TypedDict
 from pydantic import BaseModel
 from typing import List, Optional
 from sklearn.preprocessing import StandardScaler
@@ -33,9 +34,18 @@ class ModelStatus(BaseModel):
 
 
 class FilesConfig(BaseModel):
+    pc_id: str | None = None
     config_file: str | None = None
     allowed_file: str | None = None
     current_mode: int | None = None
+    icon: str | None = None
+    name: str | None = None
+    updated_at: datetime | None = None
+
+
+class ConfigEntity(TypedDict):
+    config: FilesConfig
+    update: bool
 
 
 # ============================================================================

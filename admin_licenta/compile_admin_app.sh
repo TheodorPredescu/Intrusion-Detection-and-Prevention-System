@@ -10,4 +10,4 @@ g++ -std=c++17 -Wall -g \
     imgui/backends/imgui_impl_opengl3.cpp \
     -I. -Iimgui -Iimgui/backends \
     -lglfw -lGL -lssh -lsqlite3 -lpthread -ldl \
-    -o application
+    -lcurl -o application

@@ -4,8 +4,12 @@
 
 // TODO:
 #include "imgui-node-editor/imgui_node_editor.h"
+#include <cstdint>
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
 #include <GLFW/glfw3.h>
+#include <cstdio>
 #include <libssh/libssh.h>
 #include <libssh/sftp.h>
 
@@ -36,7 +40,22 @@
 #include "shared_network_types.h"
 #include "tcp_log_receiver.h"
 
+// States available.
+#define LISTENING 0
+#define MONITORING 1
+#define REACTIVE 2
+#define DISABLED 3
+
+const char *MODES[] = {"LISTENING", "MONITORING", "REACTIVE", "DISABLED"};
+
 using json = nlohmann::json;
+
+enum class Page { MainPage, Topology, Logs, Config, ClientDetail };
+static Page page;
+static std::string pc_id_selected = "";
+
+static const double TARGET_FPS = 30.0;
+static const double TARGET_FRAME_TIME = 1.0 / TARGET_FPS;
 
 // ============================================================================
 // DATA MODEL
@@ -63,6 +82,16 @@ struct PendingConnection {
     ssh_session session = nullptr;
     std::string error_msg;
     std::thread connection_thread;
+};
+
+struct PCInfo {
+    std::string pc_id;
+    std::string updated_at;
+    std::string config_file;
+    std::string allowed_file;
+    int current_mode;
+
+    GLuint icon_texture;
 };
 
 // Global state for pending connections
@@ -183,6 +212,119 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb, std::str
     return newLength;
 }
 
+static GLuint load_texture_from_memory(const std::vector<uint8_t> &data) {
+
+    if (data.empty()) {
+        return 0;
+    }
+
+    int width, height, channels;
+    unsigned char *img_data = stbi_load_from_memory(data.data(), data.size(), &width, &height, &channels, 4);
+
+    if (!img_data) {
+        return 0;
+    }
+
+    GLuint texture_id;
+    glGenTextures(1, &texture_id);
+    glBindTexture(GL_TEXTURE_2D, texture_id);
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, img_data);
+
+    stbi_image_free(img_data);
+    return texture_id;
+}
+
+static std::vector<uint8_t> base64_decode(const std::string &encoded) {
+    static const std::string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    std::vector<uint8_t> data;
+    int val = 0, bits = -8;
+
+    for (unsigned char c : encoded) {
+        if (c == '=' || c == '\n') {
+            continue;
+        }
+        auto pos = chars.find(c);
+        if (pos == std::string::npos) {
+            break;
+        }
+        val = (val << 6) + static_cast<int>(pos);
+        bits += 6;
+        if (bits >= 0) {
+            data.push_back((val >> bits) & 0xFF);
+            bits -= 8;
+        }
+    }
+
+    return data;
+}
+
+static bool fetch_pc_list_config_from_api(std::string &out) {
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        std::cerr << "Failed to initialize CURL\n";
+        return false;
+    }
+
+    // Build the API URL
+    std::string url = "http://127.0.0.1:8080/config/admin";
+
+    out.clear();
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);        // 5 second timeout
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 2L); // 2 second connect timeout
+
+    CURLcode res = curl_easy_perform(curl);
+    bool success = (res == CURLE_OK);
+
+    curl_easy_cleanup(curl);
+    return success;
+}
+
+static bool fetch_pc_config_from_api(const std::string &pc_id, std::string &out) {
+
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        return -1;
+    }
+
+    std::string base_url = "http://127.0.0.1:8080/config/admin?pc_id=" + pc_id;
+
+    curl_easy_setopt(curl, CURLOPT_URL, base_url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+    out.clear();
+
+    curl_easy_setopt(
+        curl, CURLOPT_WRITEFUNCTION, +[](char *ptr, size_t size, size_t nmemb, void *userdata) -> size_t {
+            auto *resp = static_cast<std::string *>(userdata);
+            resp->append(ptr, size * nmemb);
+            return size * nmemb;
+        });
+
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
+
+    CURLcode res = curl_easy_perform(curl);
+
+    bool success = (res == CURLE_OK);
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    return success;
+}
+
 static bool fetch_logs_from_api(const std::string &pc_ip, std::string &out) {
     CURL *curl = curl_easy_init();
     if (!curl) {
@@ -191,8 +333,10 @@ static bool fetch_logs_from_api(const std::string &pc_ip, std::string &out) {
     }
 
     // Build the API URL
-    // Example: http://192.168.0.113:8080/api/logs?ip=192.168.0.113
-    std::string url = "http://127.0.0.1:8080/logs?ip=" + pc_ip;
+    std::string url = "http://127.0.0.1:8080/logs";
+    if (pc_ip != "") {
+        url += "?pc_id=" + pc_ip;
+    }
 
     out.clear();
 
@@ -206,53 +350,15 @@ static bool fetch_logs_from_api(const std::string &pc_ip, std::string &out) {
 
     bool success = (res == CURLE_OK);
     if (!success) {
-        std::cerr << "CURL error for " << pc_ip << ": " << curl_easy_strerror(res) << "\n";
+        std::cerr << "CURL error " << pc_ip << ": " << curl_easy_strerror(res) << "\n";
     }
 
     curl_easy_cleanup(curl);
     return success;
 }
 
-static void start_log_thread(RemotePC *pc) {
-    std::cout << "Starting log thread for " << pc->name << " (" << pc->host << ")\n";
-
-    // Get or create database ID for this PC (if you're using the database)
-    // pc->db_id = log_db.upsert_pc(pc->name, pc->host);
-
-    pc->running = true;
-    pc->logStatus = "Connected";
-
-    pc->logThread = std::thread([pc] {
-        while (pc->running) {
-            std::string tmp;
-
-            // Fetch logs from HTTP API instead of SSH
-            const bool success = fetch_logs_from_api(pc->host, tmp);
-
-            {
-                std::lock_guard<std::mutex> lock(pc->logMutex);
-
-                if (!success) {
-                    pc->logStatus = "ERROR";
-                } else if (tmp.empty()) {
-                    pc->logStatus = "NO DATA";
-                    pc->logBuffer.clear();
-                } else {
-                    pc->logStatus = "OK";
-                    pc->logBuffer = std::move(tmp);
-                }
-            }
-
-            std::this_thread::sleep_for(std::chrono::seconds(3));
-        }
-
-        // No SSH cleanup needed anymore!
-        std::cout << "Log thread stopped for " << pc->name << "\n";
-    });
-}
-
 // ============================================================================
-// HELPERS
+// __________________________________ HELPERS _________________________________
 // ============================================================================
 static std::string make_key(const std::string &name, const std::string &host) {
     return name + "|" + host;
@@ -402,53 +508,6 @@ static bool remove_pc_by_ip(const std::string &ip) {
     return remove_pc(name, host);
 }
 
-// TODO: I need to check this. NOT TESTED!!
-static int read_pc_logs(const std::string pc_id = "") {
-
-    CURL *curl = curl_easy_init();
-    if (!curl) {
-        return -1;
-    }
-
-    std::string base_url = "http://127.0.0.1:8080/logs";
-    if (pc_id != "") {
-        base_url += "?pc_id=" + pc_id;
-    }
-
-    curl_easy_setopt(curl, CURLOPT_URL, base_url.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-
-    struct curl_slist *headers = NULL;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-    std::string response;
-
-    curl_easy_setopt(
-        curl, CURLOPT_WRITEFUNCTION, +[](char *ptr, size_t size, size_t nmemb, void *userdata) -> size_t {
-            auto *resp = static_cast<std::string *>(userdata);
-            resp->append(ptr, size * nmemb);
-            return size * nmemb;
-        });
-
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-
-    CURLcode res = curl_easy_perform(curl);
-    if (res == CURLE_OK) {
-        std::cout << "[DAEMON] ✓ Sent " << response << " packets\n";
-        if (!response.empty()) {
-            // std::cout << "[DAEMON] Backend response: " << response << "\n";
-            // extract_and_store_pc_id(response);
-        }
-    } else {
-        std::cerr << "[DAEMON] Failed: " << curl_easy_strerror(res) << "\n";
-    }
-
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-
-    return 0;
-}
 // ============================================================================
 // SSH Save
 // ============================================================================
@@ -702,8 +761,7 @@ static void trigger_model_training() {
 }
 
 // ===============================================================================================
-// ================================== async connection handling
-// ==================================
+// ================================== async connection handling ==================================
 // ===============================================================================================
 
 // Background connection function
@@ -771,6 +829,7 @@ static void start_async_connection(const char *name, const char *host, const cha
 }
 
 // Check and process completed connections
+// TODO: Should dissapear
 static void process_pending_connections(std::string &successMsg, std::string &errorMsg) {
     std::lock_guard<std::mutex> lock(pending_connection_mutex);
 
@@ -825,7 +884,6 @@ static void process_pending_connections(std::string &successMsg, std::string &er
         RemotePC *raw_ptr = pc.get();
         pc_by_name_host[key] = std::move(pc);
         update_ip_map_for_pc(raw_ptr);
-        start_log_thread(raw_ptr);
 
         successMsg = "Successfully added PC " + pending_connection->name;
     }
@@ -839,8 +897,30 @@ static bool is_connection_pending() {
     return pending_connection != nullptr;
 }
 
-// ================================== Transformations from topology reactivity
-// ==================================
+static GLuint LoadImageAsTexture(const char *pc_id) {
+    char filename[] = "picture.png";
+
+    int width, height, channels;
+    unsigned char *data = stbi_load(filename, &width, &height, &channels, 4);
+
+    if (!data) {
+        std::cerr << "Failed to load image: " << filename << "\n";
+        return 0;
+    }
+
+    GLuint texture_id;
+    glGenTextures(1, &texture_id);
+    glBindTexture(GL_TEXTURE_2D, texture_id);
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+
+    stbi_image_free(data);
+    return texture_id;
+}
+// ================================== Transformations from topology reactivity ==================================
 
 /**
  * Handles interactive panning and zooming of the topology view.
@@ -887,10 +967,271 @@ static ImVec2 to_screen(const ImVec2 &world) {
 }
 
 // ===================================================================================================
-// ===================================== Main UI functionalities
-// =====================================
+// ===================================== Main UI functionalities =====================================
 // ===================================================================================================
 
+static void draw_main_page(const double current_time) {
+    static double previous_time = -10.0;
+    static bool is_context_menu_opened = false;
+    static float blink_time = 0.0f;
+
+    // Fetch logs every 10 seconds
+    static std::vector<std::string> message_history;
+    static std::vector<PCInfo> pcs;
+
+    static PCInfo const *pc_context_menu_selected = nullptr;
+
+    ImGui::Text("Network Monitoring System");
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // TODO: Top buttons
+    if (ImGui::Button("Network Topology")) {}
+
+    ImGui::Spacing();
+    ImGui::Separator();
+
+    // Clients section
+    ImGui::Text("Connected Clients");
+    ImGui::Spacing();
+
+    ImGui::BeginChild("clients_list", ImVec2(0, -200), true);
+
+    // Blinking effect state
+    blink_time += ImGui::GetIO().DeltaTime;
+    const bool blink_visible = fmod(blink_time, 1.0f) < 0.5f;
+
+    if (current_time >= previous_time + 5) {
+        std::cout << previous_time << ", " << current_time << std::endl;
+        previous_time = current_time;
+
+        message_history.clear();
+        std::string pc_logs;
+
+        if (fetch_logs_from_api("", pc_logs)) {
+            try {
+                // Parse JSON response
+                auto logs_json = json::parse(pc_logs);
+
+                if (logs_json.contains("logs") && logs_json["logs"].is_array()) {
+                    for (const auto &log_entry : logs_json["logs"]) {
+
+                        // Extract fields from JSON
+                        std::string timestamp = log_entry.value("timestamp", "N/A");
+                        std::string src_ip = log_entry.value("src_ip", "");
+                        std::string dst_ip = log_entry.value("dst_ip", "");
+                        int src_port = log_entry.value("src_port", 0);
+                        int dst_port = log_entry.value("dst_port", 0);
+                        int protocol = log_entry.value("protocol", 0);
+
+                        // Format message
+                        const char *proto_name = (protocol == 6) ? "TCP" : (protocol == 17) ? "UDP" : "OTHER";
+
+                        std::stringstream ss;
+                        ss << "[" << timestamp << "] " << src_ip << ":" << src_port << " -> " << dst_ip << ":"
+                           << dst_port << " [" << proto_name << "]";
+
+                        message_history.push_back(ss.str());
+                    }
+                }
+            } catch (const std::exception &e) {
+                std::cerr << "JSON parse error for logs: " << e.what() << "\n";
+            }
+        }
+
+        std::string pcs_response;
+
+        if (fetch_pc_list_config_from_api(pcs_response)) {
+            try {
+                // Parse JSON response
+                auto logs_json = json::parse(pcs_response);
+
+                if (logs_json.is_array()) {
+
+                    pcs.clear();
+
+                    for (const auto &pc_entry : logs_json) {
+
+                        PCInfo pc;
+                        // Extract fields from JSON
+                        pc.pc_id = pc_entry.value("pc_id", "");
+                        pc.updated_at = pc_entry.value("updated_at", "N/A");
+                        pc.config_file = pc_entry.value("config_file", "");
+                        pc.allowed_file = pc_entry.value("allowed_file", "");
+                        pc.current_mode = pc_entry.value("current_mode", 3);
+
+                        std::string icon_bytes_encoded = pc_entry.value("icon", "");
+                        if (!icon_bytes_encoded.empty()) {
+                            std::vector<uint8_t> icon_bytes = base64_decode(icon_bytes_encoded);
+                            pc.icon_texture = load_texture_from_memory(icon_bytes);
+                        } else {
+                            pc.icon_texture = 0;
+                        }
+
+                        pcs.push_back(pc);
+                    }
+                }
+            } catch (const std::exception &e) {
+                std::cerr << "JSON parse error in fetching pcs: " << e.what() << "\n";
+            }
+        }
+    }
+
+    // Get clients from your data structure
+    for (PCInfo const &pc : pcs) {
+        ImGui::BeginGroup();
+
+        // Client card background
+        ImVec2 card_pos = ImGui::GetCursorScreenPos();
+        ImVec2 card_size(500, 55);
+
+        // Background color based on mode
+        ImU32 mode_color;
+        const char *mode_name;
+        ImVec4 mode_text_color;
+
+        switch (pc.current_mode) {
+            case 0:
+                mode_name = "LISTENING";
+                mode_color = IM_COL32(100, 200, 100, 50);
+                mode_text_color = ImVec4(0.4f, 0.8f, 0.4f, 1.0f);
+                break;
+            case 1:
+                mode_name = "MONITORING";
+                mode_color = IM_COL32(100, 150, 255, blink_visible ? 80 : 20);
+                mode_text_color = ImVec4(0.4f, 0.6f, 1.0f, 1.0f);
+                break;
+            case 2:
+                mode_name = "REACTIVE";
+                mode_color = IM_COL32(255, 100, 100, blink_visible ? 80 : 20);
+                mode_text_color = ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+                break;
+            case 3:
+                mode_name = "DISABLED";
+                mode_color = IM_COL32(100, 100, 100, 50);
+                mode_text_color = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
+                break;
+            default:
+                mode_name = "UNKNOWN";
+                mode_color = IM_COL32(100, 100, 100, 50);
+                mode_text_color = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
+        }
+
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(card_pos, ImVec2(card_pos.x + card_size.x, card_pos.y + card_size.y), mode_color, 8.0f);
+        dl->AddRect(card_pos, ImVec2(card_pos.x + card_size.x, card_pos.y + card_size.y), IM_COL32(150, 150, 150, 150),
+                    8.0f, 0, 2.0f);
+
+        // Padding
+
+        // Vertical padding
+        ImGui::Dummy(ImVec2(0, 4));
+
+        // I move to the next line
+        ImGui::Dummy(ImVec2(6, 0));
+        // Put content on the same line, so it starts from 10
+        ImGui::SameLine();
+
+        // Icon on the left
+        if (pc.icon_texture != 0) {
+            ImGui::Image((void *)(intptr_t)pc.icon_texture, ImVec2(38, 38), ImVec2(0, 0), ImVec2(1, 1),
+                         ImVec4(1, 1, 1, 1), ImVec4(0.7f, 0.7f, 0.7f, 1.0f));
+            ImGui::SameLine(65);
+        } else {
+            ImGui::SameLine(65);
+        }
+
+        // PC info to the right of icon
+        ImGui::BeginGroup();
+        ImGui::Text("PC ID: %s", pc.pc_id.c_str());
+        ImGui::TextDisabled("Updated: %s", pc.updated_at.c_str());
+        ImGui::EndGroup();
+
+        // Mode on the far right
+        ImGui::SameLine(380);
+        ImGui::PushStyleColor(ImGuiCol_Text, mode_text_color);
+        ImGui::Text("Mode: %s", mode_name);
+        ImGui::PopStyleColor();
+
+        ImGui::Dummy(ImVec2(card_size.x, 0));
+        ImGui::EndGroup();
+
+        // Make the card clickable
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                pc_id_selected = pc.pc_id;
+                page = Page::ClientDetail;
+            } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                pc_context_menu_selected = &pc;
+                ImGui::OpenPopup("pc_context_menu");
+            }
+        }
+
+        ImGui::Spacing();
+        ImGui::Spacing();
+    }
+
+    // Popup on right click on a pc component.
+    if (ImGui::BeginPopup("pc_context_menu")) {
+        ImGui::Text("PC: %s", pc_context_menu_selected->pc_id.c_str());
+        ImGui::Separator();
+
+        if (ImGui::MenuItem("View Details")) {
+            pc_id_selected = pc_context_menu_selected->pc_id;
+            page = Page::ClientDetail;
+            ImGui::CloseCurrentPopup();
+        }
+        if (ImGui::MenuItem("Edit Config")) {
+            pc_id_selected = pc_context_menu_selected->pc_id;
+            page = Page::Config;
+            ImGui::CloseCurrentPopup();
+        }
+        if (ImGui::MenuItem("View Logs")) {
+            pc_id_selected = pc_context_menu_selected->pc_id;
+            page = Page::Logs;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Restart")) {
+            std::cout << "Restart " << pc_context_menu_selected->pc_id << "\n";
+            ImGui::CloseCurrentPopup();
+        }
+        if (ImGui::MenuItem("Delete")) {
+            std::cout << "Delete " << pc_context_menu_selected->pc_id << "\n";
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+
+        // Popup is open this frame
+        is_context_menu_opened = true;
+    } else if (is_context_menu_opened) {
+        pc_context_menu_selected = nullptr;
+        is_context_menu_opened = false;
+    }
+
+    ImGui::EndChild();
+
+    // Message history section
+    ImGui::Separator();
+    ImGui::Text("Recent Messages (Last 20)");
+
+    ImGui::BeginChild("message_history", ImVec2(0, 0), true);
+
+    for (const std::string &msg : message_history) {
+        // TODO: Need to switch collor based on the current mode of the log itself.
+
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.8f, 0.4f, 1.0f));
+        ImGui::TextWrapped("%s", msg.c_str());
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+    }
+
+    ImGui::EndChild();
+}
+
+// TODO: Will dissapear
 static void draw_add_pc() {
     static char name[32] = "pc1";
     static char host[64] = "192.168.0.113";
@@ -1605,11 +1946,203 @@ static void draw_config_editor() {
     ImGui::EndChild(); // config_right
 }
 
-// ===================================================================================================
-// ============================================= Main
-// ================================================
-// ===================================================================================================
-enum class Page { AddPC, Topology, Logs, Config };
+/**
+ * TODO: I remained here!!!
+ */
+static int draw_pc_page(const double current_time) {
+    static double previous_time = -10;
+    static PCInfo pc_selected_data;
+    static std::string last_pc_id = "";
+
+    static std::vector<std::string> message_history;
+
+    if (pc_id_selected.empty()) {
+        ImGui::Text("No PC selected");
+        return -1;
+    }
+
+    const bool pc_changed = pc_id_selected != last_pc_id;
+    if (pc_changed || current_time >= previous_time + 2.5) {
+        previous_time = current_time;
+        last_pc_id = pc_id_selected;
+
+        std::string pcs_response;
+
+        printf("Using ip: %s\n", pc_id_selected.c_str());
+
+        pc_selected_data.pc_id = "";
+        pc_selected_data.updated_at = "";
+        pc_selected_data.config_file = "";
+        pc_selected_data.allowed_file = "";
+        pc_selected_data.current_mode = 4;
+
+        if (fetch_pc_config_from_api(pc_id_selected, pcs_response)) {
+            try {
+                // Parse JSON response
+                auto config_json = json::parse(pcs_response);
+
+                if (config_json.is_object()) {
+
+                    // Extract fields from JSON
+                    pc_selected_data.pc_id = config_json.value("pc_id", "");
+                    pc_selected_data.updated_at = config_json.value("updated_at", "N/A");
+                    pc_selected_data.config_file = config_json.value("config_file", "");
+                    pc_selected_data.allowed_file = config_json.value("allowed_file", "");
+                    pc_selected_data.current_mode = config_json.value("current_mode", 3);
+
+                    std::string icon_bytes_encoded = config_json.value("icon", "");
+                    if (!icon_bytes_encoded.empty()) {
+                        std::vector<uint8_t> icon_bytes = base64_decode(icon_bytes_encoded);
+                        pc_selected_data.icon_texture = load_texture_from_memory(icon_bytes);
+                    } else {
+                        pc_selected_data.icon_texture = 0;
+                    }
+                } else {
+                    printf("I did not received an object\n\n");
+                }
+            } catch (const std::exception &e) {
+                std::cerr << "JSON parse error in fetching pcs: " << e.what() << "\n";
+            }
+        }
+
+        message_history.clear();
+        std::string pc_logs;
+
+        if (fetch_logs_from_api(pc_id_selected, pc_logs)) {
+            try {
+                // Parse JSON response
+                auto logs_json = json::parse(pc_logs);
+                printf("Logs received for %s -> %s\n", pc_id_selected.c_str(), pc_logs.c_str());
+                fflush(stdout);
+
+                if (logs_json.contains("logs") && logs_json["logs"].is_array()) {
+                    for (const auto &log_entry : logs_json["logs"]) {
+
+                        // Extract fields from JSON
+                        std::string timestamp = log_entry.value("timestamp", "N/A");
+                        std::string src_ip = log_entry.value("src_ip", "");
+                        std::string dst_ip = log_entry.value("dst_ip", "");
+                        int src_port = log_entry.value("src_port", 0);
+                        int dst_port = log_entry.value("dst_port", 0);
+                        int protocol = log_entry.value("protocol", 0);
+
+                        // Format message
+                        const char *proto_name = (protocol == 6) ? "TCP" : (protocol == 17) ? "UDP" : "OTHER";
+
+                        std::stringstream ss;
+                        ss << "[" << timestamp << "] " << src_ip << ":" << src_port << " -> " << dst_ip << ":"
+                           << dst_port << " [" << proto_name << "]";
+
+                        message_history.push_back(ss.str());
+                    }
+                }
+            } catch (const std::exception &e) {
+                std::cerr << "JSON parse error for logs: " << e.what() << "\n";
+            }
+        }
+    }
+
+    if (pc_selected_data.pc_id.empty()) {
+        ImGui::TextDisabled("Loading PC information...");
+        printf("Not entered: %s %s %s %d\n", pc_selected_data.pc_id.c_str(), pc_selected_data.allowed_file.c_str(),
+               pc_selected_data.config_file.c_str(), pc_selected_data.current_mode);
+
+        fflush(stdout);
+        return -1;
+    }
+
+    // Get mode color
+    ImU32 mode_bg_color;
+    const char *mode_name;
+    ImVec4 mode_text_color;
+
+    switch (pc_selected_data.current_mode) {
+        case 0:
+            mode_name = "LISTENING";
+            mode_bg_color = IM_COL32(100, 200, 100, 50);
+            mode_text_color = ImVec4(0.4f, 0.8f, 0.4f, 1.0f);
+            break;
+        case 1:
+            mode_name = "MONITORING";
+            mode_bg_color = IM_COL32(100, 150, 255, 80);
+            mode_text_color = ImVec4(0.4f, 0.6f, 1.0f, 1.0f);
+            break;
+        case 2:
+            mode_name = "REACTIVE";
+            mode_bg_color = IM_COL32(255, 100, 100, 80);
+            mode_text_color = ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+            break;
+        case 3:
+            mode_name = "DISABLED";
+            mode_bg_color = IM_COL32(100, 100, 100, 50);
+            mode_text_color = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
+            break;
+        default:
+            mode_name = "UNKNOWN";
+            mode_bg_color = IM_COL32(100, 100, 100, 50);
+            mode_text_color = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
+    }
+
+    // === HEADER SECTION ===
+    ImGui::BeginGroup();
+
+    // Icon on the left
+    if (pc_selected_data.icon_texture != 0) {
+        ImGui::Image((void *)(intptr_t)pc_selected_data.icon_texture, ImVec2(80, 80), ImVec2(0, 0), ImVec2(1, 1),
+                     ImVec4(1, 1, 1, 1), ImVec4(0.7f, 0.7f, 0.7f, 1.0f));
+        ImGui::SameLine(100);
+    } else {
+        ImGui::SameLine(100);
+    }
+
+    // PC info on the right
+    ImGui::BeginGroup();
+    ImGui::Text("PC ID: %s", pc_selected_data.pc_id.c_str());
+    ImGui::PushStyleColor(ImGuiCol_Text, mode_text_color);
+    ImGui::Text("Mode: %s", mode_name);
+    ImGui::PopStyleColor();
+    ImGui::TextDisabled("Updated: %s", pc_selected_data.updated_at.c_str());
+    ImGui::EndGroup();
+
+    ImGui::EndGroup();
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // === DETAILS SECTION ===
+    ImGui::Text("Configuration Details");
+    ImGui::BeginChild("details", ImVec2(0, 180), true);
+    ImGui::TextWrapped("Config File: %s", pc_selected_data.config_file.c_str());
+    ImGui::Spacing();
+    ImGui::TextWrapped("Allowed File: %s", pc_selected_data.allowed_file.c_str());
+    ImGui::EndChild();
+
+    ImGui::Spacing();
+
+    // === LOGS SECTION ===
+    ImGui::Text("Recent Network Activity");
+    ImGui::BeginChild("logs", ImVec2(0, 0), true);
+
+    if (message_history.empty()) {
+        ImGui::TextDisabled("No activity recorded");
+    } else {
+        for (const std::string &msg : message_history) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.8f, 0.5f, 1.0f));
+            ImGui::TextWrapped("%s", msg.c_str());
+            ImGui::PopStyleColor();
+            ImGui::Separator();
+        }
+    }
+
+    ImGui::EndChild();
+
+    return 0;
+}
+
+// ==================================================================================================
+// ============================================ Main ================================================
+// ==================================================================================================
 
 int main() {
     if (!g_network_log_db.open()) {
@@ -1617,9 +2150,6 @@ int main() {
     } else {
         g_tcp_log_receiver.start();
     }
-
-    const double target_fps = 30.0;
-    const double target_frame_time = 1.0 / target_fps;
 
     glfwInit();
     GLFWwindow *wnd = glfwCreateWindow(1400, 900, "Network Inspection App", nullptr, nullptr);
@@ -1634,10 +2164,10 @@ int main() {
     ImGui_ImplGlfw_InitForOpenGL(wnd, true);
     ImGui_ImplOpenGL3_Init("#version 150");
 
-    Page page = Page::AddPC;
+    page = Page::MainPage;
 
     while (!glfwWindowShouldClose(wnd)) {
-        double frame_start = glfwGetTime();
+        const double frame_start = glfwGetTime();
 
         glfwPollEvents();
         ImGui_ImplOpenGL3_NewFrame();
@@ -1656,8 +2186,8 @@ int main() {
         ImGui::Begin("##root", nullptr, flags);
 
         // Create the main top buttons.
-        if (ImGui::Button("Add PC")) {
-            page = Page::AddPC;
+        if (ImGui::Button("Main page")) {
+            page = Page::MainPage;
         }
         ImGui::SameLine();
         if (ImGui::Button("Topology")) {
@@ -1675,14 +2205,22 @@ int main() {
         ImGui::Separator();
 
         // Based on the button pressed, draw the content of the page.
-        if (page == Page::AddPC) {
-            draw_add_pc();
-        } else if (page == Page::Topology) {
-            draw_topology();
-        } else if (page == Page::Logs) {
-            draw_logs();
-        } else if (page == Page::Config) {
-            draw_config_editor();
+        switch (page) {
+            case Page::MainPage:
+                draw_main_page(frame_start);
+                break;
+            case Page::Topology:
+                draw_topology();
+                break;
+            case Page::Logs:
+                draw_logs();
+                break;
+            case Page::Config:
+                draw_config_editor();
+                break;
+            case Page::ClientDetail:
+                draw_pc_page(frame_start);
+                break;
         }
 
         ImGui::End();
@@ -1696,10 +2234,11 @@ int main() {
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(wnd);
 
-        double frame_end = glfwGetTime();
-        double frame_duration = frame_end - frame_start;
-        if (frame_duration < target_frame_time) {
-            std::this_thread::sleep_for(std::chrono::duration<double>(target_frame_time - frame_duration));
+        // Make the fps cap at `target_fps`.
+        const double frame_end = glfwGetTime();
+        const double frame_duration = frame_end - frame_start;
+        if (frame_duration < TARGET_FRAME_TIME) {
+            std::this_thread::sleep_for(std::chrono::duration<double>(TARGET_FRAME_TIME - frame_duration));
         }
     }
 

@@ -8,6 +8,7 @@
 #include <cstring>
 #include <ctime>
 #include <curl/curl.h>
+#include <deque>
 #include <fcntl.h>
 #include <fstream>
 #include <iostream>
@@ -352,6 +353,10 @@ class ConfigDaemon {
             return false;
         }
 
+        if (new_id == pc_id) {
+            return true;
+        }
+
         pc_id = new_id;
 
         if (!save_pc_id_to_file()) {
@@ -364,9 +369,17 @@ class ConfigDaemon {
     }
 
     void send_to_backend(const std::vector<packet_data> &packets) {
-        if (packets.empty()) {
+        static std::deque<packet_data> pending_packets;
+        static const size_t MAX_PENDING = 1000;
+
+        if (packets.empty() && pending_packets.empty()) {
             return;
         }
+
+        std::vector<packet_data> to_send;
+        to_send.reserve(pending_packets.size() + packets.size());
+        to_send.insert(to_send.end(), pending_packets.begin(), pending_packets.end());
+        to_send.insert(to_send.end(), packets.begin(), packets.end());
 
         json payload = json::object();
         // Build JSON manually as string
@@ -376,7 +389,7 @@ class ConfigDaemon {
         }
 
         json packets_array = json::array();
-        for (const auto &pkt : packets) {
+        for (const auto &pkt : to_send) {
             char saddr[16], daddr[16];
             inet_ntop(AF_INET, &pkt.saddr, saddr, sizeof(saddr));
             inet_ntop(AF_INET, &pkt.daddr, daddr, sizeof(daddr));
@@ -432,13 +445,30 @@ class ConfigDaemon {
 
         CURLcode res = curl_easy_perform(curl);
         if (res == CURLE_OK) {
-            std::cout << "[DAEMON] ✓ Sent " << packets.size() << " packets\n";
+            std::cout << "[DAEMON] ✓ Sent " << packets.size() << " packets";
+
+            if (!pending_packets.empty()) {
+                std::cout << " (including " << pending_packets.size() << " retried)";
+            }
+            printf("\n");
+            pending_packets.clear();
+
             if (!response.empty()) {
                 std::cout << "[DAEMON] Backend response: " << response << "\n";
                 extract_and_store_pc_id(response);
             }
         } else {
             std::cerr << "[DAEMON] Failed: " << curl_easy_strerror(res) << "\n";
+
+            // Save for retry, but cap the buffer
+            for (const auto &pkt : packets) {
+                if (pending_packets.size() >= MAX_PENDING) {
+                    std::cerr << "[DAEMON] Pending buffer full (" << MAX_PENDING << "), dropping oldest packet\n";
+                    pending_packets.pop_front();
+                }
+                pending_packets.push_back(pkt);
+            }
+            std::cout << "[DAEMON] Queued for retry: " << pending_packets.size() << " packets total\n";
         }
 
         curl_slist_free_all(headers);
@@ -454,7 +484,6 @@ class ConfigDaemon {
         }
 
         json payload = json::object();
-        std::ostringstream ss;
         // Build JSON manually as string
 
         if (pc_id.empty()) {
@@ -463,10 +492,13 @@ class ConfigDaemon {
 
         if (config_changed) {
             std::ifstream config_file_handle(config_file);
+
             if (!config_file_handle.is_open()) {
                 std::cerr << "[DAEMON] Cannot open config file: " << config_file << "\n";
                 return false;
             }
+
+            std::ostringstream ss;
 
             ss << config_file_handle.rdbuf();
             payload["config_file"] = ss.str();
@@ -481,6 +513,7 @@ class ConfigDaemon {
                 return false;
             }
 
+            std::ostringstream ss;
             ss << allowed_file_handle.rdbuf();
             payload["allowed_file"] = ss.str();
         }
@@ -493,7 +526,7 @@ class ConfigDaemon {
         }
 
         const std::string base_url =
-            "http://" + current_server_ip_str + ":" + current_server_port_str + "/config?pc_id=" + pc_id;
+            "http://" + current_server_ip_str + ":" + current_server_port_str + "/config/user?pc_id=" + pc_id;
         curl_easy_setopt(curl, CURLOPT_URL, base_url.c_str());
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_str.c_str());
 
@@ -550,7 +583,7 @@ class ConfigDaemon {
             }
 
             if (entered_config || entered_allowed_file) {
-                send_configuration_profile();
+                send_configuration_profile(entered_config, entered_allowed_file);
             }
 
             std::this_thread::sleep_for(std::chrono::seconds(15));
@@ -572,7 +605,7 @@ class ConfigDaemon {
                 send_to_backend(pkts);
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         std::cout << "[DAEMON] Packet collector exiting\n";
     }
@@ -594,7 +627,7 @@ class ConfigDaemon {
             }
 
             const std::string base_url =
-                "http://" + current_server_ip_str + ":" + current_server_port_str + "/config?pc_id=" + pc_id;
+                "http://" + current_server_ip_str + ":" + current_server_port_str + "/config/user?pc_id=" + pc_id;
             curl_easy_setopt(curl, CURLOPT_URL, base_url.c_str());
             curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
 

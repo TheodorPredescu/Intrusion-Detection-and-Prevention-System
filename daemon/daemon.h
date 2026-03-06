@@ -24,7 +24,7 @@
 #define DISABLED 3
 
 #define MAX_ALLOWED_DEFINITION_FILE 64
-#define MAX_PACKET_BATCH 50
+#define MAX_PACKET_BATCH 100
 
 
 struct allowed_entry_ioctl {
@@ -40,16 +40,20 @@ struct server_info_ioctl {
 
 struct packet_data {
     UINT32_T saddr;
+
     UINT32_T daddr;
+
     UINT16_T sport;
     UINT16_T dport;
+
+    UINT16_T total_len;
     UINT8_T protocol;
     UINT8_T ttl;
-    UINT16_T total_len;
+
     UINT8_T tcp_flags;
+    UINT8_T src_mac[6];
 
     char indev[16];
-    UINT8_T src_mac[6];
     UINT8_T dst_mac[6];
 };
 
