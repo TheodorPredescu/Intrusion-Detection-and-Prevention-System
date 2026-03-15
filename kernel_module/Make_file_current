@@ -1,0 +1,24 @@
+obj-m += kernel_module.o
+
+all: kernel_module daemon
+
+kernel_module:
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
+
+daemon: daemon.cpp
+	g++ -O2 -std=c++11 -o daemon daemon.cpp -lcurl
+
+clean:
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
+	rm -f daemon
+
+insert: all
+	sudo insmod kernel_module.ko
+	sudo cp daemon /usr/local/bin/
+
+remove:
+	sudo rmmod kernel_module
+	sudo rm /usr/local/bin/daemon
+
+run: install
+	sudo /usr/local/bin/daemon

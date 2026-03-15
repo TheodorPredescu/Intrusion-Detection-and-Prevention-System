@@ -411,7 +411,8 @@ class ConfigDaemon {
                                {"tcp_flags", pkt.tcp_flags},
                                {"iface", std::string(pkt.indev)},
                                {"src_mac", src_mac_str},
-                               {"dst_mac", dst_mac_str}};
+                               {"dst_mac", dst_mac_str},
+                               {"mode", current_state}};
 
             packets_array.push_back(std::move(packet_obj));
         }
@@ -550,6 +551,7 @@ class ConfigDaemon {
             std::cout << "[DAEMON] ✓ new config send to the server.\n";
         } else {
             std::cerr << "[DAEMON] Failed: " << curl_easy_strerror(res) << "\n";
+            return false;
         }
 
         curl_slist_free_all(headers);
@@ -563,12 +565,12 @@ class ConfigDaemon {
         while (running) {
             bool entered_config = false;
             bool entered_allowed_file = false;
+
             time_t config_mtime = get_mtime(config_file);
 
             if (config_mtime > last_config_mtime) {
                 std::cout << "[DAEMON] Config file changed, reloading...\n";
                 if (parse_config()) {
-                    last_config_mtime = config_mtime;
                     entered_config = true;
                 }
             }
@@ -577,13 +579,15 @@ class ConfigDaemon {
             if (allowed_mtime > last_allowed_mtime && !allowed_file.empty()) {
                 std::cout << "[DAEMON] Whitelist file changed, reloading...\n";
                 if (parse_allowed_file()) {
-                    last_allowed_mtime = allowed_mtime;
                     entered_allowed_file = true;
                 }
             }
 
             if (entered_config || entered_allowed_file) {
-                send_configuration_profile(entered_config, entered_allowed_file);
+                if (send_configuration_profile(entered_config, entered_allowed_file)) {
+                    last_config_mtime = config_mtime;
+                    last_allowed_mtime = allowed_mtime;
+                }
             }
 
             std::this_thread::sleep_for(std::chrono::seconds(15));
@@ -654,8 +658,8 @@ class ConfigDaemon {
                         json resp_json = json::parse(response);
 
                         // Example: server returns new config content
-                        if (resp_json.contains("config") && resp_json["config"].is_string()) {
-                            std::string new_config = resp_json["config"].get<std::string>();
+                        if (resp_json.contains("config_file") && resp_json["config_file"].is_string()) {
+                            std::string new_config = resp_json["config_file"].get<std::string>();
 
                             if (new_config.empty()) {
                                 std::cerr << "[DAEMON] Server sent empty config → refusing to overwrite\n";
@@ -705,9 +709,10 @@ class ConfigDaemon {
                         }
 
                         // Same for allowed file
-                        if (resp_json.contains("allowed") && resp_json["allowed"].is_string()) {
-                            if (!allowed_file.empty()) {
-                                std::string new_allowed_conf = resp_json["allowed"].get<std::string>();
+                        if (resp_json.contains("allowed_file") && resp_json["allowed_file"].is_string()) {
+                            std::string new_allowed_conf = resp_json["allowed_file"].get<std::string>();
+
+                            if (!allowed_file.empty() && !new_allowed_conf.empty()) {
 
                                 // Write to disk and reload
                                 std::string tmp_path = allowed_file + ".tmp";
@@ -736,7 +741,7 @@ class ConfigDaemon {
                                     }
 
                                     if (std::rename(tmp_path.c_str(), allowed_file.c_str()) == 0) {
-                                        std::cout << "[DAEMON] new config file added\n";
+                                        std::cout << "[DAEMON] new allowed file added\n";
                                         std::remove(tmp_path.c_str());
                                     } else {
                                         std::cout << "[DAEMON] failed to add a new allowed file\n";

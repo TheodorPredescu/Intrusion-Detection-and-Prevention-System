@@ -3,8 +3,12 @@
 #include "imgui/imgui.h"
 
 // TODO:
-#include "imgui-node-editor/imgui_node_editor.h"
+// #include "imgui-node-editor/imgui_node_editor.h"
+// #include "imnodes/imnodes.h"
+#include <GL/gl.h>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
@@ -25,13 +29,11 @@
 #include <iostream>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <regex>
 #include <set>
 #include <sstream>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -45,66 +47,90 @@
 #define MONITORING 1
 #define REACTIVE 2
 #define DISABLED 3
+#define NO_STATE 255
 
 const char *MODES[] = {"LISTENING", "MONITORING", "REACTIVE", "DISABLED"};
 
 using json = nlohmann::json;
 
-enum class Page { MainPage, Topology, Logs, Config, ClientDetail };
+enum class Page { MainPage, Topology, ClientDetail };
 static Page page;
+
+// Options selected for config file.
 static std::string pc_id_selected = "";
+static std::string changed_config_server_ip = "";
+static std::string changed_config_server_port = "";
+static int changed_config_mode = NO_STATE;
+static std::string changed_config_allowed_file_path = "";
+static bool changed_config_checker = false;
+
+// Options selected for allowed file.
+static std::vector<std::string> changed_allowed_file;
+static bool changed_allowed_file_checker = false;
+
+// Options selected for general info.
+static std::string changed_general_name_given = "";
+static bool changed_general_checker = false;
 
 static const double TARGET_FPS = 30.0;
 static const double TARGET_FRAME_TIME = 1.0 / TARGET_FPS;
 
 // ============================================================================
-// DATA MODEL
+// ________________________________ DATA MODEL ________________________________
 // ============================================================================
 
-// TODO: I could also send with the packages the profile with what  they were selected, so that I can differenciate
-// between them and save them in continuity with their other runs.
-
-struct ExternalNode {
-    std::string ip;
-    ImVec2 pos;
-    std::set<RemotePC *> connected_pcs;
-};
-
-// Used when a new connection is atempted, to not block the execution line.
-struct PendingConnection {
-    std::string name;
-    std::string host;
-    std::string user;
-    std::string pass;
-    std::string bind_ip;
-    std::atomic<bool> completed{false};
-    std::atomic<bool> success{false};
-    ssh_session session = nullptr;
-    std::string error_msg;
-    std::thread connection_thread;
-};
-
-struct PCInfo {
+struct MessageReceived {
     std::string pc_id;
-    std::string updated_at;
-    std::string config_file;
-    std::string allowed_file;
-    int current_mode;
-
-    GLuint icon_texture;
+    std::string timestamp;
+    std::string src_ip;
+    std::string dst_ip;
+    int src_port;
+    int dst_port;
+    int protocol;
+    int mode;
 };
 
-// Global state for pending connections
-static std::unique_ptr<PendingConnection> pending_connection = nullptr;
-static std::mutex pending_connection_mutex;
+/**
+ * The `current_mode` will not be received via the API, but it will be searched and created from `config_file`, when it
+ * is first received.
+ */
+struct PCInfo {
+    std::string pc_id = "";
+    std::string updated_at = "";
+    std::string config_file = "";
+    std::string allowed_file = "";
+
+    /* This will not be received via the API, it will be created when its received.*/
+    int current_mode = NO_STATE;
+
+    GLuint icon_texture_id;
+    std::string name = "";
+};
+
+struct ConnectionStats {
+    std::set<int> ports_out;
+    std::set<int> protocols;
+    std::set<int> ttls;
+    std::set<int> packet_lens;
+    std::set<int> tcp_flags;
+    std::set<int> ports_in;
+    std::set<std::string> mac_addr;
+};
+
+struct TopologyEntry {
+    std::map<std::string, ConnectionStats> connection_dict;
+    std::set<std::string> topology_ip;
+};
+
+struct TopologyType {
+    std::map<std::string, TopologyEntry> topology_connection;
+};
+
+// ============================================================================
 
 // Global structures
-static std::map<std::string, std::unique_ptr<RemotePC>> pc_by_name_host; // key: name + "|" + host
-std::unordered_map<std::string, RemotePC *> ip_to_pc_map;                // fast IP → PC lookup
-static int next_pc_id = 0;
-static std::string selectedRemoveIP;
-static int selectedRemoveIdx = 0; // persistent index
-static std::vector<std::string> ip_list;
+// static std::map<std::string, std::unique_ptr<RemotePC>> pc_by_name_host; // key: name + "|" + host
+// std::unordered_map<std::string, RemotePC *> ip_to_pc_map; // fast IP → PC lookup
 
 static ImVec2 topology_pan = ImVec2(0.0f, 0.0f);
 static float topology_zoom = 1.0f;
@@ -113,103 +139,30 @@ static const float ZOOM_MIN = 0.3f;
 static const float ZOOM_MAX = 3.0f;
 
 // ============================================================================
-// SSH LOG READ
+// ______________________________ Texture helpers _____________________________
 // ============================================================================
 
-// Used to Receive the ips from the `allowed_file`.
-std::set<std::string> parse_allowed_ips(const std::string &text) {
-    std::set<std::string> ips;
-    std::istringstream iss(text);
-    std::string line;
+static GLuint load_image_as_texture(const char *filename) {
 
-    while (std::getline(iss, line)) {
-        // trim spaces
-        line.erase(0, line.find_first_not_of(" \t\r\n"));
-        line.erase(line.find_last_not_of(" \t\r\n") + 1);
+    int width, height, channels;
+    unsigned char *data = stbi_load(filename, &width, &height, &channels, 4);
 
-        if (line.empty()) {
-            continue;
-        }
-
-        size_t colon = line.find(':');
-        std::string ip = (colon == std::string::npos) ? line : line.substr(0, colon);
-
-        ips.insert(ip);
-    }
-
-    return ips;
-}
-
-// static ssh_session connect_to_host(const char *host, const char *user, const char *pass, const char *bind_ip) {
-//     const ssh_session session = ssh_new();
-//     if (!session) {
-//         return nullptr;
-//     }
-//
-//     ssh_options_set(session, SSH_OPTIONS_HOST, host);
-//     ssh_options_set(session, SSH_OPTIONS_USER, user);
-//
-//     // If a bind_ip was provided, set it up.
-//     if (bind_ip && strlen(bind_ip) > 0) {
-//         ssh_options_set(session, SSH_OPTIONS_BINDADDR, bind_ip);
-//     }
-//
-//     const int strict = 0;
-//     ssh_options_set(session, SSH_OPTIONS_STRICTHOSTKEYCHECK, &strict);
-//
-//     if (ssh_connect(session) != SSH_OK) {
-//         goto fail;
-//     }
-//
-//     if (ssh_userauth_password(session, nullptr, pass) != SSH_AUTH_SUCCESS) {
-//         goto fail;
-//     }
-//
-//     return session;
-//
-// fail:
-//     std::cout << "Failed to connect\n";
-//     ssh_disconnect(session);
-//     ssh_free(session);
-//     return nullptr;
-// }
-
-static bool read_remote_log(const ssh_session session, const char *cmd, std::string &out) {
-    const ssh_channel ch = ssh_channel_new(session);
-    if (!ch) {
-        return false;
-    }
-
-    if (ssh_channel_open_session(ch) != SSH_OK || ssh_channel_request_exec(ch, cmd) != SSH_OK) {
-        ssh_channel_free(ch);
-        return false;
-    }
-
-    char buf[4096];
-    int n;
-    out.clear();
-
-    while ((n = ssh_channel_read(ch, buf, sizeof(buf), 0)) > 0) {
-        out.append(buf, n);
-    }
-
-    ssh_channel_close(ch);
-    ssh_channel_free(ch);
-    return true;
-}
-
-// ============================================================================
-// LOG THREAD
-// ============================================================================
-
-static size_t write_callback(void *contents, size_t size, size_t nmemb, std::string *s) {
-    size_t newLength = size * nmemb;
-    try {
-        s->append((char *)contents, newLength);
-    } catch (std::bad_alloc &e) {
+    if (!data) {
+        std::cerr << "Failed to load image: " << filename << "\n";
         return 0;
     }
-    return newLength;
+
+    GLuint texture_id;
+    glGenTextures(1, &texture_id);
+    glBindTexture(GL_TEXTURE_2D, texture_id);
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+
+    stbi_image_free(data);
+    return texture_id;
 }
 
 static GLuint load_texture_from_memory(const std::vector<uint8_t> &data) {
@@ -238,6 +191,36 @@ static GLuint load_texture_from_memory(const std::vector<uint8_t> &data) {
     return texture_id;
 }
 
+static std::vector<uint8_t> read_file_as_bytes(const std::string &path) {
+    std::ifstream file(path, std::ios::binary);
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(file), {});
+}
+
+static std::string base64_encode(const std::vector<uint8_t> &data) {
+    static const char chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string result;
+    int val = 0, bits = -6;
+
+    for (uint8_t c : data) {
+        val = (val << 8) + c;
+        bits += 8;
+        while (bits >= 0) {
+            result.push_back(chars[(val >> bits) & 0x3F]);
+            bits -= 6;
+        }
+    }
+
+    if (bits > -6) {
+        result.push_back(chars[((val << 8) >> (bits + 8)) & 0x3F]);
+    }
+
+    while (result.size() % 4) {
+        result.push_back('=');
+    }
+
+    return result;
+}
+
 static std::vector<uint8_t> base64_decode(const std::string &encoded) {
     static const std::string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -263,6 +246,20 @@ static std::vector<uint8_t> base64_decode(const std::string &encoded) {
     return data;
 }
 
+// ============================================================================
+// ______________________________ Curl functions ______________________________
+// ============================================================================
+
+static size_t write_callback(void *contents, size_t size, size_t nmemb, std::string *s) {
+    size_t newLength = size * nmemb;
+    try {
+        s->append((char *)contents, newLength);
+    } catch (std::bad_alloc &e) {
+        return 0;
+    }
+    return newLength;
+}
+
 static bool fetch_pc_list_config_from_api(std::string &out) {
     CURL *curl = curl_easy_init();
     if (!curl) {
@@ -278,8 +275,8 @@ static bool fetch_pc_list_config_from_api(std::string &out) {
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);        // 5 second timeout
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 2L); // 2 second connect timeout
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 2L);
 
     CURLcode res = curl_easy_perform(curl);
     bool success = (res == CURLE_OK);
@@ -325,7 +322,7 @@ static bool fetch_pc_config_from_api(const std::string &pc_id, std::string &out)
     return success;
 }
 
-static bool fetch_logs_from_api(const std::string &pc_ip, std::string &out) {
+static bool fetch_logs_from_api(const std::string &pc_id, const int limit, std::string &out) {
     CURL *curl = curl_easy_init();
     if (!curl) {
         std::cerr << "Failed to initialize CURL\n";
@@ -334,8 +331,12 @@ static bool fetch_logs_from_api(const std::string &pc_ip, std::string &out) {
 
     // Build the API URL
     std::string url = "http://127.0.0.1:8080/logs";
-    if (pc_ip != "") {
-        url += "?pc_id=" + pc_ip;
+    if (pc_id != "") {
+        url += "?pc_id=" + pc_id;
+    }
+
+    if (limit > 0) {
+        url += "?limit=" + std::to_string(limit);
     }
 
     out.clear();
@@ -350,31 +351,305 @@ static bool fetch_logs_from_api(const std::string &pc_ip, std::string &out) {
 
     bool success = (res == CURLE_OK);
     if (!success) {
-        std::cerr << "CURL error " << pc_ip << ": " << curl_easy_strerror(res) << "\n";
+        std::cerr << "CURL error " << pc_id << ": " << curl_easy_strerror(res) << "\n";
     }
 
     curl_easy_cleanup(curl);
     return success;
 }
 
+static bool fetch_topology_info_from_api(const std::string &pc_id, std::string &out) {
+
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        return -1;
+    }
+
+    std::string base_url = "http://127.0.0.1:8080/topology";
+
+    if (!pc_id.empty()) {
+        base_url += "?pc_id=" + pc_id;
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, base_url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+    out.clear();
+
+    curl_easy_setopt(
+        curl, CURLOPT_WRITEFUNCTION, +[](char *ptr, size_t size, size_t nmemb, void *userdata) -> size_t {
+            auto *resp = static_cast<std::string *>(userdata);
+            resp->append(ptr, size * nmemb);
+            return size * nmemb;
+        });
+
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
+
+    CURLcode res = curl_easy_perform(curl);
+
+    bool success = (res == CURLE_OK);
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    return success;
+}
+
+static bool send_config_via_api(const std::string &pc_id, const std::string &config_file,
+                                const std::string allowed_file = "", const std::string name = "",
+                                const std::string icon_path = "") {
+    if (pc_id.empty()) {
+        return false;
+    }
+
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        std::cerr << "Failed to initialize CURL\n";
+        return false;
+    }
+
+    const std::string url = "http://127.0.0.1:8080/config/admin?pc_id=" + pc_id;
+
+    // Build JSON body
+    json body;
+    if (!config_file.empty()) {
+        body["config_file"] = config_file;
+    }
+    if (!allowed_file.empty()) {
+        body["allowed_file"] = allowed_file;
+    }
+    if (!name.empty()) {
+        body["name"] = name;
+    }
+
+    if (icon_path[0] != '\0') {
+        std::vector<uint8_t> image_data = read_file_as_bytes(icon_path);
+        std::string base64_icon = base64_encode(image_data);
+        body["icon"] = base64_icon;
+    }
+
+    std::string json_str = body.dump();
+
+    // Set up headers
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "POST");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_str.c_str());
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 2L);
+
+    std::string response;
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
+    CURLcode res = curl_easy_perform(curl);
+    bool success = (res == CURLE_OK);
+
+    if (!success) {
+        std::cerr << "CURL error in posting configuration: " << curl_easy_strerror(res) << "\n";
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    return success;
+}
+
 // ============================================================================
 // __________________________________ HELPERS _________________________________
 // ============================================================================
-static std::string make_key(const std::string &name, const std::string &host) {
-    return name + "|" + host;
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+static std::map<std::string, ImVec2>
+compute_graph_layout(const std::set<std::string> &all_ips,
+                     const std::map<std::string, std::set<std::string>> &connections) {
+    std::map<std::string, ImVec2> positions;
+
+    // Get temp directory (cross-platform)
+    std::string temp_dir;
+#ifdef _WIN32
+    char temp_path[MAX_PATH];
+    GetTempPathA(MAX_PATH, temp_path);
+    temp_dir = temp_path;
+#else
+    temp_dir = "/tmp/";
+#endif
+
+    std::string dot_file_path = temp_dir + "graph.dot";
+    std::string txt_file_path = temp_dir + "graph.txt";
+
+    // Generate dot
+    std::string dot = "digraph G {\nrankdir=LR;\nnode [shape=box];\n";
+    dot += "graph [overlap=false];\n";
+    for (const auto &ip : all_ips) {
+        dot += "  \"" + ip + "\";\n";
+    }
+    for (const auto &[src, dests] : connections) {
+        for (const auto &dst : dests) {
+            dot += "  \"" + src + "\" -> \"" + dst + "\";\n";
+        }
+    }
+    dot += "}\n";
+
+    std::ofstream dot_file(dot_file_path);
+    dot_file << dot;
+    dot_file.close();
+
+    // Run graphviz (quote paths for Windows)
+#ifdef _WIN32
+    std::string cmd = "neato -Tplain \"" + dot_file_path + "\" -o \"" + txt_file_path + "\"";
+#else
+    std::string cmd = "neato -Tplain " + dot_file_path + " -o " + txt_file_path + " 2>/dev/null";
+#endif
+    system(cmd.c_str());
+
+    // Parse positions
+    std::ifstream result(txt_file_path);
+    std::string line;
+    while (std::getline(result, line)) {
+        if (!line.empty() && line[0] == 'n') {
+            std::istringstream iss(line);
+            std::string node_type, ip_quoted;
+            float x, y;
+            iss >> node_type >> ip_quoted >> x >> y;
+            std::string ip = ip_quoted.substr(1, ip_quoted.length() - 2);
+            positions[ip] = ImVec2(x * 100, y * 100);
+        }
+    }
+    result.close();
+
+    // Cleanup
+    std::remove(dot_file_path.c_str());
+    std::remove(txt_file_path.c_str());
+
+    return positions;
 }
 
-static void update_ip_map_for_pc(RemotePC *pc) {
-    for (const std::string &ip : pc->ips) {
-        // Add only the new elements info `ip_to_pc_map`
-        ip_to_pc_map.emplace(ip, pc);
+// static std::map<std::string, ImVec2>
+// compute_graph_layout(const std::set<std::string> &all_ips,
+//                      const std::map<std::string, std::set<std::string>> &connections) {
+//
+//     std::map<std::string, ImVec2> positions;
+//
+//     // Generate dot format
+//     std::string dot = "digraph G {\nrankdir=LR;\nnode [shape=box];\n";
+//     dot += "graph [overlap=false];\n";
+//     for (const auto &ip : all_ips) {
+//         dot += "  \"" + ip + "\";\n";
+//     }
+//     for (const auto &[src, dests] : connections) {
+//         for (const auto &dst : dests) {
+//             dot += "  \"" + src + "\" -> \"" + dst + "\";\n";
+//         }
+//     }
+//     dot += "}\n";
+//
+//     // Save dot file
+//     std::ofstream dot_file("/tmp/graph.dot");
+//     dot_file << dot;
+//     dot_file.close();
+//
+//     // Run graphviz
+//     system("neato -Tplain /tmp/graph.dot -o /tmp/graph.txt 2>/dev/null");
+//
+//     // Parse positions
+//     std::ifstream result("/tmp/graph.txt");
+//     std::string line;
+//     while (std::getline(result, line)) {
+//         if (line[0] == 'n') {
+//             std::istringstream iss(line);
+//             std::string node_type, ip_quoted;
+//             float x, y;
+//             iss >> node_type >> ip_quoted >> x >> y;
+//
+//             // Remove quotes from ip
+//             std::string ip = ip_quoted.substr(1, ip_quoted.length() - 2);
+//             positions[ip] = ImVec2(x * 100, y * 100); // scale to screen
+//         }
+//     }
+//     result.close();
+//
+//     return positions;
+// }
+
+static std::string get_protocol_name(const int protocol) {
+    switch (protocol) {
+        case 1:
+            return "ICMP";
+        case 6:
+            return "TCP";
+        case 17:
+            return "UDP";
+        case 41:
+            return "IPv6";
+        case 58:
+            return "ICMPv6";
+        case 88:
+            return "IGRP";
+        default:
+            return "UNKNOWN";
     }
 }
 
-RemotePC *find_pc_by_ip(const std::string &ip) {
-    auto it = ip_to_pc_map.find(ip);
-    return it != ip_to_pc_map.end() ? it->second : nullptr;
+static ImVec4 get_mode_color(const int mode) {
+    switch (mode) {
+        case 0:
+            return ImVec4(0.4f, 0.8f, 0.4f, 1.0f);
+        case 1:
+            return ImVec4(0.4f, 0.6f, 1.0f, 1.0f);
+        case 2:
+            return ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+        case 3:
+            return ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
+        default:
+            return ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
+    }
 }
+
+static void reset_config_modifications() {
+    changed_config_server_port = "";
+    changed_config_server_ip = "";
+    changed_config_mode = NO_STATE;
+    changed_config_allowed_file_path = "";
+    changed_config_checker = false;
+}
+
+static void reset_allowed_modifications() {
+    changed_allowed_file.clear();
+    changed_allowed_file_checker = false;
+}
+
+static void reset_general_user_info() {
+    changed_general_name_given = "";
+    changed_general_checker = false;
+}
+
+static void reset_modifications() {
+    reset_config_modifications();
+    reset_allowed_modifications();
+    reset_general_user_info();
+}
+
+// static void update_ip_map_for_pc(RemotePC *pc) {
+//     for (const std::string &ip : pc->ips) {
+//         // Add only the new elements info `ip_to_pc_map`
+//         ip_to_pc_map.emplace(ip, pc);
+//     }
+// }
+
+// RemotePC *find_pc_by_ip(const std::string &ip) {
+//     auto it = ip_to_pc_map.find(ip);
+//     return it != ip_to_pc_map.end() ? it->second : nullptr;
+// }
 
 std::vector<std::pair<std::string, std::string>> parse_connections(const std::string &log) {
     std::vector<std::pair<std::string, std::string>> connections;
@@ -398,528 +673,355 @@ std::vector<std::pair<std::string, std::string>> parse_connections(const std::st
     return connections;
 }
 
-static bool load_file_from_ssh(const char *host, const char *user, const char *pass, const char *path,
-                               std::string &out) {
-    const ssh_session session = ssh_new();
-    if (!session) {
-        return false;
-    }
-
-    ssh_options_set(session, SSH_OPTIONS_HOST, host);
-    ssh_options_set(session, SSH_OPTIONS_USER, user);
-
-    if (ssh_connect(session) != SSH_OK) {
-        ssh_free(session);
-        return false;
-    }
-
-    if (ssh_userauth_password(session, nullptr, pass) != SSH_AUTH_SUCCESS) {
-        ssh_disconnect(session);
-        ssh_free(session);
-        return false;
-    }
-
-    sftp_session sftp = sftp_new(session);
-    if (!sftp || sftp_init(sftp) != SSH_OK) {
-        sftp_free(sftp);
-        ssh_disconnect(session);
-        ssh_free(session);
-        return false;
-    }
-
-    sftp_file file = sftp_open(sftp, path, O_RDONLY, 0);
-    if (!file) {
-        sftp_free(sftp);
-        ssh_disconnect(session);
-        ssh_free(session);
-        return false;
-    }
-
-    char buf[4096];
-    int n = 0;
-    out.clear();
-
-    while ((n = sftp_read(file, buf, sizeof(buf))) > 0) {
-        out.append(buf, n);
-    }
-
-    sftp_close(file);
-    sftp_free(sftp);
-    ssh_disconnect(session);
-    ssh_free(session);
-    return true;
-}
-
-static bool remove_pc(const std::string &name, const std::string &host) {
-    const std::string key = make_key(name, host);
-    const auto it = pc_by_name_host.find(key);
-    if (it == pc_by_name_host.end()) {
-        return false; // PC not found
-    }
-
-    RemotePC *pc = it->second.get();
-
-    // 1. Stop log thread
-    pc->running = false;
-    if (pc->logThread.joinable()) {
-        pc->logThread.join();
-    }
-
-    // 2. Cleanup SSH session if still active
-    if (pc->session) {
-        ssh_disconnect(pc->session);
-        ssh_free(pc->session);
-        pc->session = nullptr;
-    }
-
-    // 3. Remove from IP → PC map
-    for (const std::string &ip : pc->ips) {
-        auto ip_it = ip_to_pc_map.find(ip);
-        if (ip_it != ip_to_pc_map.end() && ip_it->second == pc) {
-            ip_to_pc_map.erase(ip_it);
-        }
-    }
-
-    // 4. Remove from main PC map
-    pc_by_name_host.erase(it);
-
-    std::cout << "Removed PC " << name << " (" << host << ")\n";
-    return true;
-}
-
-static bool remove_pc_by_ip(const std::string &ip) {
-    std::cout << "Tracked IPs:\n";
-    for (const std::pair<std::string, RemotePC *> pair : ip_to_pc_map) {
-        std::cout << "[" << pair.first << "] -> " << pair.second->name << " (" << pair.second->host << ")\n";
-    }
-
-    const RemotePC *pc = find_pc_by_ip(ip);
-    if (!pc) {
-        std::cout << "PC not found for IP: " << ip << "\n";
-        return false;
-    }
-
-    std::cout << "Found pc by ip: " << pc->name << "\n";
-
-    // IMPORTANT: Copy name and host BEFORE calling remove_pc
-    std::string name = pc->name;
-    std::string host = pc->host;
-
-    return remove_pc(name, host);
-}
-
-// ============================================================================
-// SSH Save
-// ============================================================================
-static int save_file_to_ssh(const char *host, const char *user, const char *pass, const char *path,
-                            const std::string &data) {
-    const ssh_session session = ssh_new();
-    if (!session) {
-        return -1;
-    }
-
-    ssh_options_set(session, SSH_OPTIONS_HOST, host);
-    ssh_options_set(session, SSH_OPTIONS_USER, user);
-
-    if (ssh_connect(session) != SSH_OK) {
-        ssh_free(session);
-        return -2;
-    }
-
-    if (ssh_userauth_password(session, nullptr, pass) != SSH_AUTH_SUCCESS) {
-        ssh_disconnect(session);
-        ssh_free(session);
-        return -3;
-    }
-
-    sftp_session sftp = sftp_new(session);
-    if (!sftp || sftp_init(sftp) != SSH_OK) {
-        sftp_free(sftp);
-        ssh_disconnect(session);
-        ssh_free(session);
-        return -4;
-    }
-
-    const sftp_file file = sftp_open(sftp, path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
-
-    if (!file) {
-        std::cerr << "SFTP open failed on " << path << ": " << ssh_get_error(session) << "\n";
-        sftp_free(sftp);
-        ssh_disconnect(session);
-        ssh_free(session);
-        return -5;
-    }
-
-    size_t left = data.size();
-    const char *ptr = data.c_str();
-
-    while (left > 0) {
-        int written = sftp_write(file, ptr, left);
-        if (written <= 0) {
-            sftp_close(file);
-            sftp_free(sftp);
-            ssh_disconnect(session);
-            ssh_free(session);
-            return -6;
-        }
-        left -= written;
-        ptr += written;
-    }
-
-    sftp_close(file);
-    sftp_free(sftp);
-    ssh_disconnect(session);
-    ssh_free(session);
-    return 1;
-}
-
 /**
- * Extract the allowed file name from the main buffer.
- *
- * @param text represents the main buffer in which it is searched.
+ * @default value: 4
  */
-static std::string extract_allowed_file(const std::string &text) {
-    const std::string key = "allowed_file ";
-    size_t pos = text.find(key);
-    if (pos == std::string::npos) {
+static int extract_current_state(const std::string &config_file) {
+
+    std::string result = config_file;
+    for (auto &c : result) {
+        c = std::tolower(c);
+    }
+    if (result.find("listening") != std::string::npos) {
+        return LISTENING;
+    }
+    if (result.find("monitoring") != std::string::npos) {
+        return MONITORING;
+    }
+    if (result.find("reactive") != std::string::npos) {
+        return REACTIVE;
+    }
+    if (result.find("disabled") != std::string::npos) {
+        return DISABLED;
+    }
+    return NO_STATE;
+}
+
+static void extract_config_info(const std::string &text, std::string &server_ip, std::string &server_port,
+                                std::string &allowed_file) {
+
+    std::istringstream iss(text);
+    std::string line;
+
+    while (std::getline(iss, line)) {
+        // Trim whitespace
+        line.erase(0, line.find_first_not_of(" \t\r\n"));
+        line.erase(line.find_last_not_of(" \t\r\n") + 1);
+
+        if (line.empty()) {
+            continue;
+        }
+
+        // Parse server IP
+        if (line.find("server IP") == 0) {
+            server_ip = line.substr(line.find_last_of(" ") + 1);
+        }
+        // Parse server port
+        else if (line.find("server port") == 0) {
+            server_port = line.substr(line.find_last_of(" ") + 1);
+        }
+        // Parse allowed file
+        else if (line.find("allowed_file") == 0) {
+            allowed_file = line.substr(line.find_last_of(" ") + 1);
+        }
+    }
+}
+
+static std::string create_config_info_string() {
+    if (!changed_config_checker) {
         return "";
     }
 
-    pos += key.length();
-    const size_t end = text.find_first_of("\r\n", pos);
-    return text.substr(pos, end - pos);
+    char buffer[2048];
+    snprintf(buffer, sizeof(buffer), "server IP %s\nserver port %s\n%s\nallowed_file %s\n",
+             changed_config_server_ip.c_str(), changed_config_server_port.c_str(), MODES[changed_config_mode],
+             changed_config_allowed_file_path.c_str());
+
+    return std::string(buffer);
 }
 
 /**
  * Discovers the new ips that a pc might use in the logs.
  */
-static void discover_new_ips() {
-    for (const auto &[key, pc_uptr] : pc_by_name_host) {
-        RemotePC *pc = pc_uptr.get();
+// static void discover_new_ips() {
+//     for (const auto &[key, pc_uptr] : pc_by_name_host) {
+//         RemotePC *pc = pc_uptr.get();
+//
+//         std::string log_copy;
+//         {
+//             std::lock_guard<std::mutex> lock(pc->logMutex);
+//             log_copy = pc->logBuffer;
+//         }
+//
+//         std::vector<std::pair<std::string, std::string>> conns = parse_connections(log_copy);
+//
+//         for (const auto &[_, dst_ip] : conns) {
+//             RemotePC *dst_pc = find_pc_by_ip(dst_ip);
+//
+//             // Check if destination IP belongs to this PC but isn't tracked yet
+//             if (dst_pc) {
+//                 continue;
+//             }
+//             bool ip_appears_in_pc = false;
+//
+//             for (const auto &ip : pc->ips) {
+//                 if (ip == dst_ip) {
+//                     ip_appears_in_pc = true;
+//                     break;
+//                 }
+//             }
+//
+//             if (ip_appears_in_pc == false) {
+//                 pc->ips.push_back(dst_ip);
+//                 update_ip_map_for_pc(pc);
+//             }
+//         }
+//     }
+// }
 
-        std::string log_copy;
-        {
-            std::lock_guard<std::mutex> lock(pc->logMutex);
-            log_copy = pc->logBuffer;
-        }
+static std::map<std::string, PCInfo> *get_pc_info() {
+    static std::map<std::string, PCInfo> pc_map;
+    std::string pcs_response;
 
-        std::vector<std::pair<std::string, std::string>> conns = parse_connections(log_copy);
+    if (fetch_pc_list_config_from_api(pcs_response)) {
+        try {
+            // Parse JSON response
+            auto logs_json = json::parse(pcs_response);
 
-        for (const auto &[_, dst_ip] : conns) {
-            RemotePC *dst_pc = find_pc_by_ip(dst_ip);
+            if (logs_json.is_array()) {
 
-            // Check if destination IP belongs to this PC but isn't tracked yet
-            if (dst_pc) {
-                continue;
-            }
-            bool ip_appears_in_pc = false;
+                pc_map.clear();
 
-            for (const auto &ip : pc->ips) {
-                if (ip == dst_ip) {
-                    ip_appears_in_pc = true;
-                    break;
+                for (const auto &pc_entry : logs_json) {
+
+                    PCInfo pc;
+                    // Extract fields from JSON
+                    pc.pc_id = pc_entry.value("pc_id", "");
+                    pc.name = pc_entry.value("name", "");
+                    pc.updated_at = pc_entry.value("updated_at", "N/A");
+                    pc.config_file = pc_entry.value("config_file", "");
+                    pc.allowed_file = pc_entry.value("allowed_file", "");
+                    pc.current_mode = extract_current_state(pc.config_file);
+
+                    std::string icon_bytes_encoded = pc_entry.value("icon", "");
+                    if (!icon_bytes_encoded.empty()) {
+                        std::vector<uint8_t> icon_bytes = base64_decode(icon_bytes_encoded);
+                        pc.icon_texture_id = load_texture_from_memory(icon_bytes);
+                    } else {
+                        pc.icon_texture_id = 0;
+                    }
+
+                    pc_map.insert({pc.pc_id, pc});
                 }
             }
-
-            if (ip_appears_in_pc == false) {
-                pc->ips.push_back(dst_ip);
-                update_ip_map_for_pc(pc);
-            }
+        } catch (const std::exception &e) {
+            std::cerr << "JSON parse error in fetching pcs: " << e.what() << "\n";
         }
     }
+
+    return &pc_map;
 }
 
-static void distribute_model_to_pcs(const std::string &model_code) {
-    std::vector<std::thread> threads;
+static std::vector<MessageReceived> *get_message_history(const std::string &pc_id = "",
+                                                         std::map<std::string, PCInfo> *pc_map = nullptr,
+                                                         const int limit = -1) {
+    static std::vector<MessageReceived> message_history;
 
-    for (const auto &[_, pc_uptr] : pc_by_name_host) {
-        threads.emplace_back([pc = pc_uptr.get(), model_code]() {
-            ssh_session session = ssh_new();
-            if (!session) {
-                return;
-            }
+    message_history.clear();
+    std::string pc_logs;
 
-            ssh_options_set(session, SSH_OPTIONS_HOST, pc->host.c_str());
-            ssh_options_set(session, SSH_OPTIONS_USER, pc->user.c_str());
+    if (fetch_logs_from_api(pc_id, limit, pc_logs)) {
+        try {
+            // Parse JSON response
+            auto logs_json = json::parse(pc_logs);
 
-            if (ssh_connect(session) != SSH_OK) {
-                ssh_free(session);
-                return;
-            }
+            if (logs_json.contains("logs") && logs_json["logs"].is_array()) {
+                for (const auto &log_entry : logs_json["logs"]) {
 
-            if (ssh_userauth_password(session, nullptr, pc->pass.c_str()) != SSH_AUTH_SUCCESS) {
-                ssh_disconnect(session);
-                ssh_free(session);
-                return;
-            }
+                    // Extract fields from JSON
+                    MessageReceived message;
+                    message.pc_id = log_entry.value("pc_id", "");
+                    message.timestamp = log_entry.value("timestamp", "N/A");
+                    message.src_ip = log_entry.value("src_ip", "");
+                    message.dst_ip = log_entry.value("dst_ip", "");
+                    message.src_port = log_entry.value("src_port", 0);
+                    message.dst_port = log_entry.value("dst_port", 0);
+                    message.protocol = log_entry.value("protocol", 0);
+                    message.mode = log_entry.value("mode", NO_STATE);
 
-            // Upload to /tmp
-            sftp_session sftp = sftp_new(session);
-            if (!sftp || sftp_init(sftp) != SSH_OK) {
-                ssh_disconnect(session);
-                ssh_free(session);
-                return;
-            }
-
-            sftp_file file = sftp_open(sftp, "/tmp/model.bin.tmp", O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
-
-            if (!file) {
-                sftp_free(sftp);
-                ssh_disconnect(session);
-                ssh_free(session);
-                return;
-            }
-
-            const char *data = model_code.data();
-            size_t remaining = model_code.size();
-
-            while (remaining > 0) {
-                int written = sftp_write(file, data, remaining);
-                if (written <= 0) {
-                    break;
+                    message_history.push_back(message);
                 }
-                data += written;
-                remaining -= written;
             }
-
-            sftp_close(file);
-            sftp_free(sftp);
-
-            if (remaining != 0) {
-                ssh_disconnect(session);
-                ssh_free(session);
-                return;
-            }
-
-            // Move into place
-            ssh_channel ch = ssh_channel_new(session);
-            if (!ch || ssh_channel_open_session(ch) != SSH_OK) {
-                ssh_disconnect(session);
-                ssh_free(session);
-                return;
-            }
-
-            const char *cmd = "sudo /usr/bin/mv -f /tmp/model.bin.tmp /etc/model.bin";
-
-            if (ssh_channel_request_exec(ch, cmd) != SSH_OK) {
-                ssh_channel_free(ch);
-                ssh_disconnect(session);
-                ssh_free(session);
-                return;
-            }
-
-            ssh_channel_send_eof(ch);
-            ssh_channel_close(ch);
-
-            int status = ssh_channel_get_exit_status(ch);
-
-            ssh_channel_free(ch);
-            ssh_disconnect(session);
-            ssh_free(session);
-
-            if (status != 0) {
-                // optional minimal error log
-                std::cerr << "[DIST] Deployment failed on " << pc->name << "\n";
-            }
-        });
-    }
-
-    for (auto &t : threads) {
-        if (t.joinable()) {
-            t.join();
+        } catch (const std::exception &e) {
+            std::cerr << "JSON parse error for logs: " << e.what() << "\n";
         }
     }
+
+    return &message_history;
 }
 
-static void trigger_model_training() {
-    const char *filename = "train/model.bin";
-    std::string content;
-    struct stat st;
+static TopologyType get_topology(const std::string pc_id = "") {
+    TopologyType topology;
+    std::string topology_str;
 
-    if (stat("train", &st) == 0 && S_ISDIR(st.st_mode)) {
-        std::ofstream f("train/train_trigger.txt");
-        f << "train_now\n";
-        f.close();
-        std::cout << "[APP] Training triggered, waiting for model...\n";
+    if (fetch_topology_info_from_api(pc_id, topology_str)) {
+        try {
+            printf("[TOPOLOGY] %s\n", topology_str.c_str());
+            auto topology_json = json::parse(topology_str);
 
-        for (int i = 0; i < 120; i++) {
-            std::ifstream f(filename);
-            if (f.good()) {
-                content = std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-                std::cout << "[APP] Model ready (" << content.size() << " bytes)\n";
+            if (topology_json.is_object()) {
+                for (auto &[pc_id, entry_json] : topology_json.items()) {
+                    TopologyEntry entry;
 
-                // Distribute model to all PCs in new thread
-                std::thread dist_thread(distribute_model_to_pcs, content);
-                dist_thread.detach(); // Let it run in background
-                break;
+                    // Parse topology_ip set
+                    if (entry_json.contains("topology_ip") && entry_json["topology_ip"].is_array()) {
+                        for (const auto &ip : entry_json["topology_ip"]) {
+                            entry.topology_ip.insert(ip.get<std::string>());
+                        }
+                    }
+
+                    // Parse connection_dict
+                    if (entry_json.contains("connection_dict") && entry_json["connection_dict"].is_object()) {
+                        for (auto &[src_ip, stats_json] : entry_json["connection_dict"].items()) {
+                            ConnectionStats stats;
+
+                            // Helper lambda to parse int sets
+                            auto parse_int_set = [](const json &j, const std::string &key) -> std::set<int> {
+                                std::set<int> result;
+                                if (j.contains(key) && j[key].is_array()) {
+                                    for (const auto &val : j[key]) {
+                                        result.insert(val.get<int>());
+                                    }
+                                }
+                                return result;
+                            };
+
+                            // Helper lambda to parse string set
+                            auto parse_str_set = [](const json &j, const std::string &key) -> std::set<std::string> {
+                                std::set<std::string> result;
+                                if (j.contains(key) && j[key].is_array()) {
+                                    for (const auto &val : j[key]) {
+                                        result.insert(val.get<std::string>());
+                                    }
+                                }
+                                return result;
+                            };
+
+                            stats.ports_out = parse_int_set(stats_json, "ports_out");
+                            stats.protocols = parse_int_set(stats_json, "protocols");
+                            stats.ttls = parse_int_set(stats_json, "ttls");
+                            stats.packet_lens = parse_int_set(stats_json, "packet_lens");
+                            stats.tcp_flags = parse_int_set(stats_json, "tcp_flags");
+                            stats.ports_in = parse_int_set(stats_json, "ports_in");
+                            stats.mac_addr = parse_str_set(stats_json, "mac_addr");
+
+                            entry.connection_dict[src_ip] = stats;
+                        }
+                    }
+
+                    topology.topology_connection[pc_id] = entry;
+                }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        } catch (const std::exception &e) {
+            std::cerr << "JSON parse error for topology: " << e.what() << "\n";
         }
-    } else {
-        std::cerr << "[APP] train directory does not exist\n";
     }
+
+    return topology;
+}
+
+static std::string recreate_allowed_file(const TopologyEntry &information,
+                                         const std::vector<std::string> &allowed_lines) {
+
+    static std::map<std::string, std::set<int>> allowed_ip_map;
+    allowed_ip_map.clear();
+
+    for (const std::string &line : allowed_lines) {
+        size_t colon_pos = line.find(":");
+
+        // Just the ip, no ports written
+        if (colon_pos == std::string::npos) {
+            allowed_ip_map[line];
+        } else {
+            // IP with ports
+            std::string ip = line.substr(0, colon_pos);
+            std::string ports_str = line.substr(colon_pos + 1);
+
+            // Parse ports (comma-separated)
+            std::istringstream iss(ports_str);
+            std::string port_token;
+            while (std::getline(iss, port_token, ',')) {
+                try {
+                    uint port = std::stoul(port_token);
+
+                    if (port <= 65535) {
+                        allowed_ip_map[ip].insert(port);
+                    } else {
+                        std::cerr << "Port out of range: " << port << "\n";
+                    }
+                } catch (const std::exception &e) {
+                    // Invalid port format, skip
+                    std::cerr << "Invalid port: " << port_token << "\n";
+                }
+            }
+        }
+    }
+
+    for (const auto &[ip, stats] : information.connection_dict) {
+        std::set<int> &ip_set = allowed_ip_map[ip];
+        printf("[TOPOLOGY] tried to add a new set for ip: %s\n", ip.c_str());
+        for (const int &port : stats.ports_out) {
+            ip_set.insert(port);
+            printf("[TOPOLOGY] tried to add a new port : %d\n", port);
+        }
+    }
+
+    std::string allowed_file = "";
+    for (const auto &[ip, port_set] : allowed_ip_map) {
+        allowed_file += ip;
+
+        bool first = true;
+        for (const int port : port_set) {
+            if (first) {
+                first = false;
+                allowed_file += ": ";
+            } else {
+                allowed_file += ", ";
+            }
+
+            allowed_file += std::to_string(port);
+        }
+
+        allowed_file += "\n";
+    }
+
+    return allowed_file;
+}
+
+static std::string transform_messages_to_str(const MessageReceived &message,
+                                             const std::map<std::string, PCInfo> *const pc_map) {
+
+    std::string name = "";
+    if (pc_map != nullptr && !message.pc_id.empty()) {
+        const auto it = (*pc_map).find(message.pc_id);
+        if (it != (*pc_map).end() && !it->second.name.empty()) {
+            name = it->second.name + " ";
+        }
+    }
+
+    const std::string proto_name = get_protocol_name(message.protocol);
+
+    std::stringstream ss;
+    ss << name << "[" << message.timestamp << "] " << message.src_ip << ":" << message.src_port << " -> "
+       << message.dst_ip << ":" << message.dst_port << " [" << proto_name << "]";
+
+    return ss.str();
 }
 
 // ===============================================================================================
 // ================================== async connection handling ==================================
 // ===============================================================================================
 
-// Background connection function
-static void async_connect(PendingConnection *pending) {
-    const ssh_session session = ssh_new();
-    if (!session) {
-        pending->error_msg = "Failed to create SSH session";
-        pending->success = false;
-        pending->completed = true;
-        return;
-    }
-
-    ssh_options_set(session, SSH_OPTIONS_HOST, pending->host.c_str());
-    ssh_options_set(session, SSH_OPTIONS_USER, pending->user.c_str());
-
-    if (!pending->bind_ip.empty() && pending->bind_ip.length() > 0) {
-        ssh_options_set(session, SSH_OPTIONS_BINDADDR, pending->bind_ip.c_str());
-    }
-
-    const int strict = 0;
-    ssh_options_set(session, SSH_OPTIONS_STRICTHOSTKEYCHECK, &strict);
-
-    // Set timeout to avoid hanging forever
-    const long timeout = 10; // 10 seconds
-    ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &timeout);
-
-    if (ssh_connect(session) != SSH_OK) {
-        pending->error_msg = "Failed to connect to " + pending->host + ": " + std::string(ssh_get_error(session));
-        ssh_free(session);
-        pending->success = false;
-        pending->completed = true;
-        return;
-    }
-
-    if (ssh_userauth_password(session, nullptr, pending->pass.c_str()) != SSH_AUTH_SUCCESS) {
-        pending->error_msg = "Authentication failed for " + pending->host;
-        ssh_disconnect(session);
-        ssh_free(session);
-        pending->success = false;
-        pending->completed = true;
-        return;
-    }
-
-    // Success!
-    pending->session = session;
-    pending->success = true;
-    pending->completed = true;
-}
-
-// Start an async connection
-static void start_async_connection(const char *name, const char *host, const char *user, const char *pass,
-                                   const char *bind_ip) {
-
-    std::lock_guard<std::mutex> lock(pending_connection_mutex);
-    pending_connection = std::make_unique<PendingConnection>();
-
-    pending_connection->name = name;
-    pending_connection->host = host;
-    pending_connection->user = user;
-    pending_connection->pass = pass;
-    pending_connection->bind_ip = (bind_ip && strlen(bind_ip) > 0) ? bind_ip : "";
-
-    // Start the connection thread
-    pending_connection->connection_thread = std::thread(async_connect, pending_connection.get());
-}
-
-// Check and process completed connections
-// TODO: Should dissapear
-static void process_pending_connections(std::string &successMsg, std::string &errorMsg) {
-    std::lock_guard<std::mutex> lock(pending_connection_mutex);
-
-    if (pending_connection == nullptr || !pending_connection->completed) {
-        return;
-    }
-    // Join the thread
-    if (pending_connection->connection_thread.joinable()) {
-        pending_connection->connection_thread.join();
-    }
-
-    if (pending_connection->success == false) {
-        // Connection failed
-        errorMsg = pending_connection->error_msg;
-        successMsg.clear();
-        pending_connection = nullptr;
-        return;
-    }
-
-    // Connection successful - add the PC
-    std::string key = make_key(pending_connection->name, pending_connection->host);
-    auto pc_it = pc_by_name_host.find(key);
-
-    if (pc_it != pc_by_name_host.end()) {
-        // Existing PC — add IP if new
-        RemotePC *pc = pc_it->second.get();
-        if (std::find(pc->ips.begin(), pc->ips.end(), pending_connection->host) == pc->ips.end()) {
-            pc->ips.push_back(pending_connection->host);
-            update_ip_map_for_pc(pc);
-            successMsg = "Added IP " + pending_connection->host + " to existing PC " + pending_connection->name;
-
-        } else {
-            successMsg = "PC already exists with this configuration";
-        }
-
-        // Close the duplicate session
-        ssh_disconnect(pending_connection->session);
-        ssh_free(pending_connection->session);
-    } else {
-        // New PC
-        auto pc = std::make_unique<RemotePC>();
-        pc->id = next_pc_id++;
-        pc->name = pending_connection->name;
-        pc->host = pending_connection->host;
-        pc->user = pending_connection->user;
-        pc->pass = pending_connection->pass;
-        pc->bind_ip = pending_connection->bind_ip;
-        pc->session = pending_connection->session;
-        pc->ips = {pending_connection->host};
-        pc->pos = ImVec2(200 + pc->id * 200, 300);
-
-        RemotePC *raw_ptr = pc.get();
-        pc_by_name_host[key] = std::move(pc);
-        update_ip_map_for_pc(raw_ptr);
-
-        successMsg = "Successfully added PC " + pending_connection->name;
-    }
-
-    pending_connection.reset();
-}
-
-// Get count of pending connections
-static bool is_connection_pending() {
-    std::lock_guard<std::mutex> lock(pending_connection_mutex);
-    return pending_connection != nullptr;
-}
-
-static GLuint LoadImageAsTexture(const char *pc_id) {
-    char filename[] = "picture.png";
-
-    int width, height, channels;
-    unsigned char *data = stbi_load(filename, &width, &height, &channels, 4);
-
-    if (!data) {
-        std::cerr << "Failed to load image: " << filename << "\n";
-        return 0;
-    }
-
-    GLuint texture_id;
-    glGenTextures(1, &texture_id);
-    glBindTexture(GL_TEXTURE_2D, texture_id);
-
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-
-    stbi_image_free(data);
-    return texture_id;
-}
 // ================================== Transformations from topology reactivity ==================================
 
 /**
@@ -970,23 +1072,60 @@ static ImVec2 to_screen(const ImVec2 &world) {
 // ===================================== Main UI functionalities =====================================
 // ===================================================================================================
 
-static void draw_main_page(const double current_time) {
-    static double previous_time = -10.0;
+static void draw_main_page(const double &current_time) {
+    static const int REFRESH_INTERVAL = 5; // sec
+    static double previous_time = -REFRESH_INTERVAL;
     static bool is_context_menu_opened = false;
     static float blink_time = 0.0f;
 
-    // Fetch logs every 10 seconds
-    static std::vector<std::string> message_history;
-    static std::vector<PCInfo> pcs;
+    static std::map<std::string, PCInfo> *pc_map;
+
+    // Fetch logs every `REFRESH_INTERVAL` seconds
+    static std::vector<MessageReceived> *message_history_vector;
 
     static PCInfo const *pc_context_menu_selected = nullptr;
+
+    static std::unique_ptr<TopologyType> topology_data = nullptr;
+    static bool activate_training = false;
 
     ImGui::Text("Network Monitoring System");
     ImGui::Separator();
     ImGui::Spacing();
 
-    // TODO: Top buttons
-    if (ImGui::Button("Network Topology")) {}
+    if (ImGui::Button("Network Topology")) {
+        page = Page::Topology;
+        return;
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Button(activate_training ? "Stop Training" : "Train")) {
+        activate_training = !activate_training;
+
+        // TODO: Based on the information from `topology_data`, add all the elements in the allowed_file from the pc_map
+        if (activate_training) {
+            // Change the profile of all the pcs to MONITORING ( I should make a function special for changing mode.)
+            for (const auto &[pc_id, pc_info] : *pc_map) {
+                // Set all the information to all the pcs.
+                // pc_info.config_file - > mode changed to the previous one saved somewere.
+                // The actual information from the pc_info can remain the same, I just need to copy the config string
+                // and change the mode of operation. I can also chose to change in pc_info memory the config, so that I
+                // will not have updating problems with the display or something similar..., but that means that I need
+                // to keep somewere else the current config saved so that I can restore it later... .
+                const std::string monitoring_config = pc_info.config_file;
+                send_config_via_api(pc_id, monitoring_config);
+            }
+        } else {
+
+            // The training has ended and the information needs to be added.
+            // add_information_to_all_pcs(topology_data, pc_map);
+            //
+            for (const auto &[pc_id, pc_info] : *pc_map) {
+                // Set all the information to all the pcs.
+                // pc_info.config_file - > mode changed to the previous one saved somewere.
+                send_config_via_api(pc_id, pc_info.config_file, pc_info.allowed_file);
+            }
+        }
+    }
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -1001,84 +1140,21 @@ static void draw_main_page(const double current_time) {
     blink_time += ImGui::GetIO().DeltaTime;
     const bool blink_visible = fmod(blink_time, 1.0f) < 0.5f;
 
-    if (current_time >= previous_time + 5) {
+    if (current_time >= previous_time + REFRESH_INTERVAL) {
         std::cout << previous_time << ", " << current_time << std::endl;
         previous_time = current_time;
 
-        message_history.clear();
-        std::string pc_logs;
+        pc_map = get_pc_info();
+        message_history_vector = get_message_history("", pc_map);
 
-        if (fetch_logs_from_api("", pc_logs)) {
-            try {
-                // Parse JSON response
-                auto logs_json = json::parse(pc_logs);
-
-                if (logs_json.contains("logs") && logs_json["logs"].is_array()) {
-                    for (const auto &log_entry : logs_json["logs"]) {
-
-                        // Extract fields from JSON
-                        std::string timestamp = log_entry.value("timestamp", "N/A");
-                        std::string src_ip = log_entry.value("src_ip", "");
-                        std::string dst_ip = log_entry.value("dst_ip", "");
-                        int src_port = log_entry.value("src_port", 0);
-                        int dst_port = log_entry.value("dst_port", 0);
-                        int protocol = log_entry.value("protocol", 0);
-
-                        // Format message
-                        const char *proto_name = (protocol == 6) ? "TCP" : (protocol == 17) ? "UDP" : "OTHER";
-
-                        std::stringstream ss;
-                        ss << "[" << timestamp << "] " << src_ip << ":" << src_port << " -> " << dst_ip << ":"
-                           << dst_port << " [" << proto_name << "]";
-
-                        message_history.push_back(ss.str());
-                    }
-                }
-            } catch (const std::exception &e) {
-                std::cerr << "JSON parse error for logs: " << e.what() << "\n";
-            }
-        }
-
-        std::string pcs_response;
-
-        if (fetch_pc_list_config_from_api(pcs_response)) {
-            try {
-                // Parse JSON response
-                auto logs_json = json::parse(pcs_response);
-
-                if (logs_json.is_array()) {
-
-                    pcs.clear();
-
-                    for (const auto &pc_entry : logs_json) {
-
-                        PCInfo pc;
-                        // Extract fields from JSON
-                        pc.pc_id = pc_entry.value("pc_id", "");
-                        pc.updated_at = pc_entry.value("updated_at", "N/A");
-                        pc.config_file = pc_entry.value("config_file", "");
-                        pc.allowed_file = pc_entry.value("allowed_file", "");
-                        pc.current_mode = pc_entry.value("current_mode", 3);
-
-                        std::string icon_bytes_encoded = pc_entry.value("icon", "");
-                        if (!icon_bytes_encoded.empty()) {
-                            std::vector<uint8_t> icon_bytes = base64_decode(icon_bytes_encoded);
-                            pc.icon_texture = load_texture_from_memory(icon_bytes);
-                        } else {
-                            pc.icon_texture = 0;
-                        }
-
-                        pcs.push_back(pc);
-                    }
-                }
-            } catch (const std::exception &e) {
-                std::cerr << "JSON parse error in fetching pcs: " << e.what() << "\n";
-            }
+        // TODO: Training all the pcs.
+        if (activate_training) {
+            topology_data = std::make_unique<TopologyType>(get_topology());
         }
     }
 
     // Get clients from your data structure
-    for (PCInfo const &pc : pcs) {
+    for (const auto &[_, pc] : *pc_map) {
         ImGui::BeginGroup();
 
         // Client card background
@@ -1133,8 +1209,8 @@ static void draw_main_page(const double current_time) {
         ImGui::SameLine();
 
         // Icon on the left
-        if (pc.icon_texture != 0) {
-            ImGui::Image((void *)(intptr_t)pc.icon_texture, ImVec2(38, 38), ImVec2(0, 0), ImVec2(1, 1),
+        if (pc.icon_texture_id != 0) {
+            ImGui::Image((void *)(intptr_t)pc.icon_texture_id, ImVec2(38, 38), ImVec2(0, 0), ImVec2(1, 1),
                          ImVec4(1, 1, 1, 1), ImVec4(0.7f, 0.7f, 0.7f, 1.0f));
             ImGui::SameLine(65);
         } else {
@@ -1143,7 +1219,11 @@ static void draw_main_page(const double current_time) {
 
         // PC info to the right of icon
         ImGui::BeginGroup();
-        ImGui::Text("PC ID: %s", pc.pc_id.c_str());
+        if (!pc.name.empty()) {
+            ImGui::Text("PC name: %s", pc.name.c_str());
+        } else {
+            ImGui::Text("PC ID: %s", pc.pc_id.c_str());
+        }
         ImGui::TextDisabled("Updated: %s", pc.updated_at.c_str());
         ImGui::EndGroup();
 
@@ -1184,12 +1264,7 @@ static void draw_main_page(const double current_time) {
         }
         if (ImGui::MenuItem("Edit Config")) {
             pc_id_selected = pc_context_menu_selected->pc_id;
-            page = Page::Config;
-            ImGui::CloseCurrentPopup();
-        }
-        if (ImGui::MenuItem("View Logs")) {
-            pc_id_selected = pc_context_menu_selected->pc_id;
-            page = Page::Logs;
+            page = Page::ClientDetail;
             ImGui::CloseCurrentPopup();
         }
         ImGui::Separator();
@@ -1219,11 +1294,11 @@ static void draw_main_page(const double current_time) {
 
     ImGui::BeginChild("message_history", ImVec2(0, 0), true);
 
-    for (const std::string &msg : message_history) {
+    for (const MessageReceived &msg : *message_history_vector) {
         // TODO: Need to switch collor based on the current mode of the log itself.
 
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.8f, 0.4f, 1.0f));
-        ImGui::TextWrapped("%s", msg.c_str());
+        ImGui::PushStyleColor(ImGuiCol_Text, get_mode_color(msg.mode));
+        ImGui::TextWrapped("%s", transform_messages_to_str(msg, pc_map).c_str());
         ImGui::PopStyleColor();
         ImGui::Separator();
     }
@@ -1231,750 +1306,816 @@ static void draw_main_page(const double current_time) {
     ImGui::EndChild();
 }
 
-// TODO: Will dissapear
-static void draw_add_pc() {
-    static char name[32] = "pc1";
-    static char host[64] = "192.168.0.113";
-    static char ip[64] = "192.168.0.114";
-    static char user[64] = "theodor";
-    static char pass[64] = "theodor";
-    static std::string errorMsg = "";
-    static std::string successMsg = "";
+/**
+ * TODO:
+ * Should I filter it on the backend and just send it in final version in here?? Another api?? If I do not I would send
+ * to much info via the current api (like 1000 packets and then filter them here.)
+ */
 
-    // Process any completed connections
-    process_pending_connections(successMsg, errorMsg);
+static void draw_topology(const double &current_time) {
+    static const float REFRESH_INTERVAL = 7;
+    static double previous_time = -REFRESH_INTERVAL;
+    static std::map<std::string, PCInfo> *pc_map = nullptr;
+    static TopologyType topology_data;
+    static std::map<std::string, ImVec2> node_positions;
 
-    // ========== ADD PC SECTION ==========
-    ImGui::Text("Add New PC");
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    // Left side - form inputs
-    ImGui::BeginChild("add_form", ImVec2(500, 0), false);
-
-    ImGui::Text("Connection Details:");
-    ImGui::Spacing();
-
-    ImGui::PushItemWidth(200.0f);
-    ImGui::InputText("PC Name", name, sizeof(name));
-    ImGui::InputText("Host Address", host, sizeof(host));
-    ImGui::InputText("Bind IP (optional)", ip, sizeof(ip));
-    ImGui::Spacing();
-
-    ImGui::InputText("Username", user, sizeof(user));
-    ImGui::InputText("Password", pass, sizeof(pass), ImGuiInputTextFlags_Password);
-    ImGui::PopItemWidth();
-
-    ImGui::Spacing();
-    ImGui::Spacing();
-
-    const bool is_connecting = is_connection_pending();
-
-    if (is_connecting) {
-        ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(100, 100, 100, 255));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(100, 100, 100, 255));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(100, 100, 100, 255));
+    if (current_time >= previous_time + REFRESH_INTERVAL) {
+        previous_time = current_time;
+        pc_map = get_pc_info();
+        topology_data = get_topology();
+        node_positions.clear();
     }
 
-    if (ImGui::Button("Add PC", ImVec2(150, 30)) && !is_connecting) {
-        errorMsg.clear();
-        successMsg.clear();
+    if (!pc_map || topology_data.topology_connection.empty()) {
+        return;
+    }
 
-        if (strlen(name) > 0 && strlen(host) > 0) {
-            // Start async connection
+    // Build IP to PC mapping
+    std::map<std::string, std::string> ip_to_pc_id;
+    for (const auto &[pc_id, entry] : topology_data.topology_connection) {
+        for (const auto &ip : entry.topology_ip) {
+            ip_to_pc_id[ip] = pc_id;
+        }
+    }
 
-            // TODO: I check if this host ip matches ones already present, but
-            // if its a sleeping host ip (not active)
-            if (find_pc_by_ip(host) == nullptr) {
-                start_async_connection(name, host, user, pass, ip);
-                successMsg = "Connecting to " + std::string(host) + "...";
+    // Build connections from topology data
+    std::set<std::string> all_nodes;
+    std::map<std::string, std::set<std::string>> connections;
+
+    for (const auto &[receiver_pc_id, entry] : topology_data.topology_connection) {
+        all_nodes.insert(receiver_pc_id);
+
+        // For each source IP that connected to this PC
+        for (const auto &[src_ip, stats] : entry.connection_dict) {
+            std::string sender;
+
+            // Map src_ip to pc_id or keep as external IP
+            if (ip_to_pc_id.find(src_ip) != ip_to_pc_id.end()) {
+                sender = ip_to_pc_id[src_ip];
+                all_nodes.insert(sender);
             } else {
-                errorMsg = "This ip is already tracked.";
+                sender = src_ip;
+                all_nodes.insert(sender);
             }
-        } else {
-            errorMsg = "Name and Host are required fields";
+
+            connections[sender].insert(receiver_pc_id);
         }
     }
 
-    if (is_connecting) {
-        ImGui::PopStyleColor(3);
-        ImGui::SameLine();
-        ImGui::Text("Connecting... ");
-    } else {
-        ImGui::SameLine();
-        ImGui::TextDisabled("Bind IP represents the IP that will be used to\n"
-                            "connect to the Host Address. If its left empty,\n"
-                            "one will be selected automatically.");
+    if (node_positions.empty()) {
+        node_positions = compute_graph_layout(all_nodes, connections);
     }
 
-    ImGui::Spacing();
-    ImGui::Spacing();
-
-    // Display error or success messages
-    if (!errorMsg.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 100, 100, 255));
-        ImGui::TextWrapped("%s", errorMsg.c_str());
-        ImGui::PopStyleColor();
-    }
-
-    if (!successMsg.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(100, 255, 100, 255));
-        ImGui::TextWrapped("%s", successMsg.c_str());
-        ImGui::PopStyleColor();
-    }
-
-    if (ImGui::Button("Train", ImVec2(150, 30))) {
-        trigger_model_training();
-    }
-    ImGui::EndChild();
-
-    // Right side - remove PC section
-    ImGui::SameLine();
-    ImGui::BeginChild("remove_section", ImVec2(0, 0), true);
-
-    ImGui::Text("Remove Tracked PC");
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    // Collect all IPs
-    ip_list.clear();
-    for (const auto &pair : ip_to_pc_map) {
-        ip_list.push_back(pair.first);
-    }
-
-    if (!ip_list.empty()) {
-        if (static_cast<long long>(selectedRemoveIdx) >= static_cast<long long>(ip_list.size())) {
-            selectedRemoveIdx = 0; // reset if list shrunk
-        }
-
-        // Update selectedRemoveIP every frame
-        selectedRemoveIP = ip_list[selectedRemoveIdx];
-
-        ImGui::Text("Select PC by IP:");
-        ImGui::PushItemWidth(-1); // Full width
-        ImGui::Combo(
-            "##remove_combo", &selectedRemoveIdx,
-            [](void *data, int idx, const char **out_text) -> bool {
-                auto &vec = *reinterpret_cast<std::vector<std::string> *>(data);
-                *out_text = vec[idx].c_str();
-                return true;
-            },
-            &ip_list, (int)ip_list.size());
-        ImGui::PopItemWidth();
-
-        ImGui::Spacing();
-
-        if (ImGui::Button("Remove Selected PC", ImVec2(-1, 30))) {
-            std::cout << "Trying to remove PC with IP: " << selectedRemoveIP << "\n";
-            if (!selectedRemoveIP.empty()) {
-                bool success = remove_pc_by_ip(selectedRemoveIP);
-                if (success) {
-                    std::cout << "Successfully removed PC with IP: " << selectedRemoveIP << "\n";
-                    selectedRemoveIP.clear();
-                    selectedRemoveIdx = 0;
-                } else {
-                    std::cout << "Failed to remove PC.\n";
-                }
-            }
-        }
-
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-
-        // Show list of all tracked PCs
-        ImGui::Text("Currently Tracked PCs:");
-        ImGui::Spacing();
-
-        ImGui::BeginChild("pc_list", ImVec2(0, 0), false);
-        for (const auto &[key, pc_uptr] : pc_by_name_host) {
-            ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(120, 190, 255, 255));
-            ImGui::Text("%s", pc_uptr->name.c_str());
-            ImGui::PopStyleColor();
-
-            for (const auto &pc_ip : pc_uptr->ips) {
-                ImGui::BulletText("%s", pc_ip.c_str());
-            }
-            ImGui::Spacing();
-        }
-        ImGui::EndChild();
-
-    } else {
-        ImGui::TextDisabled("No PCs tracked yet.");
-        ImGui::TextDisabled("Add a PC using the form on the left.");
-    }
-
-    ImGui::EndChild();
-}
-
-static void draw_topology() {
     ImGui::BeginChild("canvas", ImVec2(0, 0), true);
     ImDrawList *dl = ImGui::GetWindowDrawList();
     ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
     ImVec2 canvas_size = ImGui::GetContentRegionAvail();
+    ImVec2 mouse = ImGui::GetMousePos();
 
-    calculate_zoom_and_drag();
+    if (ImGui::IsWindowHovered()) {
+        calculate_zoom_and_drag();
+    }
 
+    // Background
     dl->AddRectFilled(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y),
                       IM_COL32(30, 30, 40, 255));
 
-    ImVec2 center(canvas_pos.x + canvas_size.x * 0.5f, canvas_pos.y + canvas_size.y * 0.5f);
+    const float NODE_WIDTH = 150;
+    const float NODE_HEIGHT = 80;
+    const float PIN_RADIUS = 5;
 
-    // === 1. Collect monitored PCs ===
-    std::vector<RemotePC *> monitored_pcs;
-    for (const auto &[key, pc_uptr] : pc_by_name_host) {
-        monitored_pcs.push_back(pc_uptr.get());
-    }
+    std::map<std::string, ImVec2> pin_positions;
+    static int selected_node = -1;
 
-    // === 3. Collect external IPs (first pass - only collect) ===
+    // Draw nodes (same as before)
+    for (const auto &node_key : all_nodes) {
+        bool is_pc = pc_map->find(node_key) != pc_map->end();
+        const PCInfo &pc = is_pc ? pc_map->at(node_key) : PCInfo{};
 
-    // Store in a map the ip of the external pc and a set of all the pcs that
-    // are connected to this ip.
-    std::map<std::string, std::set<RemotePC *>> external_ip_to_pcs;
-    std::map<RemotePC *, std::set<std::string>> pcs_to_ip;
-    std::set<std::pair<int, int>> drawn_monitored_edges;
+        ImVec2 world_pos = node_positions[node_key];
+        ImVec2 screen_node_pos = to_screen(world_pos);
+        ImVec2 node_pos = ImVec2(screen_node_pos.x + canvas_pos.x, screen_node_pos.y + canvas_pos.y);
+        ImVec2 node_size(NODE_WIDTH * topology_zoom, NODE_HEIGHT * topology_zoom);
 
-    for (RemotePC *pc : monitored_pcs) {
-        std::string log_copy;
-        {
-            std::lock_guard<std::mutex> lock(pc->logMutex);
-            log_copy = pc->logBuffer;
-        }
+        ImU32 node_color = is_pc ? IM_COL32(80, 150, 255, 255) : IM_COL32(255, 100, 100, 255);
+        dl->AddRectFilled(node_pos, ImVec2(node_pos.x + node_size.x, node_pos.y + node_size.y), node_color, 8.0f);
+        dl->AddRect(node_pos, ImVec2(node_pos.x + node_size.x, node_pos.y + node_size.y), IM_COL32(255, 255, 255, 200),
+                    8.0f, 0, 2.0f);
 
-        const auto conns = parse_connections(log_copy);
+        std::string node_text = is_pc ? (pc.name.empty() ? pc.pc_id : pc.name) : node_key;
+        ImVec2 text_size = ImGui::CalcTextSize(node_text.c_str());
+        ImVec2 text_pos =
+            ImVec2(node_pos.x + node_size.x / 2 - text_size.x / 2, node_pos.y + node_size.y / 2 - text_size.y / 2);
+        dl->AddText(text_pos, IM_COL32_WHITE, node_text.c_str());
 
-        for (const auto &[src_ip, dst_ip] : conns) {
-            RemotePC *src_pc = find_pc_by_ip(src_ip);
-            RemotePC *dst_pc = find_pc_by_ip(dst_ip);
-
-            // Monitored to monitored - just dedup for later drawing
-            if (src_pc && dst_pc && src_pc != dst_pc) {
-                int a = src_pc->id, b = dst_pc->id;
-                if (a > b) {
-                    std::swap(a, b);
-                }
-                drawn_monitored_edges.insert({a, b});
-            } else if (!src_pc && dst_pc) {
-                // One side is external (meaning the destination is in the list
-                // of tracked files, and the source is not)
-                external_ip_to_pcs[src_ip].insert(dst_pc);
-                pcs_to_ip[dst_pc].insert(src_ip);
-            }
-        }
-    }
-
-    // Space between consecutive rings
-    const float ring_spacing = std::min(canvas_size.x, canvas_size.y) * 0.20f;
-    const float inner_radius = std::min(canvas_size.x, canvas_size.y) * 0.25f;
-    const size_t pc_count = monitored_pcs.size();
-    const int nodes_per_ring = 8;
-    std::map<RemotePC *, int> pcs_total_rings;
-
-    for (RemotePC *pc : monitored_pcs) {
-        int total_nodes = pcs_to_ip[pc].size();
-        int ring_number = 0;
-        if (total_nodes > 0) {
-            ring_number = static_cast<int>(std::ceil(std::log2(static_cast<float>(total_nodes) / nodes_per_ring + 1)));
-        }
-        pcs_total_rings[pc] = ring_number;
-    }
-
-    for (size_t i = 0; i < pc_count; ++i) {
-        if (pc_count <= 1) {
-            monitored_pcs[i]->pos = center;
-        } else {
-            const float angle = i * (2.0f * M_PI / pc_count);
-            const float extra_length = pcs_total_rings[monitored_pcs[i]] * ring_spacing;
-            const float radius = inner_radius + extra_length;
-
-            monitored_pcs[i]->pos = ImVec2(center.x + radius * cosf(angle), center.y + radius * sinf(angle));
-        }
-    }
-
-    // === 4. Create and position external nodes ===
-    std::map<std::string, ExternalNode> external_nodes;
-    // Distance from the connected PC
-    const float orbit_radius_base = std::min(canvas_size.x, canvas_size.y) * 0.20f;
-    /* Max nodes per orbital ring before adding another ring */
-
-    // First, count how many external nodes connect to each PC
-    std::map<RemotePC *, int> nodes_per_pc;
-    for (const auto &[ip, connected_pcs] : external_ip_to_pcs) {
-        if (connected_pcs.size() == 1) {
-            RemotePC *target_pc = *connected_pcs.begin();
-            nodes_per_pc[target_pc]++;
-        }
-    }
-
-    // Track how many nodes we've placed around each PC
-    std::map<RemotePC *, int> current_index_per_pc;
-
-    for (const auto &[ip, connected_pcs] : external_ip_to_pcs) {
-        ExternalNode node;
-        node.ip = ip;
-        node.connected_pcs = connected_pcs;
-
-        if (connected_pcs.empty()) {
-            // Shouldn't happen, but fallback to center
-            node.pos = ImVec2(center.x + orbit_radius_base, center.y);
-        } else if (connected_pcs.size() == 1) {
-            // Connected to single PC - position around it
-            RemotePC *target_pc = *connected_pcs.begin();
-
-            int current_idx = current_index_per_pc[target_pc]++;
-
-            int ring_number = 0;
-            int nodes_before = 0;
-            int nodes_in_ring = nodes_per_ring;
-
-            while (current_idx >= nodes_before + nodes_in_ring) {
-                nodes_before += nodes_in_ring;
-                ring_number++;
-
-                // increase capacity each ring
-                nodes_in_ring += nodes_per_ring;
-            }
-
-            const int position_in_ring = current_idx - nodes_before;
-
-            const float orbit_radius = orbit_radius_base + ring_number * ring_spacing;
-            float angle = (2.0f * M_PI * position_in_ring) / nodes_in_ring;
-
-            if (ring_number % 2 == 1) {
-                angle += M_PI / nodes_in_ring;
-            }
-
-            node.pos =
-                ImVec2(target_pc->pos.x + orbit_radius * cosf(angle), target_pc->pos.y + orbit_radius * sinf(angle));
-
-        } else {
-            // Connected to multiple PCs - position at centroid
-            ImVec2 centroid(0, 0);
-            for (RemotePC *pc : connected_pcs) {
-                centroid.x += pc->pos.x;
-                centroid.y += pc->pos.y;
-            }
-            centroid.x /= connected_pcs.size();
-            centroid.y /= connected_pcs.size();
-
-            // Offset slightly outward from center
-            ImVec2 dir(centroid.x - center.x, centroid.y - center.y);
-            const float len = std::hypot(dir.x, dir.y);
-            if (len > 1e-3f) {
-                dir.x /= len;
-                dir.y /= len;
-                node.pos = ImVec2(centroid.x + dir.x * 60.0f, centroid.y + dir.y * 60.0f);
-            } else {
-                node.pos = centroid;
-            }
-        }
-
-        external_nodes[ip] = node;
-    }
-
-    // === 5. Draw ALL connections (now with correct positions) ===
-    for (RemotePC *pc : monitored_pcs) {
-        std::string log_copy;
-        {
-            std::lock_guard<std::mutex> lock(pc->logMutex);
-            log_copy = pc->logBuffer;
-        }
-
-        const auto conns = parse_connections(log_copy);
-
-        for (const auto &[src_ip, dst_ip] : conns) {
-            RemotePC *src_pc = find_pc_by_ip(src_ip);
-            RemotePC *dst_pc = find_pc_by_ip(dst_ip);
-
-            ImVec2 from_pos, to_pos;
-            ImU32 line_color;
-
-            if (src_pc && dst_pc) {
-                // Monitored ↔ Monitored
-                if (src_pc == dst_pc) {
-                    continue;
-                }
-
-                int a = src_pc->id, b = dst_pc->id;
-                if (a > b) {
-                    std::swap(a, b);
-                }
-
-                if (drawn_monitored_edges.count({a, b}) == 0) {
-                    continue; // already drawn? no - we draw all
-                }
-
-                from_pos = src_pc->pos;
-                to_pos = dst_pc->pos;
-                line_color = IM_COL32(100, 200, 255, 220);
-            } else if (src_pc && external_nodes.count(dst_ip)) {
-                // Monitored → External
-                from_pos = src_pc->pos;
-                to_pos = external_nodes[dst_ip].pos;
-                line_color = IM_COL32(255, 100, 100, 220);
-            } else if (external_nodes.count(src_ip) && dst_pc) {
-                // External → Monitored
-                from_pos = external_nodes[src_ip].pos;
-                to_pos = dst_pc->pos;
-                line_color = IM_COL32(255, 100, 100, 220);
-            } else {
-                continue; // both external - ignore and impossible
-            }
-
-            // Draw line
-            dl->AddLine(to_screen(from_pos), to_screen(to_pos), line_color, 3.0f);
-        }
-    }
-
-    // === 6. Draw external nodes ===
-    int external_circle_radius = 55 * topology_zoom;
-    int monitored_circle_radius = 65 * topology_zoom;
-    int circle_segments = 64;
-    for (const auto &[ip, node] : external_nodes) {
-        bool is_allowed = false;
-
-        auto it = external_ip_to_pcs.find(ip);
-        if (it != external_ip_to_pcs.end() && it->second.size() == 1) {
-            RemotePC *pc = *it->second.begin();
-            if (pc->allowedIps.count(ip)) {
-                is_allowed = true;
-            }
-        }
-
-        ImU32 fillColor = is_allowed ? IM_COL32(255, 220, 80, 255) // yellow
-                                     : IM_COL32(255, 80, 80, 255); // red
-
-        ImU32 borderColor = is_allowed ? IM_COL32(255, 240, 120, 255) : IM_COL32(255, 120, 120, 255);
-
-        dl->AddCircleFilled(to_screen(node.pos), external_circle_radius, fillColor);
-        dl->AddCircle(to_screen(node.pos), external_circle_radius, borderColor, circle_segments, 4.0f);
-
-        ImGui::SetWindowFontScale(topology_zoom);
-        ImVec2 screen_pos = to_screen(node.pos);
-        ImVec2 ts = ImGui::CalcTextSize(ip.c_str());
-
-        dl->AddText(ImVec2(screen_pos.x - ts.x * 0.5f, screen_pos.y - ts.y * 0.5f), IM_COL32_WHITE, ip.c_str());
-        ImGui::SetWindowFontScale(1.0f);
-
-        // Hover for the other nodes presend.
-        ImVec2 mouse = ImGui::GetMousePos();
-        float dx = mouse.x - screen_pos.x;
-        float dy = mouse.y - screen_pos.y;
-
-        if (dx * dx + dy * dy <= external_circle_radius * external_circle_radius) {
-            ImGui::BeginTooltip();
-            ImGui::Text("IP: %s", ip.c_str());
-            ImGui::Separator();
-
-            if (is_allowed) {
-                ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 220, 80, 255));
-                ImGui::Text("Status: Allowed");
-                ImGui::PopStyleColor();
-            } else {
-                ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 80, 80, 255));
-                ImGui::Text("Status: External (Not Allowed)");
-                ImGui::PopStyleColor();
-            }
-
-            if (!node.connected_pcs.empty()) {
-                ImGui::Spacing();
-                ImGui::Text("Connects to:");
-                for (RemotePC *connected_pc : node.connected_pcs) {
-                    ImGui::BulletText("%s", connected_pc->name.c_str());
+        auto get_closest_edge = [](ImVec2 from_center, ImVec2 to_center, float width,
+                                   float height) -> std::pair<ImVec2, std::string> {
+            ImVec2 edges[4] = {
+                ImVec2(from_center.x - width / 2, from_center.y), ImVec2(from_center.x + width / 2, from_center.y),
+                ImVec2(from_center.x, from_center.y - height / 2), ImVec2(from_center.x, from_center.y + height / 2)};
+            std::string names[4] = {"left", "right", "top", "bottom"};
+            float min_dist = FLT_MAX;
+            int closest = 0;
+            for (int i = 0; i < 4; i++) {
+                float dx = edges[i].x - to_center.x;
+                float dy = edges[i].y - to_center.y;
+                float dist = dx * dx + dy * dy;
+                if (dist < min_dist) {
+                    min_dist = dist;
+                    closest = i;
                 }
             }
+            return {edges[closest], names[closest]};
+        };
 
-            ImGui::EndTooltip();
-        }
-    }
+        ImVec2 node_center = ImVec2(node_pos.x + node_size.x / 2, node_pos.y + node_size.y / 2);
 
-    // === 7. Draw monitored nodes on top ===
-    for (RemotePC *pc : monitored_pcs) {
-        dl->AddCircleFilled(to_screen(pc->pos), monitored_circle_radius, IM_COL32(80, 150, 255, 255));
-        dl->AddCircle(to_screen(pc->pos), monitored_circle_radius, IM_COL32(120, 190, 255, 255), circle_segments, 4.0f);
-
-        std::string label = pc->name;
-        if (!pc->ips.empty()) {
-            label += "\n" + pc->ips[0];
-        }
-
-        ImGui::SetWindowFontScale(topology_zoom);
-        ImVec2 ts = ImGui::CalcTextSize(label.c_str());
-        ImVec2 screen_pos = to_screen(pc->pos);
-
-        dl->AddText(ImVec2(screen_pos.x - ts.x * 0.5f, screen_pos.y - ts.y * 0.5f), IM_COL32_WHITE, label.c_str());
-        ImGui::SetWindowFontScale(1.0f);
-
-        // ===== HOVER TOOLTIP =====
-        ImVec2 mouse = ImGui::GetMousePos();
-        float dx = mouse.x - screen_pos.x;
-        float dy = mouse.y - screen_pos.y;
-
-        if (dx * dx + dy * dy <= monitored_circle_radius * monitored_circle_radius) {
-            ImGui::BeginTooltip();
-            ImGui::Text("PC: %s", pc->name.c_str());
-            ImGui::Separator();
-
-            for (const auto &ip : pc->ips) {
-                ImGui::BulletText("%s", ip.c_str());
+        int input_idx = 0;
+        for (const auto &[src, dests] : connections) {
+            if (dests.count(node_key)) {
+                ImVec2 src_screen = to_screen(node_positions[src]);
+                ImVec2 src_center = ImVec2(src_screen.x + canvas_pos.x + NODE_WIDTH * topology_zoom / 2,
+                                           src_screen.y + canvas_pos.y + NODE_HEIGHT * topology_zoom / 2);
+                auto [pin_pos, edge] = get_closest_edge(node_center, src_center, node_size.x, node_size.y);
+                dl->AddCircleFilled(pin_pos, PIN_RADIUS, IM_COL32(150, 200, 255, 255));
+                pin_positions[node_key + "_in_" + std::to_string(input_idx)] = pin_pos;
+                input_idx++;
             }
+        }
 
-            ImGui::EndTooltip();
+        if (connections.find(node_key) != connections.end()) {
+            int output_idx = 0;
+            for (const auto &dst : connections[node_key]) {
+                ImVec2 dst_screen = to_screen(node_positions[dst]);
+                ImVec2 dst_center = ImVec2(dst_screen.x + canvas_pos.x + NODE_WIDTH * topology_zoom / 2,
+                                           dst_screen.y + canvas_pos.y + NODE_HEIGHT * topology_zoom / 2);
+                auto [pin_pos, edge] = get_closest_edge(node_center, dst_center, node_size.x, node_size.y);
+                dl->AddCircleFilled(pin_pos, PIN_RADIUS, IM_COL32(255, 200, 150, 255));
+                pin_positions[node_key + "_out_" + std::to_string(output_idx)] = pin_pos;
+                output_idx++;
+            }
+        }
+
+        bool hovered = mouse.x >= node_pos.x && mouse.x <= node_pos.x + node_size.x && mouse.y >= node_pos.y &&
+                       mouse.y <= node_pos.y + node_size.y;
+        if (hovered) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                selected_node = std::hash<std::string>{}(node_key);
+                ImGui::OpenPopup("topology_menu");
+            }
         }
     }
 
-    ImGui::EndChild();
-}
+    // Draw links
+    for (const auto &[src, dst_set] : connections) {
+        int out_idx = 0;
+        for (const auto &dst : dst_set) {
+            auto it_src = pin_positions.find(src + "_out_" + std::to_string(out_idx));
+            int in_idx = 0;
+            for (const auto &[s, dests] : connections) {
+                if (dests.count(dst) && s == src) {
+                    break;
+                }
+                if (dests.count(dst)) {
+                    in_idx++;
+                }
+            }
+            auto it_dst = pin_positions.find(dst + "_in_" + std::to_string(in_idx));
+            if (it_src != pin_positions.end() && it_dst != pin_positions.end()) {
+                ImVec2 src_pin = it_src->second;
+                ImVec2 dst_pin = it_dst->second;
 
-static void draw_logs() {
-    // TODO: Small bug. If this pc has another ip, it will not be updated right
-    // away. I need to reenter on this page to see the modification.
+                // Node centers
+                ImVec2 src_node_pos = ImVec2(to_screen(node_positions[src]).x + canvas_pos.x,
+                                             to_screen(node_positions[src]).y + canvas_pos.y);
+                ImVec2 dst_node_pos = ImVec2(to_screen(node_positions[dst]).x + canvas_pos.x,
+                                             to_screen(node_positions[dst]).y + canvas_pos.y);
 
-    // To remember the selected option.
-    static int selected = -1;
-    ImGui::BeginChild("left", ImVec2(250, 0), true);
-    int idx = 0;
-    for (const auto &[key, pc_uptr] : pc_by_name_host) {
-        RemotePC *pc = pc_uptr.get();
-        std::string label =
-            pc->name + " (" + std::to_string(pc->ips.size()) + " IP" + (pc->ips.size() > 1 ? "s" : "") + ")";
-        for (const auto &ip : pc->ips) {
-            label += "\n\t" + ip;
+                float src_node_center_x = src_node_pos.x + NODE_WIDTH * topology_zoom / 2;
+                float src_node_center_y = src_node_pos.y + NODE_HEIGHT * topology_zoom / 2;
+                float dst_node_center_x = dst_node_pos.x + NODE_WIDTH * topology_zoom / 2;
+                float dst_node_center_y = dst_node_pos.y + NODE_HEIGHT * topology_zoom / 2;
+
+                // Offsets based on left/right and top/bottom
+                float src_offset_x = 0;
+                if (src_pin.x < src_node_center_x) {
+                    src_offset_x = -50.0f;
+                } else if (src_pin.x > src_node_center_x) {
+                    src_offset_x = 50.0f;
+                }
+
+                float src_offset_y = 0;
+                if (src_pin.y < src_node_center_y) {
+                    src_offset_y = -50.0f;
+                } else if (src_pin.y > src_node_center_y) {
+                    src_offset_y = 50.0f;
+                }
+
+                float dst_offset_x = 0;
+                if (dst_pin.x < dst_node_center_x) {
+                    dst_offset_x = -50.0f;
+                } else if (dst_pin.x > dst_node_center_x) {
+                    dst_offset_x = 50.0f;
+                }
+
+                float dst_offset_y = 0;
+                if (dst_pin.y < dst_node_center_y) {
+                    dst_offset_y = -50.0f;
+                } else if (dst_pin.y > dst_node_center_y) {
+                    dst_offset_y = 50.0f;
+                }
+
+                dl->AddBezierCubic(src_pin, ImVec2(src_pin.x + src_offset_x, src_pin.y + src_offset_y),
+                                   ImVec2(dst_pin.x + dst_offset_x, dst_pin.y + dst_offset_y), dst_pin,
+                                   IM_COL32(100, 200, 255, 255), 2.0f);
+            }
+            out_idx++;
         }
-        if (ImGui::Selectable(label.c_str(), selected == idx)) {
-            selected = idx;
-        }
-        idx++;
-    }
-    ImGui::EndChild();
-
-    ImGui::SameLine();
-    ImGui::BeginChild("right", ImVec2(0, 0), true);
-
-    if (idx == 0) {
-        ImGui::TextDisabled("No PC is currently tracked, add a PC to inspect logs.");
-        ImGui::EndChild();
-
-        // Reset the selected pc if all are removed.
-        selected = -1;
-        return;
     }
 
-    if (selected < 0) {
-        ImGui::TextDisabled("Select a PC from the left pannel to show its logs.");
-        ImGui::EndChild();
-        return;
-    }
-
-    idx = 0;
-    for (const auto &[key, pc_uptr] : pc_by_name_host) {
-        if (idx++ == selected) {
-            std::lock_guard<std::mutex> lock(pc_uptr->logMutex);
-            ImGui::TextUnformatted(pc_uptr->logBuffer.c_str());
-            break;
-        }
-    }
-    ImGui::EndChild();
-}
-
-// TODO: I can change the logs to not send all the data all the time, but change
-// once its read (keeping the reading file way smaller) and just add them
-// continously untill I detect a change in the config file (might be able to
-// detect even if the mode was changed on each pc with a variable?).
-static void draw_config_editor() {
-    static int selectedPC = -1;
-    static int writing_succedded = -1;
-
-    ImGui::BeginChild("config_left", ImVec2(250, 0), true);
-    int idx = 0;
-
-    // Add this check at the start:
-    if (selectedPC >= (int)pc_by_name_host.size()) {
-        selectedPC = -1;
-    }
-
-    for (const auto &[key, pc_uptr] : pc_by_name_host) {
-
-        std::string label = pc_uptr->name + " (" + std::to_string(pc_uptr->ips.size()) + " IP" +
-                            (pc_uptr->ips.size() > 1 ? "s" : "") + ")";
-        for (const auto &ip : pc_uptr->ips) {
-            label += "\n\t" + ip;
-        }
-
-        if (ImGui::Selectable(label.c_str(), selectedPC == idx)) {
-            selectedPC = idx;
-            writing_succedded = -1;
-        }
-        idx++;
-    }
-    ImGui::EndChild();
-
-    ImGui::SameLine();
-    ImGui::BeginChild("config_right", ImVec2(0, 0), true);
-
-    if (idx == 0) {
-        ImGui::TextDisabled("No PC is currently tracked.");
-        ImGui::EndChild();
-
-        // Reset the pc index.
-        selectedPC = -1;
-        return;
-    }
-
-    if (selectedPC < 0) {
-        ImGui::TextDisabled("Select a PC to edit its config.");
-        ImGui::EndChild();
-        return;
-    }
-
-    idx = 0;
-    RemotePC *pc = nullptr;
-    for (auto &[k, p] : pc_by_name_host) {
-        if (idx++ == selectedPC) {
-            pc = p.get();
+    // Hover detection (same as before)
+    std::string hovered_node;
+    for (const auto &node_key : all_nodes) {
+        ImVec2 world_pos = node_positions[node_key];
+        ImVec2 screen_node_pos = to_screen(world_pos);
+        ImVec2 node_pos = ImVec2(screen_node_pos.x + canvas_pos.x, screen_node_pos.y + canvas_pos.y);
+        ImVec2 node_size(NODE_WIDTH * topology_zoom, NODE_HEIGHT * topology_zoom);
+        bool hovered = mouse.x >= node_pos.x && mouse.x <= node_pos.x + node_size.x && mouse.y >= node_pos.y &&
+                       mouse.y <= node_pos.y + node_size.y;
+        if (hovered) {
+            hovered_node = node_key;
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            dl->AddRect(node_pos, ImVec2(node_pos.x + node_size.x, node_pos.y + node_size.y),
+                        IM_COL32(255, 255, 100, 255), 8.0f, 0, 3.0f);
             break;
         }
     }
 
-    if (!pc) {
-        ImGui::TextDisabled("Selected PC no longer exists.");
-        ImGui::EndChild();
-        return;
-    }
+    // Hover message
+    if (!hovered_node.empty()) {
+        bool is_pc = pc_map->find(hovered_node) != pc_map->end();
+        const PCInfo &pc = is_pc ? pc_map->at(hovered_node) : PCInfo{};
 
-    const char *MAIN_FILE = "/etc/mymodule.conf";
+        ImGui::SetNextWindowSizeConstraints(ImVec2(150, 0), ImVec2(400, 500));
+        ImGui::BeginTooltip();
 
-    // === Load config once ===
-    if (!pc->configLoaded) {
-        if (load_file_from_ssh(pc->host.c_str(), pc->user.c_str(), pc->pass.c_str(), MAIN_FILE, pc->mainConfig)) {
+        if (is_pc) {
+            ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "ID: %s", hovered_node.c_str());
+            ImGui::Text("Name: %s", pc.name.empty() ? pc.pc_id.c_str() : pc.name.c_str());
+            ImGui::Text("Mode: %s", MODES[pc.current_mode]);
 
-            pc->allowedPath = extract_allowed_file(pc->mainConfig);
-            if (!pc->allowedPath.empty()) {
-                load_file_from_ssh(pc->host.c_str(), pc->user.c_str(), pc->pass.c_str(), pc->allowedPath.c_str(),
-                                   pc->allowedConfig);
+            // Show all topology IPs for this PC
+            if (topology_data.topology_connection.find(hovered_node) != topology_data.topology_connection.end()) {
+                const auto &entry = topology_data.topology_connection.at(hovered_node);
+                if (!entry.topology_ip.empty()) {
+                    ImGui::Separator();
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "IPs:");
+                    for (const auto &ip : entry.topology_ip) {
+                        ImGui::BulletText("%s", ip.c_str());
+                    }
+                }
             }
+        } else {
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "External IP: %s", hovered_node.c_str());
 
-            pc->mainEditBuf.assign(pc->mainConfig.begin(), pc->mainConfig.end());
-            pc->mainEditBuf.push_back('\0');
+            // Find which PC(s) received from this external IP
+            for (const auto &[pc_id, entry] : topology_data.topology_connection) {
+                if (entry.connection_dict.find(hovered_node) != entry.connection_dict.end()) {
+                    const auto &stats = entry.connection_dict.at(hovered_node);
 
-            pc->allowedEditBuf.assign(pc->allowedConfig.begin(), pc->allowedConfig.end());
-            pc->allowedEditBuf.push_back('\0');
+                    ImGui::Separator();
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "To: %s", pc_id.c_str());
 
-            pc->configLoaded = true;
+                    // Ports Out
+                    if (!stats.ports_out.empty()) {
+                        std::string ports_str = "Ports Out: ";
+                        for (int port : stats.ports_out) {
+                            ports_str += std::to_string(port) + ", ";
+                        }
+                        ports_str.pop_back();
+                        ports_str.pop_back();
+                        ImGui::TextWrapped("%s", ports_str.c_str());
+                    }
 
-            // Save in a different place the ips allowed.
-            pc->allowedIps = parse_allowed_ips(pc->allowedConfig);
-        }
-    }
+                    // Ports In
+                    if (!stats.ports_in.empty()) {
+                        std::string ports_str = "Ports In: ";
+                        for (int port : stats.ports_in) {
+                            ports_str += std::to_string(port) + ", ";
+                        }
+                        ports_str.pop_back();
+                        ports_str.pop_back();
+                        ImGui::TextWrapped("%s", ports_str.c_str());
+                    }
 
-    // === Tabs ===
-    if (ImGui::Button("Main Config")) {
-        pc->editingMain = true;
-        writing_succedded = -1;
-    }
+                    // Protocols
+                    if (!stats.protocols.empty()) {
+                        std::string proto_str = "Protocols: ";
+                        for (int proto : stats.protocols) {
+                            proto_str += get_protocol_name(proto) + ", ";
+                        }
+                        proto_str.pop_back();
+                        proto_str.pop_back();
+                        ImGui::TextWrapped("%s", proto_str.c_str());
+                    }
 
-    ImGui::SameLine();
-    if (!pc->allowedPath.empty()) {
-        if (ImGui::Button("Allowed File")) {
-            pc->editingMain = false;
-            writing_succedded = -1;
-        }
-    }
-
-    ImGui::Separator();
-
-    std::string &active = pc->editingMain ? pc->mainConfig : pc->allowedConfig;
-    std::vector<char> &buf = pc->editingMain ? pc->mainEditBuf : pc->allowedEditBuf;
-    const char *path = pc->editingMain ? MAIN_FILE : pc->allowedPath.c_str();
-
-    ImGui::Text("Editing: %s", path);
-
-    auto resizeCb = [](ImGuiInputTextCallbackData *data) -> int {
-        if (data->EventFlag == ImGuiInputTextFlags_CallbackResize) {
-            auto *vec = reinterpret_cast<std::vector<char> *>(data->UserData);
-            vec->resize(data->BufSize);
-            data->Buf = vec->data();
-        }
-        return 0;
-    };
-
-    bool changed = ImGui::InputTextMultiline("##editor", buf.data(), buf.size(), ImVec2(-1, -60),
-                                             ImGuiInputTextFlags_AllowTabInput | ImGuiInputTextFlags_CallbackResize,
-                                             resizeCb, &buf);
-
-    // If the input box changed, update the menu with still active.
-    if (changed) {
-        writing_succedded = -1;
-        active = std::string(buf.data());
-    }
-
-    if (ImGui::Button("Save")) {
-        writing_succedded = save_file_to_ssh(pc->host.c_str(), pc->user.c_str(), pc->pass.c_str(), path, active);
-    }
-
-    if (writing_succedded <= 0) {
-        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 100, 100, 255));
-        ImGui::TextWrapped("Failed to write the file, try again!");
-        ImGui::PopStyleColor();
-    }
-
-    if (writing_succedded == 1) {
-        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(100, 255, 100, 255));
-        ImGui::TextWrapped("Saved successfully to:%s\n", path);
-        ImGui::PopStyleColor();
-
-        // If we just saved the main config, check if allowed_file path changed
-        if (pc->editingMain) {
-            std::string newAllowed = extract_allowed_file(active);
-            if (newAllowed != pc->allowedPath) {
-                pc->allowedPath = newAllowed;
-                if (!newAllowed.empty()) {
-                    // Reload the new allowed file; Create a new ssh connection
-                    // with that will be used to read.
-                    if (load_file_from_ssh(pc->host.c_str(), pc->user.c_str(), pc->pass.c_str(), newAllowed.c_str(),
-                                           pc->allowedConfig)) {
-                        pc->allowedEditBuf.assign(pc->allowedConfig.begin(), pc->allowedConfig.end());
-                        pc->allowedEditBuf.push_back('\0');
+                    // MAC addresses
+                    if (!stats.mac_addr.empty()) {
+                        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "MAC Addresses:");
+                        for (const auto &mac : stats.mac_addr) {
+                            ImGui::BulletText("%s", mac.c_str());
+                        }
                     }
                 }
             }
         }
 
-        // Reload the allowed IPs
-        pc->allowedIps = parse_allowed_ips(pc->allowedConfig);
+        ImGui::EndTooltip();
     }
-    ImGui::EndChild(); // config_right
+
+    // Context menu (same as before)
+    if (ImGui::BeginPopup("topology_menu")) {
+        std::string selected_key;
+        for (const auto &key : all_nodes) {
+            if ((int)std::hash<std::string>{}(key) == selected_node) {
+                selected_key = key;
+                break;
+            }
+        }
+        bool is_pc = pc_map->find(selected_key) != pc_map->end();
+        if (ImGui::MenuItem("View Info")) {
+            printf("Info: %s\n", selected_key.c_str());
+        }
+        if (is_pc && ImGui::MenuItem("Edit Config")) {
+            pc_id_selected = selected_key;
+            page = Page::ClientDetail;
+        }
+        if (!is_pc && ImGui::MenuItem("Block IP")) {
+            printf("Blocking %s\n", selected_key.c_str());
+        }
+        ImGui::EndPopup();
+    }
+
+    ImGui::EndChild();
 }
 
-/**
- * TODO: I remained here!!!
- */
-static int draw_pc_page(const double current_time) {
-    static double previous_time = -10;
+// static void draw_topology(const double &current_time) {
+//     static const float REFRESH_INTERVAL = 7;
+//     static double previous_time = -REFRESH_INTERVAL;
+//     static std::map<std::string, PCInfo> *pc_map = nullptr;
+//     static std::vector<MessageReceived> *messages = nullptr;
+//     static std::map<std::string, ImVec2> node_positions;
+//
+//     static ax::NodeEditor::EditorContext *context = nullptr;
+//     if (!context) {
+//         context = ax::NodeEditor::CreateEditor();
+//     }
+//     ax::NodeEditor::SetCurrentEditor(context);
+//
+//     if (current_time >= previous_time + REFRESH_INTERVAL) {
+//         previous_time = current_time;
+//         pc_map = get_pc_info();
+//         messages = get_message_history("", pc_map);
+//         node_positions.clear();
+//     }
+//
+//     if (!pc_map || !messages) {
+//         return;
+//     }
+//
+//     // Build pc_id -> IPs mapping
+//     std::map<std::string, std::set<std::string>> pc_id_to_ips;
+//     std::map<std::string, std::string> ip_to_pc_id;
+//     for (const auto &msg : *messages) {
+//         pc_id_to_ips[msg.pc_id].insert(msg.dst_ip);
+//         ip_to_pc_id.insert({msg.dst_ip, msg.pc_id});
+//     }
+//
+//     // Build connections
+//     std::set<std::string> all_nodes;
+//     std::map<std::string, std::set<std::string>> connections;
+//
+//     for (const auto &msg : *messages) {
+//         std::string receiver_pc_id = msg.pc_id;
+//         all_nodes.insert(receiver_pc_id);
+//
+//         std::string sender;
+//         if (ip_to_pc_id.find(msg.src_ip) != ip_to_pc_id.end()) {
+//             sender = ip_to_pc_id[msg.src_ip];
+//             all_nodes.insert(sender);
+//         } else {
+//             sender = msg.src_ip;
+//             all_nodes.insert(sender);
+//         }
+//
+//         connections[sender].insert(receiver_pc_id);
+//     }
+//
+//     // Compute layout if positions not set
+//     if (node_positions.empty()) {
+//         node_positions = compute_graph_layout(all_nodes, connections);
+//     }
+//
+//     ax::NodeEditor::Begin("Topology", ImVec2(0, 0));
+//
+//     static int selected_node = -1;
+//     std::map<std::string, ax::NodeEditor::NodeId> node_to_id;
+//     std::map<std::string, ax::NodeEditor::PinId> node_input_pin;
+//     std::map<std::string, ax::NodeEditor::PinId> node_output_pin;
+//     int node_id = 0;
+//
+//     // Draw all nodes
+//     for (const auto &node_key : all_nodes) {
+//         int node_id = std::hash<std::string>{}(node_key) & 0x7FFFFFFF;
+//
+//         ax::NodeEditor::NodeId node_uid(node_id);
+//
+//         node_to_id[node_key] = node_uid;
+//
+//         bool is_pc = pc_map->find(node_key) != pc_map->end();
+//         const PCInfo &pc = is_pc ? pc_map->at(node_key) : PCInfo{};
+//
+//         if (node_positions.find(node_key) != node_positions.end()) {
+//             ax::NodeEditor::SetNodePosition(node_uid, node_positions[node_key]);
+//         }
+//
+//         ax::NodeEditor::BeginNode(node_uid);
+//
+//         if (is_pc) {
+//             ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "PC");
+//             ImGui::Text("%s", pc.name.empty() ? pc.pc_id.c_str() : pc.name.c_str());
+//         } else {
+//             ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "External");
+//             ImGui::Text("%s", node_key.c_str());
+//         }
+//
+//         // Input pins (one per incoming connection)
+//         int input_idx = 0;
+//         for (const auto &[src, dests] : connections) {
+//             if (dests.count(node_key)) {
+//                 ax::NodeEditor::PinId input_pin(node_id * 1000 + input_idx);
+//                 ax::NodeEditor::BeginPin(input_pin, ax::NodeEditor::PinKind::Input);
+//                 ImGui::Text("In %d", input_idx);
+//                 ax::NodeEditor::EndPin();
+//                 node_input_pin[std::to_string(node_id) + "_" + std::to_string(input_idx)] = input_pin;
+//                 input_idx++;
+//             }
+//         }
+//
+//         // Output pins (one per outgoing connection)
+//         if (connections.find(node_key) != connections.end()) {
+//             int output_idx = 0;
+//             for (const auto &dst : connections[node_key]) {
+//                 ax::NodeEditor::PinId output_pin(node_id * 1000 + 500 + output_idx);
+//                 ax::NodeEditor::BeginPin(output_pin, ax::NodeEditor::PinKind::Output);
+//                 ImGui::Text("Out %d", output_idx);
+//                 ax::NodeEditor::EndPin();
+//                 node_output_pin[std::to_string(node_id) + "_" + std::to_string(output_idx)] = output_pin;
+//                 output_idx++;
+//             }
+//         }
+//
+//         ax::NodeEditor::EndNode();
+//
+//         node_id++;
+//     }
+//
+//     // Draw links with specific pins
+//     int link_counter = 0;
+//     for (const auto &[src, dst_set] : connections) {
+//         int src_id = std::hash<std::string>{}(src) & 0x7FFFFFFF;
+//         int out_idx = 0;
+//
+//         for (const auto &dst : dst_set) {
+//             int dst_id = std::hash<std::string>{}(dst) & 0x7FFFFFFF;
+//             int in_idx = 0;
+//
+//             // Find which input index this is
+//             for (const auto &[s, dests] : connections) {
+//                 if (dests.count(dst)) {
+//                     if (s == src) {
+//                         break;
+//                     }
+//                     in_idx++;
+//                 }
+//             }
+//
+//             ax::NodeEditor::Link(ax::NodeEditor::LinkId(link_counter++),
+//                                  ax::NodeEditor::PinId(src_id * 1000 + 500 + out_idx),
+//                                  ax::NodeEditor::PinId(dst_id * 1000 + in_idx), ImVec4(0.4f,
+//                                  0.8f, 1.0f, 1.0f), 2.0f);
+//             out_idx++;
+//         }
+//     }
+//
+//     // Context menu
+//     if (ImGui::BeginPopup("node_context")) {
+//         if (selected_node >= 0) {
+//             std::string selected_key;
+//             for (const auto &[key, id] : node_to_id) {
+//                 if (id.Get() == selected_node) {
+//                     selected_key = key;
+//                     break;
+//                 }
+//             }
+//
+//             bool is_pc = pc_map->find(selected_key) != pc_map->end();
+//
+//             if (ImGui::MenuItem("View Info")) {
+//                 printf("Info: %s\n", selected_key.c_str());
+//             }
+//             if (is_pc && ImGui::MenuItem("Edit Config")) {
+//                 pc_id_selected = selected_key;
+//                 page = Page::ClientDetail;
+//             }
+//             if (is_pc && ImGui::MenuItem("View Logs")) {
+//                 pc_id_selected = selected_key;
+//                 page = Page::Logs;
+//             }
+//             if (!is_pc && ImGui::MenuItem("Block IP")) {
+//                 printf("Blocking %s\n", selected_key.c_str());
+//             }
+//         }
+//         ImGui::EndPopup();
+//     }
+//
+//     // Draw links
+//     for (const auto &[src, dst_set] : connections) {
+//         for (const auto &dst : dst_set) {
+//             ax::NodeEditor::Link(ax::NodeEditor::LinkId(std::hash<std::string>{}(src + dst)), node_output_pin[src],
+//                                  node_input_pin[dst], ImVec4(0.4f, 0.8f, 1.0f, 1.0f), 2.0f);
+//         }
+//     }
+//
+//     ax::NodeEditor::End();
+//     ax::NodeEditor::SetCurrentEditor(nullptr);
+// }
+
+// static void draw_topology(const double &current_time) {
+//     static const float REFRESH_INTERVAL = 7;
+//     static double previous_time = -REFRESH_INTERVAL;
+//     static std::map<std::string, PCInfo> *pc_map = nullptr;
+//     static std::vector<MessageReceived> *messages = nullptr;
+//     static std::map<std::string, ImVec2> node_positions;
+//
+//     static ImNodesContext *context = nullptr;
+//     if (!context) {
+//         context = ImNodes::CreateContext();
+//     }
+//     ImNodes::SetCurrentContext(context);
+//
+//     if (current_time >= previous_time + REFRESH_INTERVAL) {
+//         previous_time = current_time;
+//         pc_map = get_pc_info();
+//         messages = get_message_history("", pc_map);
+//         node_positions.clear();
+//     }
+//
+//     if (!pc_map || !messages) {
+//         return;
+//     }
+//
+//     // Build pc_id -> IPs mapping from messages (dst_ip = receiver's IP)
+//     std::map<std::string, std::set<std::string>> pc_id_to_ips;
+//     std::map<std::string, std::string> ip_to_pc_id;
+//     for (const auto &msg : *messages) {
+//         pc_id_to_ips[msg.pc_id].insert(msg.dst_ip);
+//         ip_to_pc_id.insert({msg.dst_ip, msg.pc_id});
+//     }
+//
+//     // Build connections between pc_ids
+//     std::set<std::string> all_nodes; // pc_ids and external IPs
+//     std::map<std::string, std::set<std::string>> connections;
+//
+//     for (const auto &msg : *messages) {
+//         std::string receiver_pc_id = msg.pc_id;
+//         all_nodes.insert(receiver_pc_id);
+//
+//         // Check if sender is another PC or external
+//         std::string sender;
+//         if (ip_to_pc_id.find(msg.src_ip) != ip_to_pc_id.end()) {
+//             // Sender is another PC
+//             sender = ip_to_pc_id[msg.src_ip];
+//             all_nodes.insert(sender);
+//         } else {
+//             // Sender is external IP
+//             sender = msg.src_ip;
+//             all_nodes.insert(sender);
+//         }
+//
+//         connections[sender].insert(receiver_pc_id);
+//     }
+//
+//     // Compute layout if positions not set
+//     if (node_positions.empty()) {
+//         node_positions = compute_graph_layout(all_nodes, connections);
+//     }
+//
+//     ImNodes::BeginNodeEditor();
+//
+//     static int selected_node = -1;
+//     std::map<std::string, int> node_to_id;
+//     int node_id = 0;
+//
+//     // Draw all nodes
+//     for (const auto &node_key : all_nodes) {
+//         node_to_id[node_key] = node_id;
+//
+//         bool is_pc = pc_map->find(node_key) != pc_map->end();
+//         const PCInfo &pc = is_pc ? pc_map->at(node_key) : PCInfo{};
+//
+//         if (node_positions.find(node_key) != node_positions.end()) {
+//             ImNodes::SetNodeGridSpacePos(node_id, node_positions[node_key]);
+//         }
+//
+//         ImNodes::BeginNode(node_id);
+//
+//         ImGui::PushItemWidth(150);
+//         if (is_pc) {
+//             ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "PC");
+//             ImGui::Text("%s", pc.name.empty() ? pc.pc_id.c_str() : pc.name.c_str());
+//         } else {
+//             ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "External");
+//             ImGui::Text("%s", node_key.c_str());
+//         }
+//         ImGui::PopItemWidth();
+//
+//         if (connections.find(node_key) != connections.end()) {
+//             ImNodes::BeginOutputAttribute(node_id * 100);
+//             ImGui::Text("Out");
+//             ImNodes::EndOutputAttribute();
+//         }
+//
+//         for (const auto &[src, dests] : connections) {
+//             if (dests.count(node_key)) {
+//                 ImNodes::BeginInputAttribute(node_id * 100 + 1);
+//                 ImGui::Text("In");
+//                 ImNodes::EndInputAttribute();
+//                 break;
+//             }
+//         }
+//
+//         ImNodes::EndNode();
+//
+//         if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+//             selected_node = node_id;
+//             ImGui::OpenPopup("node_context");
+//         }
+//
+//         node_id++;
+//     }
+//
+//     // Context menu
+//     if (ImGui::BeginPopup("node_context")) {
+//         if (selected_node >= 0) {
+//             std::string selected_key;
+//             for (const auto &[key, id] : node_to_id) {
+//                 if (id == selected_node) {
+//                     selected_key = key;
+//                     break;
+//                 }
+//             }
+//
+//             bool is_pc = pc_map->find(selected_key) != pc_map->end();
+//
+//             if (ImGui::MenuItem("View Info")) {
+//                 printf("Info: %s\n", selected_key.c_str());
+//             }
+//             if (is_pc && ImGui::MenuItem("Edit Config")) {
+//                 pc_id_selected = selected_key;
+//                 page = Page::ClientDetail;
+//             }
+//             if (is_pc && ImGui::MenuItem("View Logs")) {
+//                 pc_id_selected = selected_key;
+//                 page = Page::Logs;
+//             }
+//             if (!is_pc && ImGui::MenuItem("Block IP")) {
+//                 printf("Blocking %s\n", selected_key.c_str());
+//             }
+//         }
+//         ImGui::EndPopup();
+//     }
+//
+//     // Draw links
+//     int link_id = 0;
+//     for (const auto &[src, dst_set] : connections) {
+//         for (const auto &dst : dst_set) {
+//             int src_node = node_to_id[src];
+//             int dst_node = node_to_id[dst];
+//             ImNodes::Link(link_id++, src_node * 100, dst_node * 100 + 1);
+//         }
+//     }
+//
+//     ImNodes::EndNodeEditor();
+// }
+
+// static void draw_logs() {
+//     // TODO: Small bug. If this pc has another ip, it will not be updated right
+//     // away. I need to reenter on this page to see the modification.
+//
+//     // To remember the selected option.
+//     static int selected = -1;
+//     ImGui::BeginChild("left", ImVec2(250, 0), true);
+//     int idx = 0;
+//     for (const auto &[key, pc_uptr] : pc_by_name_host) {
+//         RemotePC *pc = pc_uptr.get();
+//         std::string label =
+//             pc->name + " (" + std::to_string(pc->ips.size()) + " IP" + (pc->ips.size() > 1 ? "s" : "") + ")";
+//         for (const auto &ip : pc->ips) {
+//             label += "\n\t" + ip;
+//         }
+//         if (ImGui::Selectable(label.c_str(), selected == idx)) {
+//             selected = idx;
+//         }
+//         idx++;
+//     }
+//     ImGui::EndChild();
+//
+//     ImGui::SameLine();
+//     ImGui::BeginChild("right", ImVec2(0, 0), true);
+//
+//     if (idx == 0) {
+//         ImGui::TextDisabled("No PC is currently tracked, add a PC to inspect logs.");
+//         ImGui::EndChild();
+//
+//         // Reset the selected pc if all are removed.
+//         selected = -1;
+//         return;
+//     }
+//
+//     if (selected < 0) {
+//         ImGui::TextDisabled("Select a PC from the left pannel to show its logs.");
+//         ImGui::EndChild();
+//         return;
+//     }
+//
+//     idx = 0;
+//     for (const auto &[key, pc_uptr] : pc_by_name_host) {
+//         if (idx++ == selected) {
+//             std::lock_guard<std::mutex> lock(pc_uptr->logMutex);
+//             ImGui::TextUnformatted(pc_uptr->logBuffer.c_str());
+//             break;
+//         }
+//     }
+//     ImGui::EndChild();
+// }
+
+static int draw_pc_page(const double &current_time) {
+    static const float REFRESH_INTERVAL = 5;
+    static double previous_time = -REFRESH_INTERVAL;
+
+    /* This will keep information about the most recent information received from the server */
     static PCInfo pc_selected_data;
     static std::string last_pc_id = "";
 
-    static std::vector<std::string> message_history;
+    // For input fields
+    static char server_ip_buf[256] = "";
+    static char allowed_file_path_buf[512] = "";
+    static char server_port_buf[32] = "";
+    static char name_given_buf[256] = "";
+    static char icon_path_buf[512] = "";
+    static GLuint selected_icon_texture_id = 0;
+    static char icon_path_final[512] = "";
+    static char icon_path_buf_tmp[512] = "";
+    static GLuint selected_icon_texture_id_tmp = 0;
+
+    static bool request_update = false;
+
+    static std::vector<MessageReceived> *message_history_vector;
+
+    static std::unique_ptr<TopologyType> message_struct_info = nullptr;
+
+    // Allowed var
+    static int edit_idx = -1;
+    static char edit_line_buf[512] = "";
+    static std::vector<std::string> allowed_lines;
+    static bool discard_allowed_changes = false;
 
     if (pc_id_selected.empty()) {
         ImGui::Text("No PC selected");
         return -1;
     }
 
-    const bool pc_changed = pc_id_selected != last_pc_id;
-    if (pc_changed || current_time >= previous_time + 2.5) {
+    if (pc_id_selected != last_pc_id) {
+        request_update = true;
+    }
+
+    if (request_update || current_time >= previous_time + REFRESH_INTERVAL) {
         previous_time = current_time;
         last_pc_id = pc_id_selected;
 
+        if (request_update) {
+            // Reset all the 'changed_' variables.
+            reset_modifications();
+            changed_config_mode = pc_selected_data.current_mode;
+
+            printf("Reseted the pc_selected_data\n");
+        }
+
+        message_history_vector = get_message_history(pc_id_selected);
+
         std::string pcs_response;
-
-        printf("Using ip: %s\n", pc_id_selected.c_str());
-
-        pc_selected_data.pc_id = "";
-        pc_selected_data.updated_at = "";
-        pc_selected_data.config_file = "";
-        pc_selected_data.allowed_file = "";
-        pc_selected_data.current_mode = 4;
 
         if (fetch_pc_config_from_api(pc_id_selected, pcs_response)) {
             try {
@@ -1984,126 +2125,185 @@ static int draw_pc_page(const double current_time) {
                 if (config_json.is_object()) {
 
                     // Extract fields from JSON
-                    pc_selected_data.pc_id = config_json.value("pc_id", "");
-                    pc_selected_data.updated_at = config_json.value("updated_at", "N/A");
-                    pc_selected_data.config_file = config_json.value("config_file", "");
-                    pc_selected_data.allowed_file = config_json.value("allowed_file", "");
-                    pc_selected_data.current_mode = config_json.value("current_mode", 3);
+                    const std::string update_time = config_json.value("updated_at", "N/A");
+                    const bool update_time_changed = update_time != pc_selected_data.updated_at;
 
-                    std::string icon_bytes_encoded = config_json.value("icon", "");
-                    if (!icon_bytes_encoded.empty()) {
-                        std::vector<uint8_t> icon_bytes = base64_decode(icon_bytes_encoded);
-                        pc_selected_data.icon_texture = load_texture_from_memory(icon_bytes);
-                    } else {
-                        pc_selected_data.icon_texture = 0;
+                    // Config file
+                    if (request_update || update_time_changed) {
+
+                        pc_selected_data.pc_id = config_json.value("pc_id", "");
+                        pc_selected_data.updated_at = update_time;
+                        pc_selected_data.allowed_file = config_json.value("allowed_file", "");
+                        pc_selected_data.name = config_json.value("name", "");
+                        pc_selected_data.config_file = config_json.value("config_file", "");
+
+                        // General information
+                        changed_general_name_given = pc_selected_data.name;
+                        strncpy(name_given_buf, pc_selected_data.name.c_str(), sizeof(name_given_buf) - 1);
+
+                        // Config file
+                        extract_config_info(pc_selected_data.config_file, changed_config_server_ip,
+                                            changed_config_server_port, changed_config_allowed_file_path);
+
+                        strncpy(server_ip_buf, changed_config_server_ip.c_str(), sizeof(server_ip_buf) - 1);
+                        strncpy(allowed_file_path_buf, changed_config_allowed_file_path.c_str(),
+                                sizeof(allowed_file_path_buf) - 1);
+                        strncpy(server_port_buf, changed_config_server_port.c_str(), sizeof(server_port_buf) - 1);
+
+                        printf("changed to:\nserver ip:%s, server port:%s;\nallowed_path:%s\n",
+                               changed_config_server_ip.c_str(), changed_config_server_port.c_str(),
+                               changed_config_allowed_file_path.c_str());
+
+                        // Current mode extracted from received config file
+                        const int received_current_mode = extract_current_state(pc_selected_data.config_file);
+
+                        printf("Received mode: %d\n", received_current_mode);
+                        if (pc_selected_data.current_mode != received_current_mode) {
+
+                            pc_selected_data.current_mode = received_current_mode;
+                            changed_config_mode = received_current_mode;
+                        }
+
+                        // Icon update
+                        std::string icon_bytes_encoded = config_json.value("icon", "");
+
+                        if (pc_selected_data.icon_texture_id != 0) {
+                            glDeleteTextures(1, &pc_selected_data.icon_texture_id);
+                        }
+                        if (selected_icon_texture_id != 0 &&
+                            selected_icon_texture_id != pc_selected_data.icon_texture_id) {
+                            glDeleteTextures(1, &pc_selected_data.icon_texture_id);
+                        }
+
+                        if (!icon_bytes_encoded.empty()) {
+                            std::vector<uint8_t> icon_bytes = base64_decode(icon_bytes_encoded);
+                            pc_selected_data.icon_texture_id = load_texture_from_memory(icon_bytes);
+                            selected_icon_texture_id = pc_selected_data.icon_texture_id;
+                        } else {
+                            pc_selected_data.icon_texture_id = 0;
+                            selected_icon_texture_id = 0;
+                        }
+
+                        icon_path_buf[0] = '\0';
+                        icon_path_buf_tmp[0] = '\0';
+                        icon_path_final[0] = '\0';
+
+                        changed_config_checker = false;
+                        changed_general_checker = false;
+                        changed_allowed_file_checker = false;
                     }
+
                 } else {
                     printf("I did not received an object\n\n");
                 }
             } catch (const std::exception &e) {
                 std::cerr << "JSON parse error in fetching pcs: " << e.what() << "\n";
+
+                pc_selected_data.pc_id = "";
+                pc_selected_data.updated_at = "";
+                pc_selected_data.config_file = "";
+                pc_selected_data.allowed_file = "";
+                pc_selected_data.current_mode = NO_STATE;
+                pc_selected_data.name = "";
             }
         }
 
-        message_history.clear();
-        std::string pc_logs;
-
-        if (fetch_logs_from_api(pc_id_selected, pc_logs)) {
-            try {
-                // Parse JSON response
-                auto logs_json = json::parse(pc_logs);
-                printf("Logs received for %s -> %s\n", pc_id_selected.c_str(), pc_logs.c_str());
-                fflush(stdout);
-
-                if (logs_json.contains("logs") && logs_json["logs"].is_array()) {
-                    for (const auto &log_entry : logs_json["logs"]) {
-
-                        // Extract fields from JSON
-                        std::string timestamp = log_entry.value("timestamp", "N/A");
-                        std::string src_ip = log_entry.value("src_ip", "");
-                        std::string dst_ip = log_entry.value("dst_ip", "");
-                        int src_port = log_entry.value("src_port", 0);
-                        int dst_port = log_entry.value("dst_port", 0);
-                        int protocol = log_entry.value("protocol", 0);
-
-                        // Format message
-                        const char *proto_name = (protocol == 6) ? "TCP" : (protocol == 17) ? "UDP" : "OTHER";
-
-                        std::stringstream ss;
-                        ss << "[" << timestamp << "] " << src_ip << ":" << src_port << " -> " << dst_ip << ":"
-                           << dst_port << " [" << proto_name << "]";
-
-                        message_history.push_back(ss.str());
-                    }
-                }
-            } catch (const std::exception &e) {
-                std::cerr << "JSON parse error for logs: " << e.what() << "\n";
-            }
+        if (pc_selected_data.current_mode == MONITORING) {
+            message_struct_info = std::make_unique<TopologyType>(get_topology(pc_id_selected));
+            printf("[TOPOLOGY] Created topology\n");
         }
     }
 
     if (pc_selected_data.pc_id.empty()) {
-        ImGui::TextDisabled("Loading PC information...");
-        printf("Not entered: %s %s %s %d\n", pc_selected_data.pc_id.c_str(), pc_selected_data.allowed_file.c_str(),
-               pc_selected_data.config_file.c_str(), pc_selected_data.current_mode);
-
-        fflush(stdout);
+        ImGui::TextDisabled("Failed to load the information about the user, retrying...");
         return -1;
     }
 
     // Get mode color
-    ImU32 mode_bg_color;
-    const char *mode_name;
-    ImVec4 mode_text_color;
-
-    switch (pc_selected_data.current_mode) {
-        case 0:
-            mode_name = "LISTENING";
-            mode_bg_color = IM_COL32(100, 200, 100, 50);
-            mode_text_color = ImVec4(0.4f, 0.8f, 0.4f, 1.0f);
-            break;
-        case 1:
-            mode_name = "MONITORING";
-            mode_bg_color = IM_COL32(100, 150, 255, 80);
-            mode_text_color = ImVec4(0.4f, 0.6f, 1.0f, 1.0f);
-            break;
-        case 2:
-            mode_name = "REACTIVE";
-            mode_bg_color = IM_COL32(255, 100, 100, 80);
-            mode_text_color = ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
-            break;
-        case 3:
-            mode_name = "DISABLED";
-            mode_bg_color = IM_COL32(100, 100, 100, 50);
-            mode_text_color = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
-            break;
-        default:
-            mode_name = "UNKNOWN";
-            mode_bg_color = IM_COL32(100, 100, 100, 50);
-            mode_text_color = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
-    }
+    const ImVec4 mode_text_color = get_mode_color(pc_selected_data.current_mode);
 
     // === HEADER SECTION ===
     ImGui::BeginGroup();
 
-    // Icon on the left
-    if (pc_selected_data.icon_texture != 0) {
-        ImGui::Image((void *)(intptr_t)pc_selected_data.icon_texture, ImVec2(80, 80), ImVec2(0, 0), ImVec2(1, 1),
-                     ImVec4(1, 1, 1, 1), ImVec4(0.7f, 0.7f, 0.7f, 1.0f));
-        ImGui::SameLine(100);
-    } else {
-        ImGui::SameLine(100);
-    }
-
-    // PC info on the right
+    // Icon group
     ImGui::BeginGroup();
-    ImGui::Text("PC ID: %s", pc_selected_data.pc_id.c_str());
-    ImGui::PushStyleColor(ImGuiCol_Text, mode_text_color);
-    ImGui::Text("Mode: %s", mode_name);
-    ImGui::PopStyleColor();
-    ImGui::TextDisabled("Updated: %s", pc_selected_data.updated_at.c_str());
+    ImGui::Spacing();
+    ImGui::Spacing();
+    ImGui::Spacing();
+    ImGui::SameLine(10);
+    // Icon on the left
+    if (selected_icon_texture_id != 0) {
+        ImGui::Image((void *)(intptr_t)selected_icon_texture_id, ImVec2(80, 80), ImVec2(0, 0), ImVec2(1, 1),
+                     ImVec4(1, 1, 1, 1), ImVec4(0.7f, 0.7f, 0.7f, 1.0f));
+    }
     ImGui::EndGroup();
 
+    // PC info on the right
+    ImGui::SameLine(110);
+    ImGui::BeginGroup();
+    ImGui::Text("PC ID: %s", pc_selected_data.pc_id.c_str());
+
+    ImGui::TextDisabled("Updated: %s", pc_selected_data.updated_at.c_str());
+
+    ImGui::Spacing();
+    ImGui::Text("name: ");
+    ImGui::SameLine(80);
+    ImGui::SetNextItemWidth(250);
+    if (ImGui::InputText("##name_given", name_given_buf, sizeof(name_given_buf))) {
+        changed_general_name_given = name_given_buf;
+        changed_general_checker = true;
+    }
+
+    ImGui::BeginGroup();
+    ImGui::Text("File Path:");
+    ImGui::SameLine(80);
+    ImGui::SetNextItemWidth(250);
+    ImGui::InputText("##icon_path", icon_path_buf, sizeof(icon_path_buf));
+
+    if (ImGui::Button("Load Image", ImVec2(100, 0))) {
+        printf("Icon path: %s\n", icon_path_buf);
+        const int selected_icon_texture_var = load_image_as_texture(icon_path_buf);
+        if (selected_icon_texture_var != 0) {
+            selected_icon_texture_id_tmp = selected_icon_texture_var;
+            strncpy(icon_path_buf_tmp, icon_path_buf, sizeof(icon_path_buf) - 1);
+            ImGui::OpenPopup("Icon Preview");
+        }
+    }
+
+    ImGui::EndGroup();
+
+    // Preview popup
+    if (ImGui::BeginPopupModal("Icon Preview", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (selected_icon_texture_id_tmp != 0) {
+            ImGui::Image((void *)(intptr_t)selected_icon_texture_id_tmp, ImVec2(128, 128));
+            ImGui::Spacing();
+            if (ImGui::Button("Use This Icon", ImVec2(150, 0))) {
+                if (pc_selected_data.icon_texture_id != 0) {
+                    glDeleteTextures(1, &pc_selected_data.icon_texture_id);
+                }
+
+                if (selected_icon_texture_id != 0 && selected_icon_texture_id != pc_selected_data.icon_texture_id) {
+                    glDeleteTextures(1, &selected_icon_texture_id);
+                }
+
+                pc_selected_data.icon_texture_id = selected_icon_texture_id_tmp;
+                selected_icon_texture_id = selected_icon_texture_id_tmp;
+                strncpy(icon_path_final, icon_path_buf_tmp, sizeof(icon_path_buf_tmp));
+                changed_general_checker = true;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(150, 0))) {
+                glDeleteTextures(1, &selected_icon_texture_id_tmp);
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::EndPopup();
+    }
+    // Ending pc info right side
+    ImGui::EndGroup();
+
+    // Ending pc info pannel
     ImGui::EndGroup();
 
     ImGui::Spacing();
@@ -2112,24 +2312,228 @@ static int draw_pc_page(const double current_time) {
 
     // === DETAILS SECTION ===
     ImGui::Text("Configuration Details");
-    ImGui::BeginChild("details", ImVec2(0, 180), true);
-    ImGui::TextWrapped("Config File: %s", pc_selected_data.config_file.c_str());
+
+    // A right side info text to tell if something is changed on the page
+    if (changed_config_checker || changed_general_checker || changed_allowed_file_checker) {
+        ImGui::SameLine(ImGui::GetWindowWidth() - 150);
+        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 100, 100, 255));
+        ImGui::Text("UNSAVED CHANGES");
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::BeginChild("details", ImVec2(0, 500), true);
+
+    // Server IP
+    ImGui::Text("Server IP:");
+    ImGui::SameLine(150);
+    ImGui::SetNextItemWidth(180);
+    if (ImGui::InputText("##server_ip", server_ip_buf, sizeof(server_ip_buf))) {
+        changed_config_server_ip = server_ip_buf;
+        changed_config_checker = true;
+    }
     ImGui::Spacing();
-    ImGui::TextWrapped("Allowed File: %s", pc_selected_data.allowed_file.c_str());
+
+    // Server Port - use InputText instead to remove +/- buttons
+    ImGui::Text("Server Port:");
+    ImGui::SameLine(150);
+    ImGui::SetNextItemWidth(180);
+    if (ImGui::InputText("##server_port", server_port_buf, sizeof(server_port_buf), ImGuiInputTextFlags_CharsDecimal)) {
+        try {
+            const int server_port_int = std::stoi(server_port_buf);
+            if (server_port_int > 0 && server_port_int <= 65535) {
+                changed_config_server_port = std::to_string(server_port_int);
+                changed_config_checker = true;
+            } else {
+                ImGui::OpenPopup("Invalid Port");
+            }
+        } catch (...) {
+            ImGui::OpenPopup("Invalid Port");
+        }
+    }
+    // Error popup
+    if (ImGui::BeginPopupModal("Invalid Port", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Port must be between 1 and 65535!");
+        if (ImGui::Button("OK", ImVec2(120, 0))) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::Spacing();
+
+    ImGui::Text("Mode:");
+    ImGui::SameLine(150);
+    ImGui::SetNextItemWidth(180);
+    ImGui::PushStyleColor(ImGuiCol_Text, mode_text_color);
+    const int mode_changed = ImGui::Combo("##mode_select", &changed_config_mode, MODES, 4);
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+
+    if (mode_changed) {
+        std::cout << "Mode changed to: " << MODES[changed_config_mode] << "\n";
+        changed_config_checker = true;
+    }
+
+    // Allowed File Path
+    ImGui::Text("Allowed File Path:");
+    ImGui::SameLine(150);
+    ImGui::SetNextItemWidth(250);
+    if (ImGui::InputText("##allowed_file_path", allowed_file_path_buf, sizeof(allowed_file_path_buf))) {
+        changed_config_allowed_file_path = allowed_file_path_buf;
+        changed_config_checker = true;
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ============================= Allowed file =====================================
+
+    if (request_update || discard_allowed_changes) {
+
+        allowed_lines.clear();
+        changed_allowed_file_checker = false;
+        discard_allowed_changes = false;
+
+        std::istringstream iss(pc_selected_data.allowed_file);
+        std::string line;
+
+        while (std::getline(iss, line)) {
+            line.erase(0, line.find_first_not_of(" \t\r\n"));
+            line.erase(line.find_last_not_of(" \t\r\n") + 1);
+            if (!line.empty()) {
+                allowed_lines.push_back(line);
+            }
+        }
+    }
+
+    ImGui::BeginChild("allowed_list", ImVec2(0, 340), true);
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("Events definitions");
+
+    ImGui::SameLine();
+    if (ImGui::Button("Add New", ImVec2(100, 0))) {
+        edit_idx = -1; // -1 means new entry
+        memset(edit_line_buf, 0, sizeof(edit_line_buf));
+        ImGui::OpenPopup("Edit IP Entry");
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Button("Discard changed", ImVec2(130, 0))) {
+        discard_allowed_changes = true;
+    }
+
+    ImGui::Spacing();
+    ImGui::Spacing();
+    ImGui::Spacing();
+
+    for (uint i = 0; i < allowed_lines.size(); ++i) {
+        ImGui::Text("%s", allowed_lines[i].c_str());
+        ImGui::SameLine(350);
+
+        const std::string edit_button_label = "Edit##" + std::to_string(i);
+        if (ImGui::Button(edit_button_label.c_str())) {
+            edit_idx = i;
+            strncpy(edit_line_buf, allowed_lines[i].c_str(), sizeof(edit_line_buf) - 1);
+            ImGui::OpenPopup("Edit IP Entry");
+        }
+        ImGui::SameLine();
+
+        const std::string delete_button_label = "Delete##" + std::to_string(i);
+        if (ImGui::Button(delete_button_label.c_str())) {
+            allowed_lines.erase(allowed_lines.begin() + i);
+            changed_allowed_file_checker = true;
+        }
+    }
+
+    // Edit/Add popup
+    if (ImGui::BeginPopupModal("Edit IP Entry", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Dummy(ImVec2(0, 5));
+        ImGui::Indent(10);
+
+        ImGui::InputText("Entry", edit_line_buf, sizeof(edit_line_buf));
+        ImGui::Spacing();
+        ImGui::TextDisabled("Format: 127.0.0.1 or 127.0.0.1:8080,8081");
+        ImGui::Spacing();
+        ImGui::Spacing();
+
+        if (ImGui::Button("Save")) {
+            if (edit_idx == -1) {
+                // New entry
+                allowed_lines.push_back(edit_line_buf);
+            } else {
+                // Edit existing
+                allowed_lines[edit_idx] = edit_line_buf;
+            }
+            changed_allowed_file_checker = true;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::Unindent(10);
+        ImGui::Dummy(ImVec2(0, 5));
+
+        ImGui::EndPopup();
+    }
+    ImGui::EndChild();
+
+    if (request_update == true) {
+        request_update = false;
+    }
+
+    // =========================== Update configuration ===========================
+
+    if (ImGui::Button("Update", ImVec2(100, 0))) {
+        printf("server ip:%s\nserver port:%s\nallowed path:%s\nchanged config bool:%d\n",
+               changed_config_server_ip.c_str(), changed_config_server_port.c_str(),
+               changed_config_allowed_file_path.c_str(), changed_config_checker);
+
+        if (changed_config_checker || changed_allowed_file_checker || changed_general_checker) {
+            const std::string new_config_file = create_config_info_string();
+
+            std::string new_allwed_file = "";
+            if (pc_selected_data.current_mode == MONITORING && changed_config_mode != MONITORING &&
+                message_struct_info != nullptr) {
+
+                const auto entry = message_struct_info->topology_connection.find(pc_id_selected);
+                if (entry != message_struct_info->topology_connection.end()) {
+                    new_allwed_file = recreate_allowed_file(entry->second, allowed_lines);
+                }
+                message_struct_info = nullptr;
+            }
+
+            // If it was not constructed using the `recreate_allowed_file`, recreate it manualy.
+            if (new_allwed_file.empty()) {
+                for (const auto &line : allowed_lines) {
+                    new_allwed_file += line + "\n";
+                }
+            }
+
+            printf("new allowed: %s\nold: %s\n", new_allwed_file.c_str(), pc_selected_data.allowed_file.c_str());
+
+            send_config_via_api(pc_id_selected, new_config_file,
+                                new_allwed_file != pc_selected_data.allowed_file ? new_allwed_file : "",
+                                changed_general_name_given, icon_path_final);
+
+            request_update = true;
+        }
+    }
     ImGui::EndChild();
 
     ImGui::Spacing();
 
     // === LOGS SECTION ===
-    ImGui::Text("Recent Network Activity");
+    ImGui::Text("Current events");
     ImGui::BeginChild("logs", ImVec2(0, 0), true);
 
-    if (message_history.empty()) {
+    if ((*message_history_vector).empty()) {
         ImGui::TextDisabled("No activity recorded");
     } else {
-        for (const std::string &msg : message_history) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.8f, 0.5f, 1.0f));
-            ImGui::TextWrapped("%s", msg.c_str());
+        for (const MessageReceived &msg : *message_history_vector) {
+            ImGui::PushStyleColor(ImGuiCol_Text, get_mode_color(msg.mode));
+            ImGui::TextWrapped("%s", transform_messages_to_str(msg, nullptr).c_str());
             ImGui::PopStyleColor();
             ImGui::Separator();
         }
@@ -2175,7 +2579,7 @@ int main() {
         ImGui::NewFrame();
 
         // Keep track of all new ips that a pc might have.
-        discover_new_ips();
+        // discover_new_ips();
 
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
                                  ImGuiWindowFlags_NoBringToFrontOnFocus;
@@ -2193,14 +2597,10 @@ int main() {
         if (ImGui::Button("Topology")) {
             page = Page::Topology;
         }
-        ImGui::SameLine();
-        if (ImGui::Button("Logs")) {
-            page = Page::Logs;
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Config")) {
-            page = Page::Config;
-        }
+        // ImGui::SameLine();
+        // if (ImGui::Button("Logs")) {
+        //     page = Page::Logs;
+        // }
 
         ImGui::Separator();
 
@@ -2210,14 +2610,11 @@ int main() {
                 draw_main_page(frame_start);
                 break;
             case Page::Topology:
-                draw_topology();
+                draw_topology(frame_start);
                 break;
-            case Page::Logs:
-                draw_logs();
-                break;
-            case Page::Config:
-                draw_config_editor();
-                break;
+            // case Page::Logs:
+            // draw_logs();
+            // break;
             case Page::ClientDetail:
                 draw_pc_page(frame_start);
                 break;
@@ -2242,28 +2639,13 @@ int main() {
         }
     }
 
-    // Wait for any pending connections to complete
-    {
-        std::lock_guard<std::mutex> lock(pending_connection_mutex);
-        if (pending_connection != nullptr) {
-            if (pending_connection->connection_thread.joinable()) {
-                pending_connection->connection_thread.join();
-            }
-            if (pending_connection->session) {
-                ssh_disconnect(pending_connection->session);
-                ssh_free(pending_connection->session);
-            }
-            pending_connection.reset();
-        }
-    }
-
-    // Cleanup threads
-    for (auto &[key, pc] : pc_by_name_host) {
-        pc->running = false;
-        if (pc->logThread.joinable()) {
-            pc->logThread.join();
-        }
-    }
+    // // Cleanup threads
+    // for (auto &[key, pc] : pc_by_name_host) {
+    //     pc->running = false;
+    //     if (pc->logThread.joinable()) {
+    //         pc->logThread.join();
+    //     }
+    // }
 
     g_tcp_log_receiver.stop();
     g_network_log_db.close();
@@ -2273,5 +2655,5 @@ int main() {
     ImGui::DestroyContext();
     glfwDestroyWindow(wnd);
     glfwTerminate();
-    return 0;
+    return 0; // ceva
 }

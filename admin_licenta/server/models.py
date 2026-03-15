@@ -2,13 +2,15 @@ from datetime import datetime
 import os
 import time
 import struct
-from typing import Dict, TypedDict
-from pydantic import BaseModel
+from typing import Deque, Dict, Set, TypedDict
+from pydantic import BaseModel, Field
 from typing import List, Optional
 from sklearn.preprocessing import StandardScaler
 
 
 class PacketData(BaseModel):
+    mode: int = 255
+    ts: datetime = Field(default_factory=datetime.now)
     saddr: str
     daddr: str
     sport: int
@@ -34,18 +36,58 @@ class ModelStatus(BaseModel):
 
 
 class FilesConfig(BaseModel):
-    pc_id: str | None = None
-    config_file: str | None = None
-    allowed_file: str | None = None
-    current_mode: int | None = None
-    icon: str | None = None
-    name: str | None = None
-    updated_at: datetime | None = None
+    pc_id: str = ""
+    config_file: str = ""
+    allowed_file: str = ""
+    icon: str = ""
+    name: str = ""
+    updated_at: datetime = Field(default_factory=datetime.now)
 
 
-class ConfigEntity(TypedDict):
+class LogData(BaseModel):
+    pc_id: str
+    mode: int
+    timestamp: datetime
+    src_ip: str
+    dst_ip: str
+    src_port: Optional[int] = None
+    dst_port: Optional[int] = None
+    protocol: Optional[int] = None
+    ttl: Optional[int] = None
+    packet_len: Optional[int] = None
+    iface: Optional[str] = None
+    src_mac: Optional[str] = None
+    dst_mac: Optional[str] = None
+    tcp_flags: Optional[int] = None
+
+
+class InfoCache(TypedDict):
     config: FilesConfig
     update: bool
+    logs: Deque[PacketData]
+
+
+class ConnectionStats(BaseModel):
+    ports_out: Set[int] = Field(default_factory=set)
+    protocols: Set[int] = Field(default_factory=set)
+    ttls: Set[int] = Field(default_factory=set)
+    packet_lens: Set[int] = Field(default_factory=set)
+    tcp_flags: Set[int] = Field(default_factory=set)
+    ports_in: Set[int] = Field(default_factory=set)
+    mac_addr: Set[str] = Field(default_factory=set)
+
+
+class TopologyEntry(BaseModel):
+    # key is src_ip
+    connection_dict: Dict[str, ConnectionStats] = Field(default_factory=dict)
+
+    # List with all found ips for this entity
+    topology_ip: Set[str] = Field(default_factory=set)
+
+
+class TopologyType(BaseModel):
+    # key is pc_id
+    topology_connection: Dict[str, TopologyEntry] = Field(default_factory=dict)
 
 
 # ============================================================================

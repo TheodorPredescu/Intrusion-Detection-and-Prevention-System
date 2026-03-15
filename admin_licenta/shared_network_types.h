@@ -1,4 +1,3 @@
-// shared_network_types.h
 #ifndef SHARED_NETWORK_TYPES_H
 #define SHARED_NETWORK_TYPES_H
 
@@ -31,6 +30,8 @@ struct RemotePC {
     std::atomic<bool> running{false};
     std::thread logThread;
 
+    std::string dns_name;
+
     std::string logStatus; // "OK", "ERROR", "NO DATA"
 
     // === CONFIG EDITOR STATE ===
@@ -50,6 +51,8 @@ struct RemotePC {
     int db_pc_id = -1;
 };
 
+enum class Mode { MainPage, AddPC, Topology, Logs, Config };
+
 // ──────────────────────────────────────────────
 // Functions you want to call from tcp_log_receiver
 // ──────────────────────────────────────────────
@@ -58,8 +61,7 @@ using IPMap = std::unordered_map<std::string, RemotePC *>;
 
 // forward declarations of frequently used functions
 RemotePC *find_pc_by_ip(const std::string &ip);
-std::vector<std::pair<std::string, std::string>>
-parse_connections(const std::string &log);
+std::vector<std::pair<std::string, std::string>> parse_connections(const std::string &log);
 std::set<std::string> parse_allowed_ips(const std::string &text);
 
 #endif

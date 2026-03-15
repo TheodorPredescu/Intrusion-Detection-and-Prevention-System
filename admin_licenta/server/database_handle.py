@@ -1,5 +1,5 @@
 import sqlite3
-from models import PacketData, FilesConfig
+from models import LogData, PacketData, FilesConfig
 from typing import Optional, List, Any, overload
 import base64
 from datetime import datetime
@@ -27,6 +27,7 @@ class Database:
             schema = """
             CREATE TABLE IF NOT EXISTS connections (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mode INTEGER,
                 pc_id TEXT NOT NULL,
                 ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 src_ip TEXT NOT NULL,
@@ -55,7 +56,6 @@ class Database:
                 pc_id TEXT PRIMARY KEY,
                 config_file TEXT,
                 allowed_file TEXT,
-                current_mode INTEGER DEFAULT 3,
                 icon BLOB,
                 name TEXT DEFAULT "",
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -90,7 +90,7 @@ class Database:
         return sqlite3.connect(self.db_path, timeout=10.0)
 
     @overload
-    def get_config(self, pc_id: None = None) -> Optional[List[FilesConfig]]: ...
+    def get_config(self) -> Optional[List[FilesConfig]]: ...
 
     @overload
     def get_config(self, pc_id: str) -> Optional[FilesConfig]: ...
@@ -108,7 +108,6 @@ class Database:
                         pc_id,
                         config_file,
                         allowed_file,
-                        current_mode,
                         icon,
                         name,
                         updated_at
@@ -129,7 +128,7 @@ class Database:
             else:
                 cursor.execute(
                     """
-                    SELECT pc_id, config_file, allowed_file, current_mode, icon, name, updated_at
+                    SELECT pc_id, config_file, allowed_file, icon, name, updated_at
                     FROM pc_configs
                     WHERE pc_id = ?
                 """,
@@ -148,16 +147,17 @@ class Database:
             if conn:
                 conn.close()
 
+    def get_default_icon(self) -> str:
+        return base64.b64encode(self.DEFAULT_ICON).decode("utf-8")
+
     def formatRow(self, row: Any) -> FilesConfig:
-        raw_icon: bytes = row[4] if row[4] is not None else self.DEFAULT_ICON
         return FilesConfig(
             pc_id=row[0],
             config_file=row[1],
             allowed_file=row[2],
-            current_mode=row[3],
-            icon=base64.b64encode(raw_icon).decode("utf-8") if raw_icon else None,
-            name=row[5],
-            updated_at=row[6],
+            icon=row[3] if row[3] else self.get_default_icon(),
+            name=row[4],
+            updated_at=row[5],
         )
 
     def save_config(
@@ -165,9 +165,9 @@ class Database:
         pc_id: str,
         config_file: Optional[str] = None,
         allowed_file: Optional[str] = None,
-        current_mode: Optional[int] = None,
-        icon: Optional[bytes] = None,
+        icon: Optional[str] = None,
         name: Optional[str] = None,
+        date: Optional[datetime] = None,
     ) -> bool:
         """Save or update PC configuration (only updates provided fields)"""
         conn = None
@@ -184,25 +184,25 @@ class Database:
                 updates = []
                 params = []
 
-                if config_file is not None:
+                if config_file:
                     updates.append("config_file = ?")
                     params.append(config_file)
 
-                if allowed_file is not None:
+                if allowed_file:
                     updates.append("allowed_file = ?")
                     params.append(allowed_file)
 
-                if current_mode is not None:
-                    updates.append("current_mode = ?")
-                    params.append(current_mode)
-
-                if icon is not None:
+                if icon:
                     updates.append("icon = ?")
                     params.append(icon)
 
-                if name is not None:
+                if name:
                     updates.append("name = ?")
                     params.append(name)
+
+                if date is not None:
+                    updates.append("updated_at = ?")
+                    params.append(date)
 
                 if not updates:
                     # Nothing to update
@@ -217,10 +217,10 @@ class Database:
                 # Insert new record (both can be NULL)
                 cursor.execute(
                     """
-                    INSERT INTO pc_configs (pc_id, config_file, allowed_file, current_mode, icon, name, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    INSERT INTO pc_configs (pc_id, config_file, allowed_file, icon, name, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                    (pc_id, config_file, allowed_file, current_mode, icon, name or ""),
+                    (pc_id, config_file, allowed_file, icon, name or "", date),
                 )
 
             conn.commit()
@@ -238,6 +238,8 @@ class Database:
 
     def get_logs(self, pc_id: Optional[str], limit: int, offset: int = 0):
         conn = None
+        logs: List[LogData] = []
+
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
@@ -257,7 +259,8 @@ class Database:
                         iface,
                         src_mac,
                         dst_mac,
-                        tcp_flags
+                        tcp_flags,
+                        mode
                     FROM connections
                     WHERE pc_id = ?
                     ORDER BY ts DESC
@@ -279,43 +282,44 @@ class Database:
                         iface,
                         src_mac,
                         dst_mac,
-                        tcp_flags
+                        tcp_flags,
+                        mode
                     FROM connections
                     ORDER BY ts DESC
                     LIMIT ? OFFSET ?
                 """
                 cursor.execute(query, (limit, offset))
             rows = cursor.fetchall()
-            logs = []
             for row in rows:
                 logs.append(
-                    {
-                        "pc_id": row[0],
-                        "timestamp": row[1],
-                        "src_ip": row[2],
-                        "dst_ip": row[3],
-                        "src_port": row[4],
-                        "dst_port": row[5],
-                        "protocol": row[6],
-                        "ttl": row[7],
-                        "packet_len": row[8],
-                        "iface": row[9],
-                        "src_mac": row[10],
-                        "dst_mac": row[11],
-                        "tcp_flags": row[12],
-                    }
+                    LogData(
+                        pc_id=row[0],
+                        timestamp=row[1],
+                        src_ip=row[2],
+                        dst_ip=row[3],
+                        src_port=row[4],
+                        dst_port=row[5],
+                        protocol=row[6],
+                        ttl=row[7],
+                        packet_len=row[8],
+                        iface=row[9],
+                        src_mac=row[10],
+                        dst_mac=row[11],
+                        tcp_flags=row[12],
+                        mode=row[13],
+                    )
                 )
 
             print(f"[DB] Retrieved {len(logs)} logs for pc_id={pc_id}")
-            return logs
 
         except sqlite3.Error as e:
             print(f"[DB] Failed to fetch logs for pc_id={pc_id}: {e}")
-            return []
+            logs = []
 
         finally:
             if conn:
                 conn.close()
+            return logs
 
     def insert_packets_batch(self, packets: List["PacketData"], pc_id: str) -> int:
         """Batch insert packets into database"""
@@ -329,14 +333,15 @@ class Database:
 
             insert_query = """
                 INSERT INTO connections
-                (pc_id, src_ip, dst_ip, src_port, dst_port, protocol, ttl,
+                (pc_id, mode, src_ip, dst_ip, src_port, dst_port, protocol, ttl,
                  packet_len, tcp_flags, iface, src_mac, dst_mac)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
 
             values = [
                 (
                     pc_id,
+                    pkt.mode,
                     pkt.saddr,
                     pkt.daddr,
                     pkt.sport,
