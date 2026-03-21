@@ -35,9 +35,6 @@
 #include <vector>
 
 #include "../daemon/json.hpp"
-#include "database_handle.h"
-#include "shared_network_types.h"
-#include "tcp_log_receiver.h"
 
 // States available.
 #define LISTENING 0
@@ -69,7 +66,7 @@ static bool changed_allowed_file_checker = false;
 static std::string changed_general_name_given = "";
 static bool changed_general_checker = false;
 
-static const double TARGET_FPS = 60.0;
+static const double TARGET_FPS = 45.0;
 static const double TARGET_FRAME_TIME = 1.0 / TARGET_FPS;
 
 // ============================================================================
@@ -550,16 +547,47 @@ static std::string get_protocol_name(const int protocol) {
 
 static ImVec4 get_mode_color(const int mode) {
     switch (mode) {
-        case 0:
+        case LISTENING:
             return ImVec4(0.4f, 0.8f, 0.4f, 1.0f);
-        case 1:
+        case MONITORING:
             return ImVec4(0.4f, 0.6f, 1.0f, 1.0f);
-        case 2:
+        case REACTIVE:
             return ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
-        case 3:
+        case DISABLED:
             return ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
         default:
             return ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
+    }
+}
+
+static uint get_mode_background_color(const int mode, const bool blink_visible) {
+    switch (mode) {
+        case LISTENING:
+            return IM_COL32(100, 200, 100, 50);
+        case MONITORING:
+            return IM_COL32(100, 150, 255, blink_visible ? 80 : 20);
+        case REACTIVE:
+            return IM_COL32(255, 100, 100, blink_visible ? 80 : 20);
+        case DISABLED:
+            return IM_COL32(100, 100, 100, 50);
+        default:
+            return IM_COL32(100, 100, 100, 50);
+    }
+}
+
+static const char *const get_mode_name(const int mode) {
+
+    switch (mode) {
+        case LISTENING:
+            return MODES[LISTENING];
+        case MONITORING:
+            return MODES[MONITORING];
+        case REACTIVE:
+            return MODES[REACTIVE];
+        case DISABLED:
+            return MODES[DISABLED];
+        default:
+            return "UNKNOWN";
     }
 }
 
@@ -874,6 +902,62 @@ static TopologyType get_topology(const std::string pc_id = "") {
     return topology;
 }
 
+static bool add_entity_in_allowed(std::vector<std::string> &allowed_lines, const MessageReceived &msg) {
+
+    std::string *found_line = nullptr;
+    size_t colon_pos;
+
+    for (std::string &line : allowed_lines) {
+        colon_pos = line.find(":");
+        std::string ip;
+
+        if (colon_pos != std::string::npos) {
+            ip = line.substr(0, colon_pos);
+        } else {
+            ip = line;
+        }
+
+        if (msg.src_ip == ip) {
+            found_line = &line;
+            break;
+        }
+    }
+
+    if (found_line == nullptr) {
+        allowed_lines.push_back(msg.src_ip + ": " + std::to_string(msg.src_port));
+        return true;
+    }
+
+    if (colon_pos == std::string::npos) {
+        return false;
+    }
+
+    std::istringstream iss((*found_line).substr(colon_pos + 1));
+    std::string port_token;
+    bool found_port = false;
+
+    while (std::getline(iss, port_token, ',')) {
+        try {
+            int port = std::stoi(port_token);
+            if (port == msg.src_port) {
+                found_port = true;
+                break;
+            }
+
+        } catch (const std::exception &e) {
+            // Invalid port format, skip
+            std::cerr << "Invalid port: " << port_token << "\n";
+        }
+    }
+
+    if (!found_port) {
+        (*found_line) += ", " + std::to_string(msg.src_port);
+        return true;
+    }
+
+    return false;
+}
+
 static std::string merge_allowed_with_topology(const TopologyEntry &information,
                                                const std::vector<std::string> &allowed_lines) {
 
@@ -1109,7 +1193,6 @@ static void draw_main_page(const double &current_time) {
     ImGui::Separator();
     ImGui::Spacing();
 
-    // TODO
     ImGui::SameLine();
     if (ImGui::Button(training_activate ? "Stop Training" : "Train")) {
         training_activate = !training_activate;
@@ -1200,40 +1283,9 @@ static void draw_main_page(const double &current_time) {
         ImVec2 card_pos = ImGui::GetCursorScreenPos();
         ImVec2 card_size(500, 55);
 
-        // Background color based on mode
-        ImU32 mode_color;
-        const char *mode_name;
-        ImVec4 mode_text_color;
-
-        switch (pc.current_mode) {
-            case 0:
-                mode_name = "LISTENING";
-                mode_color = IM_COL32(100, 200, 100, 50);
-                mode_text_color = ImVec4(0.4f, 0.8f, 0.4f, 1.0f);
-                break;
-            case 1:
-                mode_name = "MONITORING";
-                mode_color = IM_COL32(100, 150, 255, blink_visible ? 80 : 20);
-                mode_text_color = ImVec4(0.4f, 0.6f, 1.0f, 1.0f);
-                break;
-            case 2:
-                mode_name = "REACTIVE";
-                mode_color = IM_COL32(255, 100, 100, blink_visible ? 80 : 20);
-                mode_text_color = ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
-                break;
-            case 3:
-                mode_name = "DISABLED";
-                mode_color = IM_COL32(100, 100, 100, 50);
-                mode_text_color = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
-                break;
-            default:
-                mode_name = "UNKNOWN";
-                mode_color = IM_COL32(100, 100, 100, 50);
-                mode_text_color = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
-        }
-
         ImDrawList *dl = ImGui::GetWindowDrawList();
-        dl->AddRectFilled(card_pos, ImVec2(card_pos.x + card_size.x, card_pos.y + card_size.y), mode_color, 8.0f);
+        dl->AddRectFilled(card_pos, ImVec2(card_pos.x + card_size.x, card_pos.y + card_size.y),
+                          get_mode_background_color(pc.current_mode, blink_visible), 8.0f);
         dl->AddRect(card_pos, ImVec2(card_pos.x + card_size.x, card_pos.y + card_size.y), IM_COL32(150, 150, 150, 150),
                     8.0f, 0, 2.0f);
 
@@ -1268,8 +1320,8 @@ static void draw_main_page(const double &current_time) {
 
         // Mode on the far right
         ImGui::SameLine(380);
-        ImGui::PushStyleColor(ImGuiCol_Text, mode_text_color);
-        ImGui::Text("Mode: %s", mode_name);
+        ImGui::PushStyleColor(ImGuiCol_Text, get_mode_color(pc.current_mode));
+        ImGui::Text("Mode: %s", get_mode_name(pc.current_mode));
         ImGui::PopStyleColor();
 
         ImGui::Dummy(ImVec2(card_size.x, 0));
@@ -1334,8 +1386,6 @@ static void draw_main_page(const double &current_time) {
     ImGui::BeginChild("message_history", ImVec2(0, 0), true);
 
     for (const MessageReceived &msg : *message_history_vector) {
-        // TODO: Need to switch collor based on the current mode of the log itself.
-
         ImGui::PushStyleColor(ImGuiCol_Text, get_mode_color(msg.mode));
         ImGui::TextWrapped("%s", transform_messages_to_str(msg, pc_map).c_str());
         ImGui::PopStyleColor();
@@ -1858,9 +1908,6 @@ static int draw_pc_page(const double &current_time) {
         return -1;
     }
 
-    // Get mode color
-    const ImVec4 mode_text_color = get_mode_color(pc_selected_data.current_mode);
-
     // === HEADER SECTION ===
     ImGui::BeginGroup();
 
@@ -2003,7 +2050,7 @@ static int draw_pc_page(const double &current_time) {
     ImGui::Text("Mode:");
     ImGui::SameLine(150);
     ImGui::SetNextItemWidth(180);
-    ImGui::PushStyleColor(ImGuiCol_Text, mode_text_color);
+    ImGui::PushStyleColor(ImGuiCol_Text, get_mode_color(pc_selected_data.current_mode));
     if (ImGui::Combo("##mode_select", &changed_config_mode, MODES, 4)) {
         std::cout << "Mode changed to: " << MODES[changed_config_mode] << "\n";
         changed_config_checker = true;
@@ -2170,10 +2217,27 @@ static int draw_pc_page(const double &current_time) {
     if ((*message_history_vector).empty()) {
         ImGui::TextDisabled("No activity recorded");
     } else {
-        for (const MessageReceived &msg : *message_history_vector) {
+        for (size_t index = 0; index < message_history_vector->size(); index++) {
+            const MessageReceived &msg = (*message_history_vector)[index];
+
+            ImGui::BeginGroup();
+
+            ImGui::AlignTextToFramePadding();
             ImGui::PushStyleColor(ImGuiCol_Text, get_mode_color(msg.mode));
             ImGui::TextWrapped("%s", transform_messages_to_str(msg, nullptr).c_str());
             ImGui::PopStyleColor();
+
+            // Add button on the right
+            ImGui::SameLine(ImGui::GetWindowWidth() - 60);
+            const std::string button_label = "+##add_" + std::to_string(index);
+            if (ImGui::Button(button_label.c_str(), ImVec2(30, 20))) {
+                printf("Add button clicked for message %ld\n", index);
+                if (add_entity_in_allowed(allowed_lines, msg)) {
+                    changed_allowed_file_checker = true;
+                }
+            }
+
+            ImGui::EndGroup();
             ImGui::Separator();
         }
     }
@@ -2188,12 +2252,6 @@ static int draw_pc_page(const double &current_time) {
 // ==================================================================================================
 
 int main() {
-    if (!g_network_log_db.open()) {
-        std::cerr << "Cannot initialize SQLite database → continuing without logging...\n";
-    } else {
-        g_tcp_log_receiver.start();
-    }
-
     glfwInit();
     GLFWwindow *wnd = glfwCreateWindow(1400, 900, "Network Inspection App", nullptr, nullptr);
     glfwMakeContextCurrent(wnd);
@@ -2264,9 +2322,6 @@ int main() {
             std::this_thread::sleep_for(std::chrono::duration<double>(TARGET_FRAME_TIME - frame_duration));
         }
     }
-
-    g_tcp_log_receiver.stop();
-    g_network_log_db.close();
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
