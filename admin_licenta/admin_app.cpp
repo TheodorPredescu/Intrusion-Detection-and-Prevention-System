@@ -2,10 +2,8 @@
 #include "imgui/backends/imgui_impl_opengl3.h"
 #include "imgui/imgui.h"
 
-// TODO:
-// #include "imgui-node-editor/imgui_node_editor.h"
-// #include "imnodes/imnodes.h"
 #include <GL/gl.h>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -21,7 +19,6 @@
 #include <sys/stat.h>
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <curl/curl.h>
@@ -72,7 +69,7 @@ static bool changed_allowed_file_checker = false;
 static std::string changed_general_name_given = "";
 static bool changed_general_checker = false;
 
-static const double TARGET_FPS = 30.0;
+static const double TARGET_FPS = 60.0;
 static const double TARGET_FRAME_TIME = 1.0 / TARGET_FPS;
 
 // ============================================================================
@@ -118,7 +115,9 @@ struct ConnectionStats {
 };
 
 struct TopologyEntry {
+    // key: source ip; value: general information comming from that source
     std::map<std::string, ConnectionStats> connection_dict;
+    // All the ips used by this pc.
     std::set<std::string> topology_ip;
 };
 
@@ -127,10 +126,6 @@ struct TopologyType {
 };
 
 // ============================================================================
-
-// Global structures
-// static std::map<std::string, std::unique_ptr<RemotePC>> pc_by_name_host; // key: name + "|" + host
-// std::unordered_map<std::string, RemotePC *> ip_to_pc_map; // fast IP → PC lookup
 
 static ImVec2 topology_pan = ImVec2(0.0f, 0.0f);
 static float topology_zoom = 1.0f;
@@ -534,53 +529,6 @@ compute_graph_layout(const std::set<std::string> &all_ips,
     return positions;
 }
 
-// static std::map<std::string, ImVec2>
-// compute_graph_layout(const std::set<std::string> &all_ips,
-//                      const std::map<std::string, std::set<std::string>> &connections) {
-//
-//     std::map<std::string, ImVec2> positions;
-//
-//     // Generate dot format
-//     std::string dot = "digraph G {\nrankdir=LR;\nnode [shape=box];\n";
-//     dot += "graph [overlap=false];\n";
-//     for (const auto &ip : all_ips) {
-//         dot += "  \"" + ip + "\";\n";
-//     }
-//     for (const auto &[src, dests] : connections) {
-//         for (const auto &dst : dests) {
-//             dot += "  \"" + src + "\" -> \"" + dst + "\";\n";
-//         }
-//     }
-//     dot += "}\n";
-//
-//     // Save dot file
-//     std::ofstream dot_file("/tmp/graph.dot");
-//     dot_file << dot;
-//     dot_file.close();
-//
-//     // Run graphviz
-//     system("neato -Tplain /tmp/graph.dot -o /tmp/graph.txt 2>/dev/null");
-//
-//     // Parse positions
-//     std::ifstream result("/tmp/graph.txt");
-//     std::string line;
-//     while (std::getline(result, line)) {
-//         if (line[0] == 'n') {
-//             std::istringstream iss(line);
-//             std::string node_type, ip_quoted;
-//             float x, y;
-//             iss >> node_type >> ip_quoted >> x >> y;
-//
-//             // Remove quotes from ip
-//             std::string ip = ip_quoted.substr(1, ip_quoted.length() - 2);
-//             positions[ip] = ImVec2(x * 100, y * 100); // scale to screen
-//         }
-//     }
-//     result.close();
-//
-//     return positions;
-// }
-
 static std::string get_protocol_name(const int protocol) {
     switch (protocol) {
         case 1:
@@ -639,18 +587,6 @@ static void reset_modifications() {
     reset_general_user_info();
 }
 
-// static void update_ip_map_for_pc(RemotePC *pc) {
-//     for (const std::string &ip : pc->ips) {
-//         // Add only the new elements info `ip_to_pc_map`
-//         ip_to_pc_map.emplace(ip, pc);
-//     }
-// }
-
-// RemotePC *find_pc_by_ip(const std::string &ip) {
-//     auto it = ip_to_pc_map.find(ip);
-//     return it != ip_to_pc_map.end() ? it->second : nullptr;
-// }
-
 std::vector<std::pair<std::string, std::string>> parse_connections(const std::string &log) {
     std::vector<std::pair<std::string, std::string>> connections;
     std::regex pattern(R"(SRC=([\d\.]+).*DST=([\d\.]+))");
@@ -674,7 +610,7 @@ std::vector<std::pair<std::string, std::string>> parse_connections(const std::st
 }
 
 /**
- * @default value: 4
+ * @default value: `NO_STATE`
  */
 static int extract_current_state(const std::string &config_file) {
 
@@ -695,6 +631,53 @@ static int extract_current_state(const std::string &config_file) {
         return DISABLED;
     }
     return NO_STATE;
+}
+
+static bool valid_mode(const int &mode) {
+    return mode >= 0 && mode <= DISABLED;
+}
+
+static std::string config_change_state(const std::string &config_file, const int &state) {
+
+    if (!valid_mode(state)) {
+        return "";
+    }
+
+    std::istringstream iss(config_file);
+    std::string line;
+    std::ostringstream oss;
+    bool wrote_mode = false;
+
+    while (std::getline(iss, line)) {
+        if (wrote_mode) {
+            oss << line << "\n";
+            continue;
+        }
+
+        std::string line_upper = line;
+        for (auto &c : line_upper) {
+            c = std::toupper(c);
+        }
+
+        bool found_mode = false;
+        for (const char *mode : MODES) {
+            const size_t pozition = line_upper.find(mode);
+
+            if (pozition != std::string::npos) {
+                found_mode = true;
+                break;
+            }
+        }
+
+        if (found_mode) {
+            oss << MODES[state] << "\n";
+            wrote_mode = true;
+        } else {
+            oss << line << "\n";
+        }
+    }
+
+    return wrote_mode ? oss.str() : "";
 }
 
 static void extract_config_info(const std::string &text, std::string &server_ip, std::string &server_port,
@@ -739,45 +722,6 @@ static std::string create_config_info_string() {
 
     return std::string(buffer);
 }
-
-/**
- * Discovers the new ips that a pc might use in the logs.
- */
-// static void discover_new_ips() {
-//     for (const auto &[key, pc_uptr] : pc_by_name_host) {
-//         RemotePC *pc = pc_uptr.get();
-//
-//         std::string log_copy;
-//         {
-//             std::lock_guard<std::mutex> lock(pc->logMutex);
-//             log_copy = pc->logBuffer;
-//         }
-//
-//         std::vector<std::pair<std::string, std::string>> conns = parse_connections(log_copy);
-//
-//         for (const auto &[_, dst_ip] : conns) {
-//             RemotePC *dst_pc = find_pc_by_ip(dst_ip);
-//
-//             // Check if destination IP belongs to this PC but isn't tracked yet
-//             if (dst_pc) {
-//                 continue;
-//             }
-//             bool ip_appears_in_pc = false;
-//
-//             for (const auto &ip : pc->ips) {
-//                 if (ip == dst_ip) {
-//                     ip_appears_in_pc = true;
-//                     break;
-//                 }
-//             }
-//
-//             if (ip_appears_in_pc == false) {
-//                 pc->ips.push_back(dst_ip);
-//                 update_ip_map_for_pc(pc);
-//             }
-//         }
-//     }
-// }
 
 static std::map<std::string, PCInfo> *get_pc_info() {
     static std::map<std::string, PCInfo> pc_map;
@@ -930,44 +874,52 @@ static TopologyType get_topology(const std::string pc_id = "") {
     return topology;
 }
 
-static std::string recreate_allowed_file(const TopologyEntry &information,
-                                         const std::vector<std::string> &allowed_lines) {
+static std::string merge_allowed_with_topology(const TopologyEntry &information,
+                                               const std::vector<std::string> &allowed_lines) {
 
     static std::map<std::string, std::set<int>> allowed_ip_map;
     allowed_ip_map.clear();
 
     for (const std::string &line : allowed_lines) {
-        size_t colon_pos = line.find(":");
+        const size_t colon_pos = line.find(":");
 
         // Just the ip, no ports written
         if (colon_pos == std::string::npos) {
             allowed_ip_map[line];
-        } else {
-            // IP with ports
-            std::string ip = line.substr(0, colon_pos);
-            std::string ports_str = line.substr(colon_pos + 1);
+            continue;
+        }
 
-            // Parse ports (comma-separated)
-            std::istringstream iss(ports_str);
-            std::string port_token;
-            while (std::getline(iss, port_token, ',')) {
-                try {
-                    uint port = std::stoul(port_token);
+        // IP with ports
+        const std::string ip = line.substr(0, colon_pos);
+        const std::string ports_str = line.substr(colon_pos + 1);
 
-                    if (port <= 65535) {
-                        allowed_ip_map[ip].insert(port);
-                    } else {
-                        std::cerr << "Port out of range: " << port << "\n";
-                    }
-                } catch (const std::exception &e) {
-                    // Invalid port format, skip
-                    std::cerr << "Invalid port: " << port_token << "\n";
+        // Parse ports (comma-separated)
+        std::istringstream iss(ports_str);
+        std::string port_token;
+        while (std::getline(iss, port_token, ',')) {
+            try {
+                uint port = std::stoul(port_token);
+
+                if (port <= 65535) {
+                    allowed_ip_map[ip].insert(port);
+                } else {
+                    std::cerr << "Port out of range: " << port << "\n";
                 }
+            } catch (const std::exception &e) {
+                // Invalid port format, skip
+                std::cerr << "Invalid port: " << port_token << "\n";
             }
         }
     }
 
     for (const auto &[ip, stats] : information.connection_dict) {
+        auto it = allowed_ip_map.find(ip);
+
+        // If its empty line, keep the profile (allow everithing)
+        if (it != allowed_ip_map.end() && it->second.empty()) {
+            continue;
+        }
+
         std::set<int> &ip_set = allowed_ip_map[ip];
         printf("[TOPOLOGY] tried to add a new set for ip: %s\n", ip.c_str());
         for (const int &port : stats.ports_out) {
@@ -998,6 +950,74 @@ static std::string recreate_allowed_file(const TopologyEntry &information,
     return allowed_file;
 }
 
+static std::string merge_allowed_with_ports_map(const std::string &allowed_file,
+                                                std::map<std::string, std::set<int>> ports_map) {
+
+    std::istringstream iss(allowed_file);
+    std::string line;
+
+    while (std::getline(iss, line)) {
+        line.erase(0, line.find_first_not_of(" \t\r\n"));
+        line.erase(line.find_last_not_of(" \t\r\n") + 1);
+        if (line.empty()) {
+            continue;
+        }
+
+        const size_t colon_pos = line.find(":");
+
+        // If its only the ip in the original list, clear the set if the entity already exists or create empty entity
+        if (colon_pos == std::string::npos) {
+            ports_map[line].clear();
+            continue;
+        }
+
+        // IP with ports
+        std::string ip = line.substr(0, colon_pos);
+        std::string ports_str = line.substr(colon_pos + 1);
+
+        // Parse ports (comma-separated)
+        std::istringstream iss(ports_str);
+        std::string port_token;
+
+        while (std::getline(iss, port_token, ',')) {
+            try {
+                uint port = std::stoul(port_token);
+
+                if (port <= 65535) {
+                    ports_map[ip].insert(port);
+                } else {
+                    std::cerr << "Port out of range: " << port << "\n";
+                }
+            } catch (const std::exception &e) {
+                // Invalid port format, skip
+                std::cerr << "Invalid port: " << port_token << "\n";
+            }
+        }
+    }
+
+    std::string new_allowed_file = "";
+
+    for (const auto &[allowed_ip, allowed_port_set] : ports_map) {
+        new_allowed_file += allowed_ip;
+
+        bool first = true;
+        for (const int port : allowed_port_set) {
+            if (first) {
+                first = false;
+                new_allowed_file += ": ";
+            } else {
+                new_allowed_file += ", ";
+            }
+
+            new_allowed_file += std::to_string(port);
+        }
+
+        new_allowed_file += "\n";
+    }
+
+    return new_allowed_file;
+}
+
 static std::string transform_messages_to_str(const MessageReceived &message,
                                              const std::map<std::string, PCInfo> *const pc_map) {
 
@@ -1018,11 +1038,7 @@ static std::string transform_messages_to_str(const MessageReceived &message,
     return ss.str();
 }
 
-// ===============================================================================================
-// ================================== async connection handling ==================================
-// ===============================================================================================
-
-// ================================== Transformations from topology reactivity ==================================
+// ========================= Transformations from topology reactivity =========================
 
 /**
  * Handles interactive panning and zooming of the topology view.
@@ -1073,56 +1089,79 @@ static ImVec2 to_screen(const ImVec2 &world) {
 // ===================================================================================================
 
 static void draw_main_page(const double &current_time) {
-    static const int REFRESH_INTERVAL = 5; // sec
+    static const int REFRESH_INTERVAL = 5; // seconds
     static double previous_time = -REFRESH_INTERVAL;
     static bool is_context_menu_opened = false;
     static float blink_time = 0.0f;
 
     static std::map<std::string, PCInfo> *pc_map;
 
-    // Fetch logs every `REFRESH_INTERVAL` seconds
-    static std::vector<MessageReceived> *message_history_vector;
+    static std::vector<MessageReceived> *message_history_vector; // Fetch logs every `REFRESH_INTERVAL` seconds
 
     static PCInfo const *pc_context_menu_selected = nullptr;
 
-    static std::unique_ptr<TopologyType> topology_data = nullptr;
-    static bool activate_training = false;
+    static std::unique_ptr<TopologyType> training_topology_data = nullptr;
+    static std::map<std::string, std::set<int>> training_allowed_new_elements;
+    static std::map<std::string, int> training_pc_mode_before;
+    static bool training_activate = false;
 
     ImGui::Text("Network Monitoring System");
     ImGui::Separator();
     ImGui::Spacing();
 
-    if (ImGui::Button("Network Topology")) {
-        page = Page::Topology;
-        return;
-    }
-
+    // TODO
     ImGui::SameLine();
-    if (ImGui::Button(activate_training ? "Stop Training" : "Train")) {
-        activate_training = !activate_training;
+    if (ImGui::Button(training_activate ? "Stop Training" : "Train")) {
+        training_activate = !training_activate;
 
-        // TODO: Based on the information from `topology_data`, add all the elements in the allowed_file from the pc_map
-        if (activate_training) {
-            // Change the profile of all the pcs to MONITORING ( I should make a function special for changing mode.)
+        if (training_activate) {
+            training_pc_mode_before.clear();
+
+            // Change the profile of all the pcs to MONITORING and save the initial modes for later restauration.
             for (const auto &[pc_id, pc_info] : *pc_map) {
-                // Set all the information to all the pcs.
-                // pc_info.config_file - > mode changed to the previous one saved somewere.
-                // The actual information from the pc_info can remain the same, I just need to copy the config string
-                // and change the mode of operation. I can also chose to change in pc_info memory the config, so that I
-                // will not have updating problems with the display or something similar..., but that means that I need
-                // to keep somewere else the current config saved so that I can restore it later... .
-                const std::string monitoring_config = pc_info.config_file;
+                const std::string monitoring_config = config_change_state(pc_info.config_file, MONITORING);
+
+                if (monitoring_config.empty()) {
+                    printf("Something went wrong for the user %s;\n config file: '%s'\n", pc_id.c_str(),
+                           pc_info.config_file.c_str());
+                    continue;
+                }
+
+                training_pc_mode_before.insert({pc_id, pc_info.current_mode});
                 send_config_via_api(pc_id, monitoring_config);
             }
         } else {
 
-            // The training has ended and the information needs to be added.
-            // add_information_to_all_pcs(topology_data, pc_map);
-            //
+            // Save all the new connections `to be added` in a more friendly format.
+            if (training_topology_data) {
+                training_allowed_new_elements.clear();
+                for (const auto &[_, pc_topology_info] : training_topology_data->topology_connection) {
+                    for (const auto &[src_ip, src_info] : pc_topology_info.connection_dict) {
+
+                        for (const int port : src_info.ports_out) {
+                            training_allowed_new_elements[src_ip].insert(port);
+                        }
+                    }
+                }
+            }
+
+            // Add all the new allowed definitions into the allowed file for each element and change back the mode to
+            // its original state.
             for (const auto &[pc_id, pc_info] : *pc_map) {
+                const auto it = training_pc_mode_before.find(pc_id);
+
+                if (it == training_pc_mode_before.end()) {
+                    continue;
+                }
+
+                const std::string original_config = config_change_state(pc_info.config_file, it->second);
+                const std::string new_allowed_file =
+                    merge_allowed_with_ports_map(pc_info.allowed_file, training_allowed_new_elements);
+
                 // Set all the information to all the pcs.
-                // pc_info.config_file - > mode changed to the previous one saved somewere.
-                send_config_via_api(pc_id, pc_info.config_file, pc_info.allowed_file);
+                printf("[TRAINING] new allowed file: '%s'\n[TRAINING] Old one: '%s'\n", new_allowed_file.c_str(),
+                       pc_info.allowed_file.c_str());
+                send_config_via_api(pc_id, original_config, new_allowed_file);
             }
         }
     }
@@ -1140,6 +1179,7 @@ static void draw_main_page(const double &current_time) {
     blink_time += ImGui::GetIO().DeltaTime;
     const bool blink_visible = fmod(blink_time, 1.0f) < 0.5f;
 
+    // __________________ REFRESH __________________
     if (current_time >= previous_time + REFRESH_INTERVAL) {
         std::cout << previous_time << ", " << current_time << std::endl;
         previous_time = current_time;
@@ -1147,9 +1187,8 @@ static void draw_main_page(const double &current_time) {
         pc_map = get_pc_info();
         message_history_vector = get_message_history("", pc_map);
 
-        // TODO: Training all the pcs.
-        if (activate_training) {
-            topology_data = std::make_unique<TopologyType>(get_topology());
+        if (training_activate) {
+            training_topology_data = std::make_unique<TopologyType>(get_topology());
         }
     }
 
@@ -1306,12 +1345,6 @@ static void draw_main_page(const double &current_time) {
     ImGui::EndChild();
 }
 
-/**
- * TODO:
- * Should I filter it on the backend and just send it in final version in here?? Another api?? If I do not I would send
- * to much info via the current api (like 1000 packets and then filter them here.)
- */
-
 static void draw_topology(const double &current_time) {
     static const float REFRESH_INTERVAL = 7;
     static double previous_time = -REFRESH_INTERVAL;
@@ -1347,6 +1380,12 @@ static void draw_topology(const double &current_time) {
 
         // For each source IP that connected to this PC
         for (const auto &[src_ip, stats] : entry.connection_dict) {
+
+            const auto it = entry.topology_ip.find(src_ip);
+            if (it != entry.topology_ip.end()) {
+                continue;
+            }
+
             std::string sender;
 
             // Map src_ip to pc_id or keep as external IP
@@ -1392,8 +1431,7 @@ static void draw_topology(const double &current_time) {
         bool is_pc = pc_map->find(node_key) != pc_map->end();
         const PCInfo &pc = is_pc ? pc_map->at(node_key) : PCInfo{};
 
-        ImVec2 world_pos = node_positions[node_key];
-        ImVec2 screen_node_pos = to_screen(world_pos);
+        ImVec2 screen_node_pos = to_screen(node_positions[node_key]);
         ImVec2 node_pos = ImVec2(screen_node_pos.x + canvas_pos.x, screen_node_pos.y + canvas_pos.y);
         ImVec2 node_size(NODE_WIDTH * topology_zoom, NODE_HEIGHT * topology_zoom);
 
@@ -1471,7 +1509,7 @@ static void draw_topology(const double &current_time) {
     for (const auto &[src, dst_set] : connections) {
         int out_idx = 0;
         for (const auto &dst : dst_set) {
-            auto it_src = pin_positions.find(src + "_out_" + std::to_string(out_idx));
+            const auto it_src = pin_positions.find(src + "_out_" + std::to_string(out_idx));
             int in_idx = 0;
             for (const auto &[s, dests] : connections) {
                 if (dests.count(dst) && s == src) {
@@ -1483,29 +1521,31 @@ static void draw_topology(const double &current_time) {
             }
             auto it_dst = pin_positions.find(dst + "_in_" + std::to_string(in_idx));
             if (it_src != pin_positions.end() && it_dst != pin_positions.end()) {
-                ImVec2 src_pin = it_src->second;
-                ImVec2 dst_pin = it_dst->second;
+                const ImVec2 src_pin = it_src->second;
+                const ImVec2 dst_pin = it_dst->second;
 
                 // Node centers
-                ImVec2 src_node_pos = ImVec2(to_screen(node_positions[src]).x + canvas_pos.x,
-                                             to_screen(node_positions[src]).y + canvas_pos.y);
-                ImVec2 dst_node_pos = ImVec2(to_screen(node_positions[dst]).x + canvas_pos.x,
-                                             to_screen(node_positions[dst]).y + canvas_pos.y);
+                const ImVec2 src_to_screen = to_screen(node_positions[src]);
+                const ImVec2 dst_to_screen = to_screen(node_positions[dst]);
 
-                float src_node_center_x = src_node_pos.x + NODE_WIDTH * topology_zoom / 2;
-                float src_node_center_y = src_node_pos.y + NODE_HEIGHT * topology_zoom / 2;
-                float dst_node_center_x = dst_node_pos.x + NODE_WIDTH * topology_zoom / 2;
-                float dst_node_center_y = dst_node_pos.y + NODE_HEIGHT * topology_zoom / 2;
+                const ImVec2 src_node_pos = ImVec2(src_to_screen.x + canvas_pos.x, src_to_screen.y + canvas_pos.y);
+                const ImVec2 dst_node_pos = ImVec2(dst_to_screen.x + canvas_pos.x, dst_to_screen.y + canvas_pos.y);
+
+                const float src_node_center_x = src_node_pos.x + NODE_WIDTH * topology_zoom / 2;
+                const float src_node_center_y = src_node_pos.y + NODE_HEIGHT * topology_zoom / 2;
+                const float dst_node_center_x = dst_node_pos.x + NODE_WIDTH * topology_zoom / 2;
+                const float dst_node_center_y = dst_node_pos.y + NODE_HEIGHT * topology_zoom / 2;
 
                 // Offsets based on left/right and top/bottom
                 float src_offset_x = 0;
+                float src_offset_y = 0;
+
                 if (src_pin.x < src_node_center_x) {
                     src_offset_x = -50.0f;
                 } else if (src_pin.x > src_node_center_x) {
                     src_offset_x = 50.0f;
                 }
 
-                float src_offset_y = 0;
                 if (src_pin.y < src_node_center_y) {
                     src_offset_y = -50.0f;
                 } else if (src_pin.y > src_node_center_y) {
@@ -1513,13 +1553,14 @@ static void draw_topology(const double &current_time) {
                 }
 
                 float dst_offset_x = 0;
+                float dst_offset_y = 0;
+
                 if (dst_pin.x < dst_node_center_x) {
                     dst_offset_x = -50.0f;
                 } else if (dst_pin.x > dst_node_center_x) {
                     dst_offset_x = 50.0f;
                 }
 
-                float dst_offset_y = 0;
                 if (dst_pin.y < dst_node_center_y) {
                     dst_offset_y = -50.0f;
                 } else if (dst_pin.y > dst_node_center_y) {
@@ -1537,12 +1578,11 @@ static void draw_topology(const double &current_time) {
     // Hover detection (same as before)
     std::string hovered_node;
     for (const auto &node_key : all_nodes) {
-        ImVec2 world_pos = node_positions[node_key];
-        ImVec2 screen_node_pos = to_screen(world_pos);
-        ImVec2 node_pos = ImVec2(screen_node_pos.x + canvas_pos.x, screen_node_pos.y + canvas_pos.y);
-        ImVec2 node_size(NODE_WIDTH * topology_zoom, NODE_HEIGHT * topology_zoom);
-        bool hovered = mouse.x >= node_pos.x && mouse.x <= node_pos.x + node_size.x && mouse.y >= node_pos.y &&
-                       mouse.y <= node_pos.y + node_size.y;
+        const ImVec2 screen_node_pos = to_screen(node_positions[node_key]);
+        const ImVec2 node_pos = ImVec2(screen_node_pos.x + canvas_pos.x, screen_node_pos.y + canvas_pos.y);
+        const ImVec2 node_size(NODE_WIDTH * topology_zoom, NODE_HEIGHT * topology_zoom);
+        const bool hovered = mouse.x >= node_pos.x && mouse.x <= node_pos.x + node_size.x && mouse.y >= node_pos.y &&
+                             mouse.y <= node_pos.y + node_size.y;
         if (hovered) {
             hovered_node = node_key;
             ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
@@ -1554,7 +1594,7 @@ static void draw_topology(const double &current_time) {
 
     // Hover message
     if (!hovered_node.empty()) {
-        bool is_pc = pc_map->find(hovered_node) != pc_map->end();
+        const bool is_pc = pc_map->find(hovered_node) != pc_map->end();
         const PCInfo &pc = is_pc ? pc_map->at(hovered_node) : PCInfo{};
 
         ImGui::SetNextWindowSizeConstraints(ImVec2(150, 0), ImVec2(400, 500));
@@ -1643,7 +1683,7 @@ static void draw_topology(const double &current_time) {
                 break;
             }
         }
-        bool is_pc = pc_map->find(selected_key) != pc_map->end();
+        const bool is_pc = pc_map->find(selected_key) != pc_map->end();
         if (ImGui::MenuItem("View Info")) {
             printf("Info: %s\n", selected_key.c_str());
         }
@@ -1659,407 +1699,6 @@ static void draw_topology(const double &current_time) {
 
     ImGui::EndChild();
 }
-
-// static void draw_topology(const double &current_time) {
-//     static const float REFRESH_INTERVAL = 7;
-//     static double previous_time = -REFRESH_INTERVAL;
-//     static std::map<std::string, PCInfo> *pc_map = nullptr;
-//     static std::vector<MessageReceived> *messages = nullptr;
-//     static std::map<std::string, ImVec2> node_positions;
-//
-//     static ax::NodeEditor::EditorContext *context = nullptr;
-//     if (!context) {
-//         context = ax::NodeEditor::CreateEditor();
-//     }
-//     ax::NodeEditor::SetCurrentEditor(context);
-//
-//     if (current_time >= previous_time + REFRESH_INTERVAL) {
-//         previous_time = current_time;
-//         pc_map = get_pc_info();
-//         messages = get_message_history("", pc_map);
-//         node_positions.clear();
-//     }
-//
-//     if (!pc_map || !messages) {
-//         return;
-//     }
-//
-//     // Build pc_id -> IPs mapping
-//     std::map<std::string, std::set<std::string>> pc_id_to_ips;
-//     std::map<std::string, std::string> ip_to_pc_id;
-//     for (const auto &msg : *messages) {
-//         pc_id_to_ips[msg.pc_id].insert(msg.dst_ip);
-//         ip_to_pc_id.insert({msg.dst_ip, msg.pc_id});
-//     }
-//
-//     // Build connections
-//     std::set<std::string> all_nodes;
-//     std::map<std::string, std::set<std::string>> connections;
-//
-//     for (const auto &msg : *messages) {
-//         std::string receiver_pc_id = msg.pc_id;
-//         all_nodes.insert(receiver_pc_id);
-//
-//         std::string sender;
-//         if (ip_to_pc_id.find(msg.src_ip) != ip_to_pc_id.end()) {
-//             sender = ip_to_pc_id[msg.src_ip];
-//             all_nodes.insert(sender);
-//         } else {
-//             sender = msg.src_ip;
-//             all_nodes.insert(sender);
-//         }
-//
-//         connections[sender].insert(receiver_pc_id);
-//     }
-//
-//     // Compute layout if positions not set
-//     if (node_positions.empty()) {
-//         node_positions = compute_graph_layout(all_nodes, connections);
-//     }
-//
-//     ax::NodeEditor::Begin("Topology", ImVec2(0, 0));
-//
-//     static int selected_node = -1;
-//     std::map<std::string, ax::NodeEditor::NodeId> node_to_id;
-//     std::map<std::string, ax::NodeEditor::PinId> node_input_pin;
-//     std::map<std::string, ax::NodeEditor::PinId> node_output_pin;
-//     int node_id = 0;
-//
-//     // Draw all nodes
-//     for (const auto &node_key : all_nodes) {
-//         int node_id = std::hash<std::string>{}(node_key) & 0x7FFFFFFF;
-//
-//         ax::NodeEditor::NodeId node_uid(node_id);
-//
-//         node_to_id[node_key] = node_uid;
-//
-//         bool is_pc = pc_map->find(node_key) != pc_map->end();
-//         const PCInfo &pc = is_pc ? pc_map->at(node_key) : PCInfo{};
-//
-//         if (node_positions.find(node_key) != node_positions.end()) {
-//             ax::NodeEditor::SetNodePosition(node_uid, node_positions[node_key]);
-//         }
-//
-//         ax::NodeEditor::BeginNode(node_uid);
-//
-//         if (is_pc) {
-//             ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "PC");
-//             ImGui::Text("%s", pc.name.empty() ? pc.pc_id.c_str() : pc.name.c_str());
-//         } else {
-//             ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "External");
-//             ImGui::Text("%s", node_key.c_str());
-//         }
-//
-//         // Input pins (one per incoming connection)
-//         int input_idx = 0;
-//         for (const auto &[src, dests] : connections) {
-//             if (dests.count(node_key)) {
-//                 ax::NodeEditor::PinId input_pin(node_id * 1000 + input_idx);
-//                 ax::NodeEditor::BeginPin(input_pin, ax::NodeEditor::PinKind::Input);
-//                 ImGui::Text("In %d", input_idx);
-//                 ax::NodeEditor::EndPin();
-//                 node_input_pin[std::to_string(node_id) + "_" + std::to_string(input_idx)] = input_pin;
-//                 input_idx++;
-//             }
-//         }
-//
-//         // Output pins (one per outgoing connection)
-//         if (connections.find(node_key) != connections.end()) {
-//             int output_idx = 0;
-//             for (const auto &dst : connections[node_key]) {
-//                 ax::NodeEditor::PinId output_pin(node_id * 1000 + 500 + output_idx);
-//                 ax::NodeEditor::BeginPin(output_pin, ax::NodeEditor::PinKind::Output);
-//                 ImGui::Text("Out %d", output_idx);
-//                 ax::NodeEditor::EndPin();
-//                 node_output_pin[std::to_string(node_id) + "_" + std::to_string(output_idx)] = output_pin;
-//                 output_idx++;
-//             }
-//         }
-//
-//         ax::NodeEditor::EndNode();
-//
-//         node_id++;
-//     }
-//
-//     // Draw links with specific pins
-//     int link_counter = 0;
-//     for (const auto &[src, dst_set] : connections) {
-//         int src_id = std::hash<std::string>{}(src) & 0x7FFFFFFF;
-//         int out_idx = 0;
-//
-//         for (const auto &dst : dst_set) {
-//             int dst_id = std::hash<std::string>{}(dst) & 0x7FFFFFFF;
-//             int in_idx = 0;
-//
-//             // Find which input index this is
-//             for (const auto &[s, dests] : connections) {
-//                 if (dests.count(dst)) {
-//                     if (s == src) {
-//                         break;
-//                     }
-//                     in_idx++;
-//                 }
-//             }
-//
-//             ax::NodeEditor::Link(ax::NodeEditor::LinkId(link_counter++),
-//                                  ax::NodeEditor::PinId(src_id * 1000 + 500 + out_idx),
-//                                  ax::NodeEditor::PinId(dst_id * 1000 + in_idx), ImVec4(0.4f,
-//                                  0.8f, 1.0f, 1.0f), 2.0f);
-//             out_idx++;
-//         }
-//     }
-//
-//     // Context menu
-//     if (ImGui::BeginPopup("node_context")) {
-//         if (selected_node >= 0) {
-//             std::string selected_key;
-//             for (const auto &[key, id] : node_to_id) {
-//                 if (id.Get() == selected_node) {
-//                     selected_key = key;
-//                     break;
-//                 }
-//             }
-//
-//             bool is_pc = pc_map->find(selected_key) != pc_map->end();
-//
-//             if (ImGui::MenuItem("View Info")) {
-//                 printf("Info: %s\n", selected_key.c_str());
-//             }
-//             if (is_pc && ImGui::MenuItem("Edit Config")) {
-//                 pc_id_selected = selected_key;
-//                 page = Page::ClientDetail;
-//             }
-//             if (is_pc && ImGui::MenuItem("View Logs")) {
-//                 pc_id_selected = selected_key;
-//                 page = Page::Logs;
-//             }
-//             if (!is_pc && ImGui::MenuItem("Block IP")) {
-//                 printf("Blocking %s\n", selected_key.c_str());
-//             }
-//         }
-//         ImGui::EndPopup();
-//     }
-//
-//     // Draw links
-//     for (const auto &[src, dst_set] : connections) {
-//         for (const auto &dst : dst_set) {
-//             ax::NodeEditor::Link(ax::NodeEditor::LinkId(std::hash<std::string>{}(src + dst)), node_output_pin[src],
-//                                  node_input_pin[dst], ImVec4(0.4f, 0.8f, 1.0f, 1.0f), 2.0f);
-//         }
-//     }
-//
-//     ax::NodeEditor::End();
-//     ax::NodeEditor::SetCurrentEditor(nullptr);
-// }
-
-// static void draw_topology(const double &current_time) {
-//     static const float REFRESH_INTERVAL = 7;
-//     static double previous_time = -REFRESH_INTERVAL;
-//     static std::map<std::string, PCInfo> *pc_map = nullptr;
-//     static std::vector<MessageReceived> *messages = nullptr;
-//     static std::map<std::string, ImVec2> node_positions;
-//
-//     static ImNodesContext *context = nullptr;
-//     if (!context) {
-//         context = ImNodes::CreateContext();
-//     }
-//     ImNodes::SetCurrentContext(context);
-//
-//     if (current_time >= previous_time + REFRESH_INTERVAL) {
-//         previous_time = current_time;
-//         pc_map = get_pc_info();
-//         messages = get_message_history("", pc_map);
-//         node_positions.clear();
-//     }
-//
-//     if (!pc_map || !messages) {
-//         return;
-//     }
-//
-//     // Build pc_id -> IPs mapping from messages (dst_ip = receiver's IP)
-//     std::map<std::string, std::set<std::string>> pc_id_to_ips;
-//     std::map<std::string, std::string> ip_to_pc_id;
-//     for (const auto &msg : *messages) {
-//         pc_id_to_ips[msg.pc_id].insert(msg.dst_ip);
-//         ip_to_pc_id.insert({msg.dst_ip, msg.pc_id});
-//     }
-//
-//     // Build connections between pc_ids
-//     std::set<std::string> all_nodes; // pc_ids and external IPs
-//     std::map<std::string, std::set<std::string>> connections;
-//
-//     for (const auto &msg : *messages) {
-//         std::string receiver_pc_id = msg.pc_id;
-//         all_nodes.insert(receiver_pc_id);
-//
-//         // Check if sender is another PC or external
-//         std::string sender;
-//         if (ip_to_pc_id.find(msg.src_ip) != ip_to_pc_id.end()) {
-//             // Sender is another PC
-//             sender = ip_to_pc_id[msg.src_ip];
-//             all_nodes.insert(sender);
-//         } else {
-//             // Sender is external IP
-//             sender = msg.src_ip;
-//             all_nodes.insert(sender);
-//         }
-//
-//         connections[sender].insert(receiver_pc_id);
-//     }
-//
-//     // Compute layout if positions not set
-//     if (node_positions.empty()) {
-//         node_positions = compute_graph_layout(all_nodes, connections);
-//     }
-//
-//     ImNodes::BeginNodeEditor();
-//
-//     static int selected_node = -1;
-//     std::map<std::string, int> node_to_id;
-//     int node_id = 0;
-//
-//     // Draw all nodes
-//     for (const auto &node_key : all_nodes) {
-//         node_to_id[node_key] = node_id;
-//
-//         bool is_pc = pc_map->find(node_key) != pc_map->end();
-//         const PCInfo &pc = is_pc ? pc_map->at(node_key) : PCInfo{};
-//
-//         if (node_positions.find(node_key) != node_positions.end()) {
-//             ImNodes::SetNodeGridSpacePos(node_id, node_positions[node_key]);
-//         }
-//
-//         ImNodes::BeginNode(node_id);
-//
-//         ImGui::PushItemWidth(150);
-//         if (is_pc) {
-//             ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "PC");
-//             ImGui::Text("%s", pc.name.empty() ? pc.pc_id.c_str() : pc.name.c_str());
-//         } else {
-//             ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "External");
-//             ImGui::Text("%s", node_key.c_str());
-//         }
-//         ImGui::PopItemWidth();
-//
-//         if (connections.find(node_key) != connections.end()) {
-//             ImNodes::BeginOutputAttribute(node_id * 100);
-//             ImGui::Text("Out");
-//             ImNodes::EndOutputAttribute();
-//         }
-//
-//         for (const auto &[src, dests] : connections) {
-//             if (dests.count(node_key)) {
-//                 ImNodes::BeginInputAttribute(node_id * 100 + 1);
-//                 ImGui::Text("In");
-//                 ImNodes::EndInputAttribute();
-//                 break;
-//             }
-//         }
-//
-//         ImNodes::EndNode();
-//
-//         if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
-//             selected_node = node_id;
-//             ImGui::OpenPopup("node_context");
-//         }
-//
-//         node_id++;
-//     }
-//
-//     // Context menu
-//     if (ImGui::BeginPopup("node_context")) {
-//         if (selected_node >= 0) {
-//             std::string selected_key;
-//             for (const auto &[key, id] : node_to_id) {
-//                 if (id == selected_node) {
-//                     selected_key = key;
-//                     break;
-//                 }
-//             }
-//
-//             bool is_pc = pc_map->find(selected_key) != pc_map->end();
-//
-//             if (ImGui::MenuItem("View Info")) {
-//                 printf("Info: %s\n", selected_key.c_str());
-//             }
-//             if (is_pc && ImGui::MenuItem("Edit Config")) {
-//                 pc_id_selected = selected_key;
-//                 page = Page::ClientDetail;
-//             }
-//             if (is_pc && ImGui::MenuItem("View Logs")) {
-//                 pc_id_selected = selected_key;
-//                 page = Page::Logs;
-//             }
-//             if (!is_pc && ImGui::MenuItem("Block IP")) {
-//                 printf("Blocking %s\n", selected_key.c_str());
-//             }
-//         }
-//         ImGui::EndPopup();
-//     }
-//
-//     // Draw links
-//     int link_id = 0;
-//     for (const auto &[src, dst_set] : connections) {
-//         for (const auto &dst : dst_set) {
-//             int src_node = node_to_id[src];
-//             int dst_node = node_to_id[dst];
-//             ImNodes::Link(link_id++, src_node * 100, dst_node * 100 + 1);
-//         }
-//     }
-//
-//     ImNodes::EndNodeEditor();
-// }
-
-// static void draw_logs() {
-//     // TODO: Small bug. If this pc has another ip, it will not be updated right
-//     // away. I need to reenter on this page to see the modification.
-//
-//     // To remember the selected option.
-//     static int selected = -1;
-//     ImGui::BeginChild("left", ImVec2(250, 0), true);
-//     int idx = 0;
-//     for (const auto &[key, pc_uptr] : pc_by_name_host) {
-//         RemotePC *pc = pc_uptr.get();
-//         std::string label =
-//             pc->name + " (" + std::to_string(pc->ips.size()) + " IP" + (pc->ips.size() > 1 ? "s" : "") + ")";
-//         for (const auto &ip : pc->ips) {
-//             label += "\n\t" + ip;
-//         }
-//         if (ImGui::Selectable(label.c_str(), selected == idx)) {
-//             selected = idx;
-//         }
-//         idx++;
-//     }
-//     ImGui::EndChild();
-//
-//     ImGui::SameLine();
-//     ImGui::BeginChild("right", ImVec2(0, 0), true);
-//
-//     if (idx == 0) {
-//         ImGui::TextDisabled("No PC is currently tracked, add a PC to inspect logs.");
-//         ImGui::EndChild();
-//
-//         // Reset the selected pc if all are removed.
-//         selected = -1;
-//         return;
-//     }
-//
-//     if (selected < 0) {
-//         ImGui::TextDisabled("Select a PC from the left pannel to show its logs.");
-//         ImGui::EndChild();
-//         return;
-//     }
-//
-//     idx = 0;
-//     for (const auto &[key, pc_uptr] : pc_by_name_host) {
-//         if (idx++ == selected) {
-//             std::lock_guard<std::mutex> lock(pc_uptr->logMutex);
-//             ImGui::TextUnformatted(pc_uptr->logBuffer.c_str());
-//             break;
-//         }
-//     }
-//     ImGui::EndChild();
-// }
 
 static int draw_pc_page(const double &current_time) {
     static const float REFRESH_INTERVAL = 5;
@@ -2350,6 +1989,7 @@ static int draw_pc_page(const double &current_time) {
             ImGui::OpenPopup("Invalid Port");
         }
     }
+
     // Error popup
     if (ImGui::BeginPopupModal("Invalid Port", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::Text("Port must be between 1 and 65535!");
@@ -2364,14 +2004,13 @@ static int draw_pc_page(const double &current_time) {
     ImGui::SameLine(150);
     ImGui::SetNextItemWidth(180);
     ImGui::PushStyleColor(ImGuiCol_Text, mode_text_color);
-    const int mode_changed = ImGui::Combo("##mode_select", &changed_config_mode, MODES, 4);
-    ImGui::PopStyleColor();
-    ImGui::Spacing();
-
-    if (mode_changed) {
+    if (ImGui::Combo("##mode_select", &changed_config_mode, MODES, 4)) {
         std::cout << "Mode changed to: " << MODES[changed_config_mode] << "\n";
         changed_config_checker = true;
     }
+
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
 
     // Allowed File Path
     ImGui::Text("Allowed File Path:");
@@ -2499,7 +2138,7 @@ static int draw_pc_page(const double &current_time) {
 
                 const auto entry = message_struct_info->topology_connection.find(pc_id_selected);
                 if (entry != message_struct_info->topology_connection.end()) {
-                    new_allwed_file = recreate_allowed_file(entry->second, allowed_lines);
+                    new_allwed_file = merge_allowed_with_topology(entry->second, allowed_lines);
                 }
                 message_struct_info = nullptr;
             }
@@ -2559,9 +2198,6 @@ int main() {
     GLFWwindow *wnd = glfwCreateWindow(1400, 900, "Network Inspection App", nullptr, nullptr);
     glfwMakeContextCurrent(wnd);
 
-    // Based on VSync
-    // glfwSwapInterval(1);
-
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
@@ -2578,9 +2214,6 @@ int main() {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        // Keep track of all new ips that a pc might have.
-        // discover_new_ips();
-
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
                                  ImGuiWindowFlags_NoBringToFrontOnFocus;
 
@@ -2594,13 +2227,9 @@ int main() {
             page = Page::MainPage;
         }
         ImGui::SameLine();
-        if (ImGui::Button("Topology")) {
+        if (ImGui::Button("Network Topology")) {
             page = Page::Topology;
         }
-        // ImGui::SameLine();
-        // if (ImGui::Button("Logs")) {
-        //     page = Page::Logs;
-        // }
 
         ImGui::Separator();
 
@@ -2612,9 +2241,6 @@ int main() {
             case Page::Topology:
                 draw_topology(frame_start);
                 break;
-            // case Page::Logs:
-            // draw_logs();
-            // break;
             case Page::ClientDetail:
                 draw_pc_page(frame_start);
                 break;
@@ -2639,14 +2265,6 @@ int main() {
         }
     }
 
-    // // Cleanup threads
-    // for (auto &[key, pc] : pc_by_name_host) {
-    //     pc->running = false;
-    //     if (pc->logThread.joinable()) {
-    //         pc->logThread.join();
-    //     }
-    // }
-
     g_tcp_log_receiver.stop();
     g_network_log_db.close();
 
@@ -2655,5 +2273,5 @@ int main() {
     ImGui::DestroyContext();
     glfwDestroyWindow(wnd);
     glfwTerminate();
-    return 0; // ceva
+    return 0;
 }

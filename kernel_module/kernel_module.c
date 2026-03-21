@@ -262,6 +262,7 @@ static void free_packet_list(void) {
 //     }
 //     spin_unlock(&list_lock);
 // }
+
 /**
  * Decide if this packet should be logged (same rules as dbg_show).
  * Returns true if it should be added to packet_list / sent to server.
@@ -272,11 +273,7 @@ static bool should_log_packet(const struct packet_info *info) {
     const u8 local_state = READ_ONCE(state);
 
     // Same as dbg_show
-    if (in_allowed_list && (local_state == MONITORING || local_state == REACTIVE)) {
-        return false;
-    }
-
-    if (!in_allowed_list && local_state == LISTENING) {
+    if (in_allowed_list && (local_state == MONITORING || local_state == REACTIVE || local_state == LISTENING)) {
         return false;
     }
 

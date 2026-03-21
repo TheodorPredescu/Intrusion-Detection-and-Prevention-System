@@ -476,7 +476,6 @@ class ConfigDaemon {
         curl_easy_cleanup(curl);
     }
 
-    // TODO: Remained here.
     bool send_configuration_profile(const bool config_changed, const bool allowed_changed) {
 
         if (config_changed == false && allowed_changed == false) {
@@ -559,7 +558,15 @@ class ConfigDaemon {
         return true;
     }
 
-    // TODO: I need to add the logic that sends the new configuration via api call to the backend.
+    void interruptible_sleep(int seconds) {
+        for (int i = 0; i < seconds; i++) {
+            if (!running) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+
     void run_config_loop() {
         std::cout << "[DAEMON] Starting config monitor...\n";
         while (running) {
@@ -590,7 +597,7 @@ class ConfigDaemon {
                 }
             }
 
-            std::this_thread::sleep_for(std::chrono::seconds(15));
+            interruptible_sleep(15);
         }
         std::cout << "[DAEMON] Config monitor exiting\n";
     }
@@ -620,13 +627,13 @@ class ConfigDaemon {
         while (running) {
 
             if (pc_id.empty()) {
-                std::this_thread::sleep_for(::std::chrono::seconds(10));
+                interruptible_sleep(10);
                 continue;
             }
 
             CURL *curl = curl_easy_init();
             if (!curl) {
-                std::this_thread::sleep_for(::std::chrono::seconds(10));
+                interruptible_sleep(10);
                 continue;
             }
 
@@ -767,7 +774,7 @@ class ConfigDaemon {
             curl_slist_free_all(headers);
             curl_easy_cleanup(curl);
 
-            std::this_thread::sleep_for(::std::chrono::seconds(10));
+            interruptible_sleep(10);
         }
 
         std::cout << "[DAEMON] Config update request loop exiting\n";
