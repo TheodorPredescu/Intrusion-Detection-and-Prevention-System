@@ -1185,7 +1185,6 @@ static void draw_main_page(const double &current_time) {
     static PCInfo const *pc_context_menu_selected = nullptr;
 
     static std::unique_ptr<TopologyType> training_topology_data = nullptr;
-    static std::map<std::string, std::set<int>> training_allowed_new_elements;
     static std::map<std::string, int> training_pc_mode_before;
     static bool training_activate = false;
 
@@ -1236,9 +1235,10 @@ static void draw_main_page(const double &current_time) {
             }
         } else {
 
+            std::map<std::string, std::set<int>> training_allowed_new_elements;
+
             // Save all the new connections `to be added` in a more friendly format.
             if (training_topology_data) {
-                training_allowed_new_elements.clear();
                 for (const auto &[_, pc_topology_info] : training_topology_data->topology_connection) {
                     for (const auto &[src_ip, src_info] : pc_topology_info.connection_dict) {
 
@@ -1778,6 +1778,9 @@ static int draw_pc_page(const double &current_time) {
     static std::vector<MessageReceived> *msg_history_vector = nullptr;
     static std::unique_ptr<TopologyType> msg_struct_info = nullptr;
 
+    static std::string config_before_training;
+    static std::string training_active_id;
+
     // Allowed var
     static int edit_idx = -1;
     static char edit_line_buf[512] = "";
@@ -1789,15 +1792,24 @@ static int draw_pc_page(const double &current_time) {
         return -1;
     }
 
-    if (pc_id_selected != last_pc_id) {
-        request_update = true;
+    bool update = false;
+    if (request_update) {
+        request_update = false;
+        update = true;
+
+        printf("update: %b\n", update);
+        fflush(stdout);
     }
 
-    if (request_update || current_time >= previous_time + REFRESH_INTERVAL) {
+    if (pc_id_selected != last_pc_id) {
+        update = true;
+    }
+
+    if (update || current_time >= previous_time + REFRESH_INTERVAL) {
         previous_time = current_time;
         last_pc_id = pc_id_selected;
 
-        if (request_update) {
+        if (update) {
             // Reset all the 'changed_' variables.
             reset_modifications();
             changed_config_mode = pc_selected_data.current_mode;
@@ -1821,7 +1833,7 @@ static int draw_pc_page(const double &current_time) {
                     const bool update_time_changed = update_time != pc_selected_data.updated_at;
 
                     // Config file
-                    if (request_update || update_time_changed) {
+                    if (update || update_time_changed) {
 
                         pc_selected_data.pc_id = config_json.value("pc_id", "");
                         pc_selected_data.updated_at = update_time;
@@ -1900,7 +1912,7 @@ static int draw_pc_page(const double &current_time) {
             }
         }
 
-        if (pc_selected_data.current_mode == MONITORING) {
+        if (!training_active_id.empty()) {
             msg_struct_info = std::make_unique<TopologyType>(get_topology(pc_id_selected));
             printf("[TOPOLOGY] Created topology\n");
         }
@@ -2002,6 +2014,71 @@ static int draw_pc_page(const double &current_time) {
     // === DETAILS SECTION ===
     ImGui::Text("Configuration Details");
 
+    // TODO: This will not reset if I change the user
+    if (ImGui::Button(training_active_id != pc_id_selected ? "Train" : "Stop Training")) {
+        if (training_active_id.empty()) {
+            training_active_id = pc_id_selected;
+        } else if (training_active_id == pc_id_selected) {
+            training_active_id = "";
+        } else {
+
+            const int original_state = extract_current_state(config_before_training);
+            if (original_state == NO_STATE) {
+                return -1;
+            }
+
+            const std::string config_before_training =
+                config_change_state(pc_selected_data.config_file, original_state);
+
+            printf("Reseted old training mode for user %s\n", training_active_id.c_str());
+            send_config_via_api(training_active_id, config_before_training);
+            training_active_id = pc_id_selected;
+            msg_struct_info = nullptr;
+        }
+
+        if (!training_active_id.empty()) {
+            discard_allowed_changes = true;
+            request_update = true;
+
+            config_before_training = pc_selected_data.config_file;
+            const std::string monitoring_config = config_change_state(pc_selected_data.config_file, MONITORING);
+
+            if (monitoring_config.empty() || !send_config_via_api(pc_id_selected, monitoring_config)) {
+                printf("Something went wrong for the user %s;\n config file: '%s'\n", pc_id_selected.c_str(),
+                       pc_selected_data.config_file.c_str());
+            }
+        } else {
+
+            std::string new_allwed_file = "";
+            if (msg_struct_info && training_active_id == pc_id_selected) {
+                const auto entry = msg_struct_info->topology_connection.find(pc_id_selected);
+                // TODO: I can change the merge to look more to the one from main page
+                if (entry != msg_struct_info->topology_connection.end()) {
+                    new_allwed_file = merge_allowed_with_topology(entry->second, allowed_lines);
+                }
+                msg_struct_info = nullptr;
+            }
+
+            const int original_state = extract_current_state(config_before_training);
+            if (original_state != NO_STATE) {
+                const std::string config_before_training =
+                    config_change_state(pc_selected_data.config_file, original_state);
+
+                printf("config: '%s'\nallowed file: '%s'\n", config_before_training.c_str(), new_allwed_file.c_str());
+                send_config_via_api(pc_id_selected, config_before_training, new_allwed_file);
+                request_update = true;
+            }
+        }
+    }
+
+    if (changed_config_checker || changed_general_checker || changed_allowed_file_checker) {
+        ImGui::SameLine();
+        if (ImGui::Button("Discard changes", ImVec2(130, 0))) {
+            discard_allowed_changes = true;
+            request_update = true;
+        }
+    }
+
     // A right side info text to tell if something is changed on the page
     if (changed_config_checker || changed_general_checker || changed_allowed_file_checker) {
         ImGui::SameLine(ImGui::GetWindowWidth() - 150);
@@ -2077,8 +2154,7 @@ static int draw_pc_page(const double &current_time) {
 
     // ============================= Allowed file =====================================
 
-    if (request_update || discard_allowed_changes) {
-
+    if (update || discard_allowed_changes) {
         allowed_lines.clear();
         changed_allowed_file_checker = false;
         discard_allowed_changes = false;
@@ -2104,11 +2180,6 @@ static int draw_pc_page(const double &current_time) {
         edit_idx = -1; // -1 means new entry
         memset(edit_line_buf, 0, sizeof(edit_line_buf));
         ImGui::OpenPopup("Edit IP Entry");
-    }
-
-    ImGui::SameLine();
-    if (ImGui::Button("Discard changed", ImVec2(130, 0))) {
-        discard_allowed_changes = true;
     }
 
     ImGui::Spacing();
@@ -2168,10 +2239,6 @@ static int draw_pc_page(const double &current_time) {
     }
     ImGui::EndChild();
 
-    if (request_update == true) {
-        request_update = false;
-    }
-
     // =========================== Update configuration ===========================
 
     if (ImGui::Button("Update", ImVec2(100, 0))) {
@@ -2191,6 +2258,7 @@ static int draw_pc_page(const double &current_time) {
                     new_allwed_file = merge_allowed_with_topology(entry->second, allowed_lines);
                 }
                 msg_struct_info = nullptr;
+                training_active_id = "";
             }
 
             // If it was not constructed using the `recreate_allowed_file`, recreate it manualy.
