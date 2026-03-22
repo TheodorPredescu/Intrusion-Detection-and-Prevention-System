@@ -2,26 +2,27 @@
 #include "imgui/backends/imgui_impl_opengl3.h"
 #include "imgui/imgui.h"
 
-#include <GL/gl.h>
-#include <cctype>
-#include <cstddef>
-#include <cstdint>
-#include <cstring>
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+#include <GL/gl.h>
 #include <GLFW/glfw3.h>
-#include <cstdio>
+
 #include <libssh/libssh.h>
 #include <libssh/sftp.h>
 
+#include <curl/curl.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
-#include <curl/curl.h>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -472,7 +473,7 @@ compute_graph_layout(const std::set<std::string> &all_ips,
     char temp_path[MAX_PATH];
     GetTempPathA(MAX_PATH, temp_path);
     temp_dir = temp_path;
-#else
+#elif __linux__
     temp_dir = "/tmp/";
 #endif
 
@@ -932,7 +933,7 @@ static bool add_entity_in_allowed(std::vector<std::string> &allowed_lines, const
         return false;
     }
 
-    std::istringstream iss((*found_line).substr(colon_pos + 1));
+    std::istringstream iss(found_line->substr(colon_pos + 1));
     std::string port_token;
     bool found_port = false;
 
@@ -951,7 +952,7 @@ static bool add_entity_in_allowed(std::vector<std::string> &allowed_lines, const
     }
 
     if (!found_port) {
-        (*found_line) += ", " + std::to_string(msg.src_port);
+        *found_line += ", " + std::to_string(msg.src_port);
         return true;
     }
 
@@ -1107,8 +1108,8 @@ static std::string transform_messages_to_str(const MessageReceived &message,
 
     std::string name = "";
     if (pc_map != nullptr && !message.pc_id.empty()) {
-        const auto it = (*pc_map).find(message.pc_id);
-        if (it != (*pc_map).end() && !it->second.name.empty()) {
+        const auto it = pc_map->find(message.pc_id);
+        if (it != pc_map->end() && !it->second.name.empty()) {
             name = it->second.name + " ";
         }
     }
@@ -1178,9 +1179,8 @@ static void draw_main_page(const double &current_time) {
     static bool is_context_menu_opened = false;
     static float blink_time = 0.0f;
 
-    static std::map<std::string, PCInfo> *pc_map;
-
-    static std::vector<MessageReceived> *message_history_vector; // Fetch logs every `REFRESH_INTERVAL` seconds
+    static std::map<std::string, PCInfo> *pc_map = nullptr;
+    static std::vector<MessageReceived> *msg_history_vector = nullptr; // Fetch logs every `REFRESH_INTERVAL` seconds
 
     static PCInfo const *pc_context_menu_selected = nullptr;
 
@@ -1188,6 +1188,27 @@ static void draw_main_page(const double &current_time) {
     static std::map<std::string, std::set<int>> training_allowed_new_elements;
     static std::map<std::string, int> training_pc_mode_before;
     static bool training_activate = false;
+
+    // Blinking effect state
+    blink_time += ImGui::GetIO().DeltaTime;
+    const bool blink_visible = fmod(blink_time, 1.0f) < 0.5f;
+
+    // __________________ REFRESH __________________
+    if (current_time >= previous_time + REFRESH_INTERVAL) {
+        std::cout << previous_time << ", " << current_time << std::endl;
+        previous_time = current_time;
+
+        pc_map = get_pc_info();
+        msg_history_vector = get_message_history("", pc_map);
+
+        if (training_activate) {
+            training_topology_data = std::make_unique<TopologyType>(get_topology());
+        }
+    }
+
+    if (!pc_map || !msg_history_vector) {
+        return;
+    }
 
     ImGui::Text("Network Monitoring System");
     ImGui::Separator();
@@ -1257,23 +1278,6 @@ static void draw_main_page(const double &current_time) {
     ImGui::Spacing();
 
     ImGui::BeginChild("clients_list", ImVec2(0, -200), true);
-
-    // Blinking effect state
-    blink_time += ImGui::GetIO().DeltaTime;
-    const bool blink_visible = fmod(blink_time, 1.0f) < 0.5f;
-
-    // __________________ REFRESH __________________
-    if (current_time >= previous_time + REFRESH_INTERVAL) {
-        std::cout << previous_time << ", " << current_time << std::endl;
-        previous_time = current_time;
-
-        pc_map = get_pc_info();
-        message_history_vector = get_message_history("", pc_map);
-
-        if (training_activate) {
-            training_topology_data = std::make_unique<TopologyType>(get_topology());
-        }
-    }
 
     // Get clients from your data structure
     for (const auto &[_, pc] : *pc_map) {
@@ -1381,11 +1385,11 @@ static void draw_main_page(const double &current_time) {
 
     // Message history section
     ImGui::Separator();
-    ImGui::Text("Recent Messages (Last 20)");
+    ImGui::Text("Recent Events (Last 20 logs)");
 
     ImGui::BeginChild("message_history", ImVec2(0, 0), true);
 
-    for (const MessageReceived &msg : *message_history_vector) {
+    for (const MessageReceived &msg : *msg_history_vector) {
         ImGui::PushStyleColor(ImGuiCol_Text, get_mode_color(msg.mode));
         ImGui::TextWrapped("%s", transform_messages_to_str(msg, pc_map).c_str());
         ImGui::PopStyleColor();
@@ -1771,9 +1775,8 @@ static int draw_pc_page(const double &current_time) {
 
     static bool request_update = false;
 
-    static std::vector<MessageReceived> *message_history_vector;
-
-    static std::unique_ptr<TopologyType> message_struct_info = nullptr;
+    static std::vector<MessageReceived> *msg_history_vector = nullptr;
+    static std::unique_ptr<TopologyType> msg_struct_info = nullptr;
 
     // Allowed var
     static int edit_idx = -1;
@@ -1802,7 +1805,7 @@ static int draw_pc_page(const double &current_time) {
             printf("Reseted the pc_selected_data\n");
         }
 
-        message_history_vector = get_message_history(pc_id_selected);
+        msg_history_vector = get_message_history(pc_id_selected);
 
         std::string pcs_response;
 
@@ -1898,12 +1901,12 @@ static int draw_pc_page(const double &current_time) {
         }
 
         if (pc_selected_data.current_mode == MONITORING) {
-            message_struct_info = std::make_unique<TopologyType>(get_topology(pc_id_selected));
+            msg_struct_info = std::make_unique<TopologyType>(get_topology(pc_id_selected));
             printf("[TOPOLOGY] Created topology\n");
         }
     }
 
-    if (pc_selected_data.pc_id.empty()) {
+    if (pc_selected_data.pc_id.empty() || !msg_history_vector) {
         ImGui::TextDisabled("Failed to load the information about the user, retrying...");
         return -1;
     }
@@ -2181,13 +2184,13 @@ static int draw_pc_page(const double &current_time) {
 
             std::string new_allwed_file = "";
             if (pc_selected_data.current_mode == MONITORING && changed_config_mode != MONITORING &&
-                message_struct_info != nullptr) {
+                msg_struct_info != nullptr) {
 
-                const auto entry = message_struct_info->topology_connection.find(pc_id_selected);
-                if (entry != message_struct_info->topology_connection.end()) {
+                const auto entry = msg_struct_info->topology_connection.find(pc_id_selected);
+                if (entry != msg_struct_info->topology_connection.end()) {
                     new_allwed_file = merge_allowed_with_topology(entry->second, allowed_lines);
                 }
-                message_struct_info = nullptr;
+                msg_struct_info = nullptr;
             }
 
             // If it was not constructed using the `recreate_allowed_file`, recreate it manualy.
@@ -2214,11 +2217,11 @@ static int draw_pc_page(const double &current_time) {
     ImGui::Text("Current events");
     ImGui::BeginChild("logs", ImVec2(0, 0), true);
 
-    if ((*message_history_vector).empty()) {
+    if (msg_history_vector->empty()) {
         ImGui::TextDisabled("No activity recorded");
     } else {
-        for (size_t index = 0; index < message_history_vector->size(); index++) {
-            const MessageReceived &msg = (*message_history_vector)[index];
+        for (size_t index = 0; index < msg_history_vector->size(); index++) {
+            const MessageReceived &msg = (*msg_history_vector)[index];
 
             ImGui::BeginGroup();
 
