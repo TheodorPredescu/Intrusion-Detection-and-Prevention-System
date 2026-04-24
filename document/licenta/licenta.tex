@@ -1,0 +1,80 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[a4paper,top=1.5cm,bottom=1.5cm,left=2cm,right=2cm,marginparwidth=1.75cm]{geometry}
+
+\usepackage[romanian]{babel}
+\usepackage[x11names]{xcolor}
+\usepackage{enumitem}
+\usepackage{indentfirst}
+
+\usepackage{tocloft}
+
+\setlength{\cftbeforesecskip}{2pt}
+\setlength{\cftaftertoctitleskip}{15pt}
+
+\setlength{\parskip}{1em}
+
+\definecolor{darkblue}{RGB}{0,0,139}
+\usepackage{graphicx}
+\usepackage[
+    colorlinks=true,
+    linkcolor=darkblue,
+    urlcolor=darkblue,
+    citecolor=darkblue
+]{hyperref}
+
+\begin{document}
+\begin{titlepage}
+    \centering
+
+    \vspace*{0.05\textheight}
+    {\small Departamentul Automatică şi Informatică Industrială\\
+        Facultatea Automatică şi Calculatoare\\
+        Universitatea POLITEHNICA din Bucureşti}\\[3cm]
+
+    {\Large Lucrare de diplomă}\\[0.5cm]
+    {\LARGE Sistem pentru detecția si raportarea evenimentelor
+    de securitate in rețele industriale de comunicații.}\\[3cm]
+
+    \vfill
+    \noindent
+    \begin{minipage}{0.45\textwidth}
+        \textbf{Coordonator}\\
+        Conf.\ dr. Ing. Florin Daniel Anton
+    \end{minipage}
+    \hfill
+    \begin{minipage}{0.30\textwidth}
+        \textbf{Absolvent}\\
+        Predescu Theodor
+    \end{minipage}
+
+    \vspace{3cm}
+    2026
+\end{titlepage}
+\newpage
+
+\tableofcontents
+\newpage
+
+\input{capitole/introducere.tex}
+\input{capitole/prezentarea_domeniului.tex}
+\input{capitole/descrierea_problemei.tex}
+\input{capitole/solutii_existente.tex}
+\input{capitole/arhitectura.tex}
+\input{capitole/rezultate.tex}
+\input{capitole/concluzii.tex}
+
+\section{Bibliografie}
+\begin{thebibliography}{9}
+    \bibitem{linux_doc_proj} The Linux Documentation Project, `Guides,'
+    [Online].\\Disponibil: \url{https://tldp.org/guides.html}. [Accesat:
+    11-iulie 2025].
+    \bibitem{IDPS} Poongodi M. and S. Bose, \textit{Design of Intrusion Detection and
+        Prevention System (IDPS) using DGSOTFC in collaborative protection
+        networks}, 2013 Fifth International Conference on Advanced Computing
+    (ICoAC), Chennai, India, 2013, pp. 172--178, doi: 10.1109/ICoAC.2013.6921946.
+\end{thebibliography}
+\section{Anexa}
+\end{document}
+
+% \medskip
+% \smallskip

@@ -1,0 +1,85 @@
+\section{Arhitectura sistemului}
+
+\subsection{Componente logice}
+\noindent
+Sistemul are ca si componente principale:
+{
+\setlength{\parskip}{0pt}
+\begin{enumerate}[noitemsep]
+      \item \textbf{componenta de filtrare la nivel kernel}, responzabil de
+            interceptarea pachetelor, extragerea informatiilor relevante despre acestea
+            si transmiterea acestora, si blocarea pachetelor mentionate in fisierul de
+            configuratii
+      \item \textbf{componenta de intermediere}, responsabil de intermedierea
+            informatiilor intre modulul kernel si serverul. Acesta de asemenea este
+            responsabil si de citirea fisierelor de configuratii, sincronizarea acestora
+            cu informatiile primite de la server si trimiterea noilor dispozitive ce
+            trebuiesc blocate catre modul.
+      \item \textbf{componenta centrala}, responsabil de stocarea tuturor
+            informatiilor primite de la dispozitivele monitorizate si intermedierea
+            legaturii intre totalitatea dispozitivelor si aplicatia adminului.
+      \item \textbf{componenta de administrare}, ce ofera posibilitatea de
+            vizualizare a conexiunilor ce au avut loc pe dispozitivele monitorizare si
+            modificarea configuratiilor acestora intr-un mod individual sau global.
+\end{enumerate}
+}
+
+\subsubsection{Componenta de filtrare la nivel kernel}
+Aceasta componenta reprezinta un modul kernel scris in limbajul de programare C
+ce ruleaza in spatiul adminului unitatii.  Principala caracteristica a acestuia
+consta in definirea si inregistrarea unui \textit{`hook'} utilizand frameworkul
+\textit{`Netfilter'}, care permite interceptarea, analiza si blocarea pachetelor
+in retea, in anumite puncte specifice ale procesului de procesare.
+
+Cu ajutorul acestui framework este registrata pentru reapelare functia
+\textit{`packet\_hook'} la intrarea in procesarea locala
+(\textit{`NF\_INET\_LOCAL\_IN'}) a pachetelor.
+
+\subsubsection{Componenta de intermediere}
+Aceasta componenta reprezinta un agent local, \textit{`daemon'}, ce ruleaza un
+spatiul utilizatorului. Limbajul ales pentru crearea acestei componente a fost
+C++, pentru a utiliza componente cu un grad de abstractizare mai mare, pastrand
+totodata puterea si viteza de procesare a limbajului C. Agentul este responsabil
+de trimiterea informatiilor ce au fost extrase din pachete in modulul kernel
+spre unitatii centrale, si de asemenea de sincronizarea setarilor si regulilor
+noi selectate in aplicatie cu regulile si modul de functionare a componentei de
+filtrare.
+
+Programul comunica cu modulul kernel este facuta prin intermediul unui
+\textit{Miscellaneous character device}, ce ofera posibilitatea folosirii unui
+\textit{character device} intr-un mod simplificat. Modulul kernel trimite
+informatii referitoare la pachetele primite intr-un \textit{character device},
+informatii ce sunt periodic citite de agentul local si trimise in grupari catre
+componenta centrala.
+
+Intr-un mod similar, programul trimite periodic mesaje catre server pentru a
+verifica daca configurarea aplicatiei trebuie modificata. In cazul in care
+serverul il informa ca modificari au avut loc, acesta va scrie in fisierul de
+tip \textit{character device} pentru a modifica modul de functionare a
+componentei de filtrare.
+
+% revormulez partea despre 3 fisiere 
+De asemenea, componenta este responsabila de stocarea locala a configuratiei
+primite de la server, cat si de citirea acesteia la inceputul rularii
+programului. Acesta stocare se face in 3 fisiere, responsabile pentru stocarea
+unei indexari unice a dispozitivului, salvarea modului de rulare a aplicatiei, a
+locatiei fisierului ce contine lista de conexiuni blocate si informatii despre
+conexiunea cu serverul (adresa ip si portul ce trebuie utilizat), si fisierul
+responsabil de retinerea dispozitivelor ce trebuiesc blocate.
+
+\subsubsection{Componenta centrala}
+Componenta centrala reprezinta serverul aplicatiei responsabila de gestionarea
+legaturii dintre dispozitivele utilizate si aplicatia desktop. Aceasta este
+responsabila de centralizarea informatiilor transmise de modulele kernel ce
+ruleaza pe dispozitivele in legatura directa cu acesta, si reformatarea acesteia
+pentru a putea fi vizualizata si prelucrata de aplicatia utilizatorului admin.
+Totodata, prin componenta centrala, noile reguli setate din aplicatia desktop sunt
+transmise catre dispozitive.
+
+\subsubsection{Componenta de administrare}
+Componenta de administrare este reprezentata de aplicatia desktop ce ofera
+flexibilitate utilizatorilor pentru control asupra dispozitivelor asocitate
+serverului. Prin aceasta un utilizator poate modifica atat modul de rulare, cat
+si reguli de blocare individuala a conexiunilor externe ce au fost, sau pot fi
+in legatura cu dispozitivele. De asemenea, ofera posibilitatea de vizualizare de
+tip graf a conexiunilor care au fost facute cu dispozitivele suport.
