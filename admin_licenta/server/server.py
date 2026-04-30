@@ -1,13 +1,14 @@
-import uuid
-import uvicorn
-
-from fastapi import FastAPI, Query
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Dict, Optional, List, Union
 from datetime import datetime
 from collections import deque
+from fastapi import FastAPI, Query
+
+import uuid
+import uvicorn
 
 import models
+import utils
 from database_handle import Database
 
 # Global database instance
@@ -20,58 +21,8 @@ of the class `FilesConfig`."""
 
 all_logs: deque[models.LogData] = deque(maxlen=500)
 
-# key packet Id of the receiver (ower user) and the sender should be
-packet_map = models.TopologyType()
-
-
-def topology_extraction(packetList: List[models.PacketData], pc_id: str):
-
-    entity = packet_map.topology_connection.setdefault(pc_id, models.TopologyEntry())
-
-    for packetEntity in packetList:
-        # The user ip that received
-        entity.topology_ip.add(packetEntity.daddr)
-
-        connection = entity.connection_dict.setdefault(packetEntity.saddr, models.ConnectionStats())
-
-        connection.ports_in.add(packetEntity.dport)
-        connection.ports_out.add(packetEntity.sport)
-        connection.protocols.add(packetEntity.protocol)
-        connection.ttls.add(packetEntity.ttl)
-        connection.packet_lens.add(packetEntity.packet_len)
-        connection.tcp_flags.add(packetEntity.tcp_flags)
-        connection.mac_addr.add(packetEntity.src_mac)
-
-
-def packet_to_log(packetList: List[models.PacketData], pc_id: str) -> List[models.LogData]:
-    logList: List[models.LogData] = []
-
-    for packet in packetList:
-        logList.append(
-            models.LogData(
-                pc_id=pc_id,
-                mode=packet.mode,
-                timestamp=packet.ts,
-                src_ip=packet.saddr,
-                dst_ip=packet.daddr,
-                src_port=packet.sport,
-                dst_port=packet.dport,
-                protocol=packet.protocol,
-                ttl=packet.ttl,
-                packet_len=packet.packet_len,
-                iface=packet.iface,
-                src_mac=packet.src_mac,
-                dst_mac=packet.dst_mac,
-                tcp_flags=packet.tcp_flags,
-            )
-        )
-
-    return logList
-
-
-# ============================================================================
-# ________________________________ FASTAPI APP _______________________________
-# ============================================================================
+connection_summary_map: Dict[str, models.TopologyEntry] = {}
+""" key packet Id of the device tracked """
 
 
 # STARTUP
@@ -106,7 +57,7 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
         if not added_with_success:
             print(f"[server] failed to add config for the user {pc_id}")
 
-    """Run on application shutdown"""
+    # Run on application shutdown
     print("[APP] Shutting down")
 
 
@@ -133,7 +84,7 @@ async def receive_packets(request: models.PacketsRequest):
         pc_id = str(uuid.uuid4())
         response_data["pc_id"] = pc_id
 
-    topology_extraction(packets, pc_id)
+    utils.topology_extraction(connection_summary_map, packets, pc_id)
 
     if pc_id in cache_dict:
         cache_dict[pc_id]["logs"].extendleft(reversed(packets))
@@ -144,7 +95,7 @@ async def receive_packets(request: models.PacketsRequest):
             "logs": deque(packets),
         }
 
-    all_logs.extendleft(reversed(packet_to_log(packets, pc_id)))
+    all_logs.extendleft(reversed(utils.packet_to_log(packets, pc_id)))
 
     response_data["status"] = "ok"
     if packets and len(packets) == 0:
@@ -275,8 +226,9 @@ async def set_config_user(pc_id: str = Query(...), body: Optional[models.FilesCo
     if update_date:
         cache_dict[pc_id]["config"].updated_at = datetime.now()
 
+        # TODO: Should not reset the topology every time.
         # Reset the information from topology for that pc_id when a modification is detected
-        packet_map.topology_connection[pc_id] = models.TopologyEntry()
+        connection_summary_map[pc_id] = models.TopologyEntry()
 
     # Resolve any inconcinsancies between the pc from FilesConfig and the actual key used.
     if pc_id != cache_dict[pc_id]["config"].pc_id or not cache_dict[pc_id]["config"].pc_id:
@@ -326,9 +278,11 @@ async def set_config_admin(pc_id: str = Query(...), body: Optional[models.FilesC
     if update_date:
         cache_dict[pc_id]["config"].updated_at = datetime.now()
 
+    # TODO: Should not reset the topology every time.
     # Reset the information from topology for that pc_id when a modification is detected
     if updated_configuration:
-        packet_map.topology_connection[pc_id] = models.TopologyEntry()
+        connection_summary_map[pc_id] = models.TopologyEntry()
+        cache_dict[pc_id]["update"] = True
 
     # Resolve any inconcinsancies between the pc from FilesConfig and the actual key used.
     if pc_id != cache_dict[pc_id]["config"].pc_id or not cache_dict[pc_id]["config"].pc_id:
@@ -337,7 +291,6 @@ async def set_config_admin(pc_id: str = Query(...), body: Optional[models.FilesC
     if not cache_dict[pc_id]["config"].icon:
         cache_dict[pc_id]["config"].icon = db.get_default_icon()
 
-    cache_dict[pc_id]["update"] = True
     return cache_dict[pc_id]["config"]
 
 
@@ -346,27 +299,22 @@ async def set_config_admin(pc_id: str = Query(...), body: Optional[models.FilesC
 async def get_pc_logs(pc_id: Optional[str] = Query(None), limit: int = Query(20)):
     if pc_id and pc_id in cache_dict:
         logs_list = list(cache_dict[pc_id]["logs"])[:limit]
-        return {"logs": packet_to_log(logs_list, pc_id)}
+        return {"logs": utils.packet_to_log(logs_list, pc_id)}
 
     if pc_id:
         filtered = [log for log in all_logs if log.pc_id == pc_id][:limit]
         return {"logs": filtered}
 
     return {"logs": list(all_logs)[:limit]}
-    # return {"logs": db.get_logs(pc_id, limit)}
 
 
 @app.get("/topology")
 async def get_topology(pc_id: Optional[str] = Query(None)):
     if pc_id:
-        return {pc_id: packet_map.topology_connection.get(pc_id)}
+        return {pc_id: connection_summary_map.get(pc_id)}
 
-    return packet_map.topology_connection
+    return connection_summary_map
 
-
-# ============================================================================
-# ___________________________________ MAIN ___________________________________
-# ============================================================================
 
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=8080, reload=True, log_level="info")
