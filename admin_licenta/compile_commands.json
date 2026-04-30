@@ -1,0 +1,122 @@
+[
+  {
+    "arguments": [
+      "/usr/bin/g++",
+      "-c",
+      "-Iimgui",
+      "-Iimgui/backends",
+      "-std=c++17",
+      "-o",
+      "application",
+      "admin_app.cpp"
+    ],
+    "directory": "/home/theodor/code/facultate/licenta_repo/admin_licenta",
+    "file": "/home/theodor/code/facultate/licenta_repo/admin_licenta/admin_app.cpp",
+    "output": "/home/theodor/code/facultate/licenta_repo/admin_licenta/application"
+  },
+  {
+    "arguments": [
+      "/usr/bin/g++",
+      "-c",
+      "-Iimgui",
+      "-Iimgui/backends",
+      "-std=c++17",
+      "-o",
+      "application",
+      "imgui/imgui.cpp"
+    ],
+    "directory": "/home/theodor/code/facultate/licenta_repo/admin_licenta",
+    "file": "/home/theodor/code/facultate/licenta_repo/admin_licenta/imgui/imgui.cpp",
+    "output": "/home/theodor/code/facultate/licenta_repo/admin_licenta/application"
+  },
+  {
+    "arguments": [
+      "/usr/bin/g++",
+      "-c",
+      "-Iimgui",
+      "-Iimgui/backends",
+      "-std=c++17",
+      "-o",
+      "application",
+      "imgui/imgui_demo.cpp"
+    ],
+    "directory": "/home/theodor/code/facultate/licenta_repo/admin_licenta",
+    "file": "/home/theodor/code/facultate/licenta_repo/admin_licenta/imgui/imgui_demo.cpp",
+    "output": "/home/theodor/code/facultate/licenta_repo/admin_licenta/application"
+  },
+  {
+    "arguments": [
+      "/usr/bin/g++",
+      "-c",
+      "-Iimgui",
+      "-Iimgui/backends",
+      "-std=c++17",
+      "-o",
+      "application",
+      "imgui/imgui_draw.cpp"
+    ],
+    "directory": "/home/theodor/code/facultate/licenta_repo/admin_licenta",
+    "file": "/home/theodor/code/facultate/licenta_repo/admin_licenta/imgui/imgui_draw.cpp",
+    "output": "/home/theodor/code/facultate/licenta_repo/admin_licenta/application"
+  },
+  {
+    "arguments": [
+      "/usr/bin/g++",
+      "-c",
+      "-Iimgui",
+      "-Iimgui/backends",
+      "-std=c++17",
+      "-o",
+      "application",
+      "imgui/imgui_tables.cpp"
+    ],
+    "directory": "/home/theodor/code/facultate/licenta_repo/admin_licenta",
+    "file": "/home/theodor/code/facultate/licenta_repo/admin_licenta/imgui/imgui_tables.cpp",
+    "output": "/home/theodor/code/facultate/licenta_repo/admin_licenta/application"
+  },
+  {
+    "arguments": [
+      "/usr/bin/g++",
+      "-c",
+      "-Iimgui",
+      "-Iimgui/backends",
+      "-std=c++17",
+      "-o",
+      "application",
+      "imgui/imgui_widgets.cpp"
+    ],
+    "directory": "/home/theodor/code/facultate/licenta_repo/admin_licenta",
+    "file": "/home/theodor/code/facultate/licenta_repo/admin_licenta/imgui/imgui_widgets.cpp",
+    "output": "/home/theodor/code/facultate/licenta_repo/admin_licenta/application"
+  },
+  {
+    "arguments": [
+      "/usr/bin/g++",
+      "-c",
+      "-Iimgui",
+      "-Iimgui/backends",
+      "-std=c++17",
+      "-o",
+      "application",
+      "imgui/backends/imgui_impl_glfw.cpp"
+    ],
+    "directory": "/home/theodor/code/facultate/licenta_repo/admin_licenta",
+    "file": "/home/theodor/code/facultate/licenta_repo/admin_licenta/imgui/backends/imgui_impl_glfw.cpp",
+    "output": "/home/theodor/code/facultate/licenta_repo/admin_licenta/application"
+  },
+  {
+    "arguments": [
+      "/usr/bin/g++",
+      "-c",
+      "-Iimgui",
+      "-Iimgui/backends",
+      "-std=c++17",
+      "-o",
+      "application",
+      "imgui/backends/imgui_impl_opengl3.cpp"
+    ],
+    "directory": "/home/theodor/code/facultate/licenta_repo/admin_licenta",
+    "file": "/home/theodor/code/facultate/licenta_repo/admin_licenta/imgui/backends/imgui_impl_opengl3.cpp",
+    "output": "/home/theodor/code/facultate/licenta_repo/admin_licenta/application"
+  }
+]
