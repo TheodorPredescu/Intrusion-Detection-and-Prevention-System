@@ -1,0 +1,17 @@
+__pycache__/
+kernel_module/kernel_module*
+kernel_module/.*
+!kernel_module/kernel_module.c
+Module.symvers
+modules.order
+
+compile_commands.json
+Makefile
+
+admin_licenta/application
+admin_licenta/NodeEditor.json
+
+*.db
+*.db-shm
+*.db-wal
+.venv

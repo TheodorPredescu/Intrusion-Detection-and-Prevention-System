@@ -1,0 +1,21 @@
+CompileFlags:
+  Add:
+    - -I/lib/modules/$(shell uname -r)/build/include
+    - -I/lib/modules/$(shell uname -r)/build/arch/x86/include
+    - -I/lib/modules/$(shell uname -r)/build/arch/x86/include/generated
+    - -I/lib/modules/$(shell uname -r)/build/include/generated
+    - -I/lib/modules/$(shell uname -r)/build/include/uapi
+    - -I/lib/modules/$(shell uname -r)/build/arch/x86/include/uapi
+    - -D__KERNEL__
+    - -DMODULE
+    - -Wno-unknown-warning-option
+    - -Wno-unknown-attributes
+  Remove:
+    - -mrecord-mcount
+    - -mindirect-branch*
+    - -fno-allow-store-data-races
+    - -fconserve-stack
+    - -mpreferred-stack-boundary=*
+    - -mskip-rax-setup
+    - -bounds-strict
+    - -fsanitize=*
