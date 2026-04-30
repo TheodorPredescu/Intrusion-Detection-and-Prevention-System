@@ -46,15 +46,14 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
         print(config_entity["config"].updated_at)
         print("\n")
 
-        added_with_success = db.save_config(
+        if not db.save_config(
             pc_id=pc_id,
             config_file=config_entity["config"].config_file,
             allowed_file=config_entity["config"].allowed_file,
             name=config_entity["config"].name,
             icon=config_entity["config"].icon,
             date=config_entity["config"].updated_at,
-        )
-        if not added_with_success:
+        ):
             print(f"[server] failed to add config for the user {pc_id}")
 
     # Run on application shutdown
@@ -228,7 +227,7 @@ async def set_config_user(pc_id: str = Query(...), body: Optional[models.FilesCo
 
         # TODO: Should not reset the topology every time.
         # Reset the information from topology for that pc_id when a modification is detected
-        connection_summary_map[pc_id] = models.TopologyEntry()
+        # connection_summary_map[pc_id] = models.TopologyEntry()
 
     # Resolve any inconcinsancies between the pc from FilesConfig and the actual key used.
     if pc_id != cache_dict[pc_id]["config"].pc_id or not cache_dict[pc_id]["config"].pc_id:
@@ -281,7 +280,7 @@ async def set_config_admin(pc_id: str = Query(...), body: Optional[models.FilesC
     # TODO: Should not reset the topology every time.
     # Reset the information from topology for that pc_id when a modification is detected
     if updated_configuration:
-        connection_summary_map[pc_id] = models.TopologyEntry()
+        # connection_summary_map[pc_id] = models.TopologyEntry()
         cache_dict[pc_id]["update"] = True
 
     # Resolve any inconcinsancies between the pc from FilesConfig and the actual key used.

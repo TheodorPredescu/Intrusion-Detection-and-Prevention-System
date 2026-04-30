@@ -51,10 +51,6 @@ struct ConnectionStats {
     std::set<int> tcp_flags;
     std::set<int> ports_in;
     std::set<std::string> mac_addr;
-
-    // TODO: Might not be necesary.
-    /** Used in the topology_map to map a connection as displayed or not */
-    bool is_visible = true;
 };
 
 struct TopologyEntry {

@@ -91,7 +91,6 @@ extern float topology_zoom;
 extern const float ZOOM_MIN;
 extern const float ZOOM_MAX;
 
-
 extern std::string pc_id_selected;
 extern Page page;
 #endif

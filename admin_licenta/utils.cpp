@@ -753,7 +753,6 @@ std::map<std::string, TopologyEntry> get_topology(const std::string pc_id) {
                             stats.tcp_flags = parse_int_set(stats_json, "tcp_flags");
                             stats.ports_in = parse_int_set(stats_json, "ports_in");
                             stats.mac_addr = parse_str_set(stats_json, "mac_addr");
-                            stats.is_visible = stats_json.value("is_visible", true);
 
                             entry.connection_dict[src_ip] = stats;
                         }
