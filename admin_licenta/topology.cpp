@@ -64,14 +64,21 @@ void Topology::draw(const double &current_time) {
         node_positions.clear();
     }
 
-    if (!pc_map || topology_data_map.empty()) {
+    if (!pc_map) {
         return;
     }
 
-    std::map<std::string, std::set<int>> allowed_ips_map;
-    for (const auto &[_, pc_info] : *pc_map) {
+    // A set of all the entities that started a connection in the network.
+    // If the entity is a tracked pc, the pc_id will be saved, otherwise the ip of the new entity.
+    std::set<std::string> all_nodes_set;
+
+    std::map<std::string, std::map<std::string, std::set<int>>> allowed_ips_map;
+    for (const auto &[pc_id, pc_info] : *pc_map) {
+        all_nodes_set.insert(pc_id);
+
+        std::map<std::string, std::set<int>> &pc_allowed = allowed_ips_map[pc_id];
         for (const auto &[key, value] : extract_allowed_ips(pc_info.allowed_file)) {
-            allowed_ips_map.insert({key, value});
+            pc_allowed.insert({key, value});
         }
     }
 
@@ -85,10 +92,6 @@ void Topology::draw(const double &current_time) {
         }
     }
 
-    // A set of all the entities that started a connection in the network.
-    // If the entity is a tracked pc, the pc_id will be saved, otherwise the ip of the new entity.
-    std::set<std::string> all_nodes_set;
-
     /**
      * All connections in the network, from sender to receiver.
      * .
@@ -98,7 +101,13 @@ void Topology::draw(const double &current_time) {
     std::map<std::string, std::set<std::string>> connections_map;
 
     for (const auto &[receiver_pc_id, entry] : topology_data_map) {
-        all_nodes_set.insert(receiver_pc_id);
+        if (all_nodes_set.find(receiver_pc_id) == all_nodes_set.end()) {
+            printf("Missing pc_id: %s\n", receiver_pc_id.c_str());
+        }
+        // all_nodes_set.insert(receiver_pc_id);
+
+        const auto allowed_ip_map = allowed_ips_map.find(receiver_pc_id);
+        const bool has_allowed_map = allowed_ip_map != allowed_ips_map.end();
 
         // For each source IP that connected to this PC
         for (const auto &[src_ip, stats] : entry.connection_dict) {
@@ -120,21 +129,25 @@ void Topology::draw(const double &current_time) {
 
             // Create the connections that are blocked;
 
+            if (!has_allowed_map) {
+                addConnectionBlocked(src_ip, receiver_pc_id);
+                continue;
+            }
             // if the ip is not found in the map of allowed ips, add it.
-            const auto allowed_ip = allowed_ips_map.find(src_ip);
-            if (allowed_ip == allowed_ips_map.end()) {
+            const auto allowed_ip_set_iterator = allowed_ip_map->second.find(src_ip);
+            if (allowed_ip_set_iterator == allowed_ip_map->second.end()) {
                 addConnectionBlocked(src_ip, receiver_pc_id);
                 continue;
             }
 
             // If there is no list of ports, it means that all ports are accepted, so it passses;
-            if (allowed_ip->second.size() == 0) {
+            if (allowed_ip_set_iterator->second.size() == 0) {
                 continue;
             }
 
             // else, if it the port is not found in the list of allowed ports, add it.
             for (const int port : stats.ports_out) {
-                if (allowed_ip->second.find(port) == allowed_ip->second.end()) {
+                if (allowed_ip_set_iterator->second.find(port) == allowed_ip_set_iterator->second.end()) {
                     addConnectionBlocked(src_ip, receiver_pc_id);
                     break;
                 }
