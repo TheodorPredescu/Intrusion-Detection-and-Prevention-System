@@ -25,6 +25,10 @@ static const ImVec4 purpleWhiteImVec4 = ImVec4(255 / 255.0f, 200 / 255.0f, 150 /
 /** Stores all initiated connections identified by an "ip:port" combination. */
 static std::unordered_map<std::string, std::unordered_set<std::string>> connections_ip_blocked;
 
+static void clearConnectionsBlocked() {
+    connections_ip_blocked.clear();
+}
+
 static void addConnectionBlocked(const std::string &source_ip, const std::string &destination_id) {
     connections_ip_blocked[source_ip].insert(destination_id);
 }
@@ -60,8 +64,10 @@ void Topology::draw(const double &current_time) {
 
         previous_time = current_time;
         pc_map = get_pc_info();
+
         topology_data_map = get_topology();
         node_positions.clear();
+        clearConnectionsBlocked();
     }
 
     if (!pc_map) {

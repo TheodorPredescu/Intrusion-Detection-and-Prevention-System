@@ -1,4 +1,5 @@
 #include <GL/gl.h>
+#include <cstdio>
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #include <curl/curl.h>
@@ -744,7 +745,6 @@ std::map<std::string, TopologyEntry> get_topology(const std::string pc_id) {
 
     if (fetch_topology_info_from_api(pc_id, topology_str)) {
         try {
-            printf("[TOPOLOGY] %s\n", topology_str.c_str());
             auto topology_json = json::parse(topology_str);
 
             if (topology_json.is_object()) {
