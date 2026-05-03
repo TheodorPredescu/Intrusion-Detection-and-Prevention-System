@@ -34,6 +34,7 @@ bool fetch_logs_from_api(const std::string &pc_id, int limit, std::string &out);
 bool fetch_topology_info_from_api(const std::string &pc_id, std::string &out);
 bool send_config_via_api(const std::string &pc_id, const std::string &config_file, const std::string allowed_file = "",
                          const std::string name = "", const std::string icon_path = "");
+bool reset_topology_connections();
 
 // ============================================================================
 // __________________________________ Helpers _________________________________

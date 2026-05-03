@@ -1,9 +1,56 @@
 #include "topology.h"
-#include "imgui.h"
 #include "types.h"
 #include "utils.h"
 #include <cstdio>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+
+static const ImU32 blueLineImU32 = IM_COL32(100, 200, 255, 255);
+static const ImU32 blueContentImU32 = IM_COL32(80, 150, 255, 255);
+static const ImU32 blueMarineImU32 = IM_COL32(150, 200, 255, 255);
+static const ImU32 redImU32 = IM_COL32(255, 100, 100, 255);
+static const ImU32 greenImU32 = IM_COL32(100, 255, 100, 255);
+static const ImU32 yellowBrightImU32 = IM_COL32(255, 255, 100, 255);
+static const ImU32 grayImU32 = IM_COL32(80, 80, 90, 255);
+static const ImU32 whiteImU32 = IM_COL32(255, 255, 255, 200);
+static const ImU32 purpleWhiteImU32 = IM_COL32(255, 200, 150, 255);
+
+static const ImVec4 greenImVec4 = ImVec4(100 / 255.0f, 255 / 255.0f, 100 / 255.0f, 1.0f);
+static const ImVec4 yellowBrightImVec4 = ImVec4(255 / 255.0f, 255 / 255.0f, 100 / 255.0f, 1.0f);
+static const ImVec4 redImVec4 = ImVec4(255 / 255.0f, 100 / 255.0f, 100 / 255.0f, 1.0f);
+static const ImVec4 whiteImVec4 = ImVec4(1.0f, 1.0f, 1.0f, 200 / 255.0f);
+static const ImVec4 purpleWhiteImVec4 = ImVec4(255 / 255.0f, 200 / 255.0f, 150 / 255.0f, 1.0f);
+
+/** Stores all initiated connections identified by an "ip:port" combination. */
+static std::unordered_map<std::string, std::unordered_set<std::string>> connections_ip_blocked;
+
+static void addConnectionBlocked(const std::string &source_ip, const std::string &destination_id) {
+    connections_ip_blocked[source_ip].insert(destination_id);
+}
+
+static bool checkConnectionBlocked(const std::string &source_ip, const std::string &destination_id) {
+    const auto it = connections_ip_blocked.find(source_ip);
+
+    if (it == connections_ip_blocked.end()) {
+        return false;
+    }
+    return it->second.find(destination_id) != it->second.end();
+}
+
+static bool hasBlockedConnections(const std::string &source_ip) {
+    return connections_ip_blocked.find(source_ip) != connections_ip_blocked.end();
+}
+
+static float calculateOffset(const float centerpoint, const float dest) {
+    if (dest < centerpoint) {
+        return -50.0f;
+    }
+    if (dest > centerpoint) {
+        return 50.0f;
+    }
+    return 0.0f;
+}
 
 void Topology::draw(const double &current_time) {
     if (topology_reset || current_time >= previous_time + REFRESH_INTERVAL) {
@@ -21,9 +68,6 @@ void Topology::draw(const double &current_time) {
         return;
     }
 
-    // TODO: I should filter the ones from topology that are found in the pc_map.allowed_file and then color
-    // distinguish them First key is the tracked ip, second one is the connected ip, and the set is all the ports
-    // allowed.
     std::map<std::string, std::set<int>> allowed_ips_map;
     for (const auto &[_, pc_info] : *pc_map) {
         for (const auto &[key, value] : extract_allowed_ips(pc_info.allowed_file)) {
@@ -45,11 +89,13 @@ void Topology::draw(const double &current_time) {
     // If the entity is a tracked pc, the pc_id will be saved, otherwise the ip of the new entity.
     std::set<std::string> all_nodes_set;
 
-    // Saves all the connections made in map format, from the sender to the receiver.
+    /**
+     * All connections in the network, from sender to receiver.
+     * .
+     * Key: pc_id of a tracked PC or IP of an external sender.
+     * Value: set of tracked PC ids that received from this sender.
+     */
     std::map<std::string, std::set<std::string>> connections_map;
-
-    /** Stores all initiated connections identified by an "ip:port" combination. */
-    std::set<std::string> connections_ip_allowed;
 
     for (const auto &[receiver_pc_id, entry] : topology_data_map) {
         all_nodes_set.insert(receiver_pc_id);
@@ -64,29 +110,35 @@ void Topology::draw(const double &current_time) {
             }
 
             // Map src_ip to pc_id or external IP
-            std::string sender;
-            if (ip_to_pc_id.find(src_ip) != ip_to_pc_id.end()) {
-                sender = ip_to_pc_id[src_ip];
-            } else {
-                sender = src_ip;
+            std::string sender = ip_to_pc_id.find(src_ip) != ip_to_pc_id.end() ? ip_to_pc_id[src_ip] : src_ip;
+            all_nodes_set.insert(sender);
+            connections_map[sender].insert(receiver_pc_id);
 
-                const auto allowed_ip = allowed_ips_map.find(src_ip);
-                if (allowed_ip != allowed_ips_map.end()) {
-                    bool is_allowed = true;
-                    for (const int port : stats.ports_out) {
-                        if (allowed_ip->second.find(port) == allowed_ip->second.end()) {
-                            is_allowed = false;
-                            break;
-                        }
-                    }
-                    if (is_allowed) {
-                        connections_ip_allowed.insert(src_ip);
-                    }
+            if (sender != src_ip) {
+                continue;
+            }
+
+            // Create the connections that are blocked;
+
+            // if the ip is not found in the map of allowed ips, add it.
+            const auto allowed_ip = allowed_ips_map.find(src_ip);
+            if (allowed_ip == allowed_ips_map.end()) {
+                addConnectionBlocked(src_ip, receiver_pc_id);
+                continue;
+            }
+
+            // If there is no list of ports, it means that all ports are accepted, so it passses;
+            if (allowed_ip->second.size() == 0) {
+                continue;
+            }
+
+            // else, if it the port is not found in the list of allowed ports, add it.
+            for (const int port : stats.ports_out) {
+                if (allowed_ip->second.find(port) == allowed_ip->second.end()) {
+                    addConnectionBlocked(src_ip, receiver_pc_id);
+                    break;
                 }
             }
-            all_nodes_set.insert(sender);
-
-            connections_map[sender].insert(receiver_pc_id);
         }
     }
 
@@ -127,12 +179,24 @@ void Topology::draw(const double &current_time) {
     dl->AddRectFilled(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y),
                       IM_COL32(30, 30, 40, 255));
 
+    ImGui::SetCursorScreenPos(ImVec2(canvas_pos.x + 10, canvas_pos.y + 10));
+
+    // Reset the topology connections
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(20, 10));
+    if (ImGui::Button("Reset", ImVec2(100, 30))) {
+        if (reset_topology_connections()) {
+            topology_reset = true;
+        }
+    }
+    ImGui::PopStyleVar();
+
     const float NODE_WIDTH = 150;
     const float NODE_HEIGHT = 80;
     const float PIN_RADIUS = 5;
 
     std::map<std::string, ImVec2> pin_positions;
-    static int selected_node = -1;
+    static std::string selected_node;
+    std::string hovered_node;
 
     // Draw nodes
     for (const auto &node_ip : all_nodes_set) {
@@ -146,38 +210,24 @@ void Topology::draw(const double &current_time) {
 
         if (is_tracked_pc) {
             pc = pc_map->at(node_ip);
-            node_color = IM_COL32(80, 150, 255, 255); // Blue
+            node_color = blueContentImU32;
             node_size_increase = 1.2;
             text_color = IM_COL32_WHITE;
         } else {
-            if (connections_ip_allowed.find(node_ip) != connections_ip_allowed.end()) {
-                node_color = IM_COL32(100, 255, 100, 255); // Green
-                text_color = IM_COL32(20, 60, 20, 255);
-            } else {
-                node_color = IM_COL32(255, 100, 100, 255); // Red
-                text_color = IM_COL32_WHITE;
-            }
+
+            node_color = grayImU32;
+            text_color = IM_COL32_WHITE;
+
             node_size_increase = 1.0;
         }
-
-        // const PCInfo &pc = is_tracked_pc ? pc_map->at(node_ip) : PCInfo{};
-        // ImU32 node_color = is_tracked_pc ? IM_COL32(80, 150, 255, 255) : IM_COL32(255, 100, 100, 255);
 
         const ImVec2 node_pos = ImVec2(screen_node_pos.x + canvas_pos.x, screen_node_pos.y + canvas_pos.y);
         const ImVec2 node_size(NODE_WIDTH * topology_zoom * node_size_increase,
                                NODE_HEIGHT * topology_zoom * node_size_increase);
 
         dl->AddRectFilled(node_pos, ImVec2(node_pos.x + node_size.x, node_pos.y + node_size.y), node_color, 8.0f);
-        dl->AddRect(node_pos, ImVec2(node_pos.x + node_size.x, node_pos.y + node_size.y), IM_COL32(255, 255, 255, 200),
-                    8.0f, 0, 2.0f);
+        dl->AddRect(node_pos, ImVec2(node_pos.x + node_size.x, node_pos.y + node_size.y), whiteImU32, 8.0f, 0, 2.0f);
 
-        // std::string node_text = is_pc ? (pc.name.empty() ? pc.pc_id : pc.name) : node_key;
-        // ImVec2 text_size = ImGui::CalcTextSize(node_text.c_str());
-        // ImVec2 text_pos =
-        //     ImVec2(node_pos.x + node_size.x / 2 - text_size.x / 2, node_pos.y + node_size.y / 2 - text_size.y /
-        //     2);
-        // dl->AddText(text_pos, IM_COL32_WHITE, node_text.c_str());
-        // ____
         std::string node_text = is_tracked_pc ? (pc.name.empty() ? pc.pc_id : pc.name) : node_ip;
         const float font_size = ImGui::GetFontSize() * topology_zoom * 1.3f;
         const float font_scale = font_size / ImGui::GetFontSize();
@@ -187,7 +237,6 @@ void Topology::draw(const double &current_time) {
         ImVec2 text_pos =
             ImVec2(node_pos.x + node_size.x / 2 - text_size.x / 2, node_pos.y + node_size.y / 2 - text_size.y / 2);
         dl->AddText(ImGui::GetFont(), font_size, text_pos, text_color, node_text.c_str());
-        // ____
 
         auto get_closest_edge = [](ImVec2 from_center, ImVec2 to_center, float width,
                                    float height) -> std::pair<ImVec2, std::string> {
@@ -218,7 +267,7 @@ void Topology::draw(const double &current_time) {
                 ImVec2 src_center = ImVec2(src_screen.x + canvas_pos.x + NODE_WIDTH * topology_zoom / 2,
                                            src_screen.y + canvas_pos.y + NODE_HEIGHT * topology_zoom / 2);
                 auto [pin_pos, edge] = get_closest_edge(node_center, src_center, node_size.x, node_size.y);
-                dl->AddCircleFilled(pin_pos, PIN_RADIUS, IM_COL32(150, 200, 255, 255));
+                dl->AddCircleFilled(pin_pos, PIN_RADIUS, blueMarineImU32);
                 pin_positions[node_ip + "_in_" + std::to_string(input_idx)] = pin_pos;
                 input_idx++;
             }
@@ -231,28 +280,48 @@ void Topology::draw(const double &current_time) {
                 ImVec2 dst_center = ImVec2(dst_screen.x + canvas_pos.x + NODE_WIDTH * topology_zoom / 2,
                                            dst_screen.y + canvas_pos.y + NODE_HEIGHT * topology_zoom / 2);
                 auto [pin_pos, edge] = get_closest_edge(node_center, dst_center, node_size.x, node_size.y);
-                dl->AddCircleFilled(pin_pos, PIN_RADIUS, IM_COL32(255, 200, 150, 255));
+                dl->AddCircleFilled(pin_pos, PIN_RADIUS, purpleWhiteImU32);
                 pin_positions[node_ip + "_out_" + std::to_string(output_idx)] = pin_pos;
                 output_idx++;
             }
         }
 
-        bool hovered = mouse.x >= node_pos.x && mouse.x <= node_pos.x + node_size.x && mouse.y >= node_pos.y &&
-                       mouse.y <= node_pos.y + node_size.y;
+        const bool hovered = mouse.x >= node_pos.x && mouse.x <= node_pos.x + node_size.x && mouse.y >= node_pos.y &&
+                             mouse.y <= node_pos.y + node_size.y;
+
         if (hovered) {
-            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-            if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-                selected_node = std::hash<std::string>{}(node_ip);
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Right) && is_tracked_pc) {
+                selected_node = node_ip;
                 ImGui::OpenPopup("topology_menu");
             }
+
+            hovered_node = node_ip;
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            dl->AddRect(node_pos, ImVec2(node_pos.x + node_size.x, node_pos.y + node_size.y), yellowBrightImU32, 8.0f,
+                        0, 3.0f);
         }
     }
 
     // Draw links
     for (const auto &[src, dst_set] : connections_map) {
+
         int out_idx = 0;
         for (const auto &dst : dst_set) {
+            // Select the collor used for the connection
+            const bool src_is_pc = pc_map->find(src) != pc_map->end();
+
+            ImU32 line_color;
+            if (src_is_pc) {
+                line_color = blueLineImU32;
+            } else if (checkConnectionBlocked(src, dst)) {
+                line_color = redImU32;
+            } else {
+                line_color = greenImU32;
+            }
+
             const auto it_src = pin_positions.find(src + "_out_" + std::to_string(out_idx));
+
+            out_idx++;
             int in_idx = 0;
             for (const auto &[s, dests] : connections_map) {
                 if (dests.count(dst) && s == src) {
@@ -263,79 +332,34 @@ void Topology::draw(const double &current_time) {
                 }
             }
             auto it_dst = pin_positions.find(dst + "_in_" + std::to_string(in_idx));
-            if (it_src != pin_positions.end() && it_dst != pin_positions.end()) {
-                const ImVec2 src_pin = it_src->second;
-                const ImVec2 dst_pin = it_dst->second;
-
-                // Node centers
-                const ImVec2 src_to_screen = to_screen(node_positions[src]);
-                const ImVec2 dst_to_screen = to_screen(node_positions[dst]);
-
-                const ImVec2 src_node_pos = ImVec2(src_to_screen.x + canvas_pos.x, src_to_screen.y + canvas_pos.y);
-                const ImVec2 dst_node_pos = ImVec2(dst_to_screen.x + canvas_pos.x, dst_to_screen.y + canvas_pos.y);
-
-                const float src_node_center_x = src_node_pos.x + NODE_WIDTH * topology_zoom / 2;
-                const float src_node_center_y = src_node_pos.y + NODE_HEIGHT * topology_zoom / 2;
-                const float dst_node_center_x = dst_node_pos.x + NODE_WIDTH * topology_zoom / 2;
-                const float dst_node_center_y = dst_node_pos.y + NODE_HEIGHT * topology_zoom / 2;
-
-                // Offsets based on left/right and top/bottom
-                float src_offset_x = 0;
-                float src_offset_y = 0;
-
-                if (src_pin.x < src_node_center_x) {
-                    src_offset_x = -50.0f;
-                } else if (src_pin.x > src_node_center_x) {
-                    src_offset_x = 50.0f;
-                }
-
-                if (src_pin.y < src_node_center_y) {
-                    src_offset_y = -50.0f;
-                } else if (src_pin.y > src_node_center_y) {
-                    src_offset_y = 50.0f;
-                }
-
-                float dst_offset_x = 0;
-                float dst_offset_y = 0;
-
-                if (dst_pin.x < dst_node_center_x) {
-                    dst_offset_x = -50.0f;
-                } else if (dst_pin.x > dst_node_center_x) {
-                    dst_offset_x = 50.0f;
-                }
-
-                if (dst_pin.y < dst_node_center_y) {
-                    dst_offset_y = -50.0f;
-                } else if (dst_pin.y > dst_node_center_y) {
-                    dst_offset_y = 50.0f;
-                }
-
-                dl->AddBezierCubic(src_pin, ImVec2(src_pin.x + src_offset_x, src_pin.y + src_offset_y),
-                                   ImVec2(dst_pin.x + dst_offset_x, dst_pin.y + dst_offset_y), dst_pin,
-                                   IM_COL32(100, 200, 255, 255), 2.0f);
+            if (it_src == pin_positions.end() || it_dst == pin_positions.end()) {
+                continue;
             }
-            out_idx++;
-        }
-    }
 
-    // Hover detection (same as before)
-    std::string hovered_node;
-    for (const auto &node_key : all_nodes_set) {
+            const ImVec2 src_pin = it_src->second;
+            const ImVec2 dst_pin = it_dst->second;
 
-        const bool is_tracked = pc_map->find(node_key) != pc_map->end();
-        const float size_increase = is_tracked ? 1.2f : 1.0f;
+            // Node centers
+            const ImVec2 src_to_screen = to_screen(node_positions[src]);
+            const ImVec2 dst_to_screen = to_screen(node_positions[dst]);
 
-        const ImVec2 screen_node_pos = to_screen(node_positions[node_key]);
-        const ImVec2 node_pos = ImVec2(screen_node_pos.x + canvas_pos.x, screen_node_pos.y + canvas_pos.y);
-        const ImVec2 node_size(NODE_WIDTH * topology_zoom * size_increase, NODE_HEIGHT * topology_zoom * size_increase);
-        const bool hovered = mouse.x >= node_pos.x && mouse.x <= node_pos.x + node_size.x && mouse.y >= node_pos.y &&
-                             mouse.y <= node_pos.y + node_size.y;
-        if (hovered) {
-            hovered_node = node_key;
-            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-            dl->AddRect(node_pos, ImVec2(node_pos.x + node_size.x, node_pos.y + node_size.y),
-                        IM_COL32(255, 255, 100, 255), 8.0f, 0, 3.0f);
-            break;
+            const ImVec2 src_node_pos = ImVec2(src_to_screen.x + canvas_pos.x, src_to_screen.y + canvas_pos.y);
+            const ImVec2 dst_node_pos = ImVec2(dst_to_screen.x + canvas_pos.x, dst_to_screen.y + canvas_pos.y);
+
+            const float src_node_center_x = src_node_pos.x + NODE_WIDTH * topology_zoom / 2;
+            const float src_node_center_y = src_node_pos.y + NODE_HEIGHT * topology_zoom / 2;
+            const float dst_node_center_x = dst_node_pos.x + NODE_WIDTH * topology_zoom / 2;
+            const float dst_node_center_y = dst_node_pos.y + NODE_HEIGHT * topology_zoom / 2;
+
+            // Offsets based on left/right and top/bottom
+            const float src_offset_x = calculateOffset(src_node_center_x, src_pin.x);
+            const float src_offset_y = calculateOffset(src_node_center_y, src_pin.y);
+
+            const float dst_offset_x = calculateOffset(dst_node_center_x, dst_pin.x);
+            const float dst_offset_y = calculateOffset(dst_node_center_y, dst_pin.y);
+
+            dl->AddBezierCubic(src_pin, ImVec2(src_pin.x + src_offset_x, src_pin.y + src_offset_y),
+                               ImVec2(dst_pin.x + dst_offset_x, dst_pin.y + dst_offset_y), dst_pin, line_color, 2.0f);
         }
     }
 
@@ -348,7 +372,7 @@ void Topology::draw(const double &current_time) {
         ImGui::BeginTooltip();
 
         if (is_pc) {
-            ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "ID: %s", hovered_node.c_str());
+            ImGui::TextColored(greenImVec4, "ID: %s", hovered_node.c_str());
             ImGui::Text("Name: %s", pc.name.empty() ? pc.pc_id.c_str() : pc.name.c_str());
             ImGui::Text("Mode: %s", MODES[pc.current_mode]);
 
@@ -357,14 +381,15 @@ void Topology::draw(const double &current_time) {
                 const auto &entry = topology_data_map.at(hovered_node);
                 if (!entry.topology_ip.empty()) {
                     ImGui::Separator();
-                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "IPs:");
+                    ImGui::TextColored(yellowBrightImVec4, "IPs:");
                     for (const auto &ip : entry.topology_ip) {
                         ImGui::BulletText("%s", ip.c_str());
                     }
                 }
             }
         } else {
-            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "External IP: %s", hovered_node.c_str());
+            ImGui::TextColored(hasBlockedConnections(hovered_node) ? redImVec4 : yellowBrightImVec4, "External IP: %s",
+                               hovered_node.c_str());
 
             // Find which PC(s) received from this external IP
             for (const auto &[pc_id, entry] : topology_data_map) {
@@ -372,7 +397,7 @@ void Topology::draw(const double &current_time) {
                     const auto &stats = entry.connection_dict.at(hovered_node);
 
                     ImGui::Separator();
-                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "To: %s", pc_id.c_str());
+                    ImGui::TextColored(greenImVec4, "To: %s", pc_id.c_str());
 
                     // Ports Out
                     if (!stats.ports_out.empty()) {
@@ -414,7 +439,7 @@ void Topology::draw(const double &current_time) {
 
                     // MAC addresses
                     if (!stats.mac_addr.empty()) {
-                        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "MAC Addresses:");
+                        ImGui::TextColored(purpleWhiteImVec4, "MAC Addresses:");
                         for (const auto &mac : stats.mac_addr) {
                             ImGui::BulletText("%s", mac.c_str());
                         }
@@ -428,23 +453,9 @@ void Topology::draw(const double &current_time) {
 
     // Context menu (same as before)
     if (ImGui::BeginPopup("topology_menu")) {
-        std::string selected_key;
-        for (const auto &key : all_nodes_set) {
-            if ((int)std::hash<std::string>{}(key) == selected_node) {
-                selected_key = key;
-                break;
-            }
-        }
-        const bool is_pc = pc_map->find(selected_key) != pc_map->end();
-        if (ImGui::MenuItem("View Info")) {
-            printf("Info: %s\n", selected_key.c_str());
-        }
-        if (is_pc && ImGui::MenuItem("Edit Config")) {
-            pc_id_selected = selected_key;
+        if (ImGui::MenuItem("Edit Config")) {
+            pc_id_selected = selected_node;
             page = Page::ClientDetail;
-        }
-        if (!is_pc && ImGui::MenuItem("Block IP")) {
-            printf("Blocking %s\n", selected_key.c_str());
         }
         ImGui::EndPopup();
     }

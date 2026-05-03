@@ -339,6 +339,45 @@ bool send_config_via_api(const std::string &pc_id, const std::string &config_fil
     return success;
 }
 
+bool reset_topology_connections() {
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        std::cerr << "Failed to initialize CURL\n";
+        return false;
+    }
+
+    std::string base_url = "http://127.0.0.1:8080/topology/reset";
+
+    // Set up headers
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL, base_url.c_str());
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "POST");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 2L);
+
+    std::string response;
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+    bool success = (res == CURLE_OK && http_code >= 200 && http_code < 300);
+
+    if (!success) {
+        std::cerr << "CURL error: " << curl_easy_strerror(res) << " | HTTP: " << http_code << "\n";
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    return success;
+}
+
 // ============================================================================
 // __________________________________ HELPERS _________________________________
 // ============================================================================

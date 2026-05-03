@@ -293,7 +293,6 @@ async def set_config_admin(pc_id: str = Query(...), body: Optional[models.FilesC
     return cache_dict[pc_id]["config"]
 
 
-# TODO: Not rly sure rn
 @app.get("/logs")
 async def get_pc_logs(pc_id: Optional[str] = Query(None), limit: int = Query(20)):
     if pc_id and pc_id in cache_dict:
@@ -313,6 +312,11 @@ async def get_topology(pc_id: Optional[str] = Query(None)):
         return {pc_id: connection_summary_map.get(pc_id)}
 
     return connection_summary_map
+
+
+@app.post("/topology/reset")
+async def reset_topology():
+    connection_summary_map.clear()
 
 
 if __name__ == "__main__":
