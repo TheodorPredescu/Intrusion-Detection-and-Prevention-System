@@ -72,17 +72,6 @@ struct logged_packet {
     struct logged_packet_key key;
 };
 
-// For table access lookup.
-static DEFINE_SPINLOCK(logged_lock); // Protect hash table access
-static struct rhashtable logged_table;
-static struct rhashtable_params logged_params = {
-    .nelem_hint = 64, // Initial hint for number of elements
-    .key_len = sizeof(struct logged_packet_key),
-    .key_offset = offsetof(struct logged_packet, key),
-    .head_offset = offsetof(struct logged_packet, node), // Required for rhashtable
-    .hashfn = jhash,                                     // Use jhash as the default hash function
-};
-
 static LIST_HEAD(packet_list);
 static DEFINE_SPINLOCK(packet_list_lock);
 
@@ -118,7 +107,6 @@ static DEFINE_MUTEX(client_server_info_mutex);
 /** Used for distruct and construct */
 
 /** Used for lookups */
-// static DEFINE_SPINLOCK(allowed_spinlock);
 static DEFINE_MUTEX(allowed_mutex);
 // ============================================================
 
@@ -143,18 +131,7 @@ struct SVMModel {
     bool loaded;
 };
 
-static struct SVMModel svm_model = {0};
-static DEFINE_SPINLOCK(svm_model_lock);
 static struct timespec64 last_mtime_model_file;
-// static char *model_bin_path = "/etc/model.bin";
-// I do not have floats here, so I transform in int and then devide by `SCALE`
-
-/**
- * To clear the table for logged information.
- */
-static void rht_free_fn(void *head, void *arg) {
-    kfree(container_of(head, struct logged_packet, node));
-}
 
 static void allowed_free_fn(void *head, void *arg) {
     kfree(container_of(head, struct allowed_entry, node));
@@ -162,12 +139,6 @@ static void allowed_free_fn(void *head, void *arg) {
 
 static void reset_in_memory_allowed_var(void) {
     /* Free existing entries and re-init the table */
-
-    // spin_lock(&allowed_spinlock);
-    // rhashtable_free_and_destroy(&allowed_table, allowed_free_fn, NULL);
-    // /* Re-initialize; ignore error here (caller will log if needed) */
-    // rhashtable_init(&allowed_table, &allowed_params);
-    // spin_unlock(&allowed_spinlock);
 
     struct rhashtable *old_table;
     struct rhashtable *new_table;
@@ -213,7 +184,6 @@ static bool allowed_connection(__be32 ip, u16 port_host) {
     }
 
     ent = rhashtable_lookup_fast(tbl, &ip, allowed_params);
-    // ent = rhashtable_lookup_fast(&allowed_table, &ip, allowed_params);
 
     ok = ent ? true : false;
     if (port_host == 0 || ok == false) {
@@ -252,17 +222,6 @@ static void free_packet_list(void) {
     spin_unlock_bh(&packet_list_lock);
 }
 
-// static void free_packet_list_sent(void) {
-//     struct packet_info *info, *tmp;
-//
-//     spin_lock(&list_lock);
-//     list_for_each_entry_safe(info, tmp, &packet_list_sent, list) {
-//         list_del(&info->list);
-//         kfree(info);
-//     }
-//     spin_unlock(&list_lock);
-// }
-
 /**
  * Decide if this packet should be logged (same rules as dbg_show).
  * Returns true if it should be added to packet_list / sent to server.
@@ -284,460 +243,6 @@ static bool should_log_packet(const struct packet_info *info) {
     return true;
 }
 
-/**
- * Read a file and parse IP addresses
- * Returns: 0 on success, negative error on failure
- */
-// static int load_allowed_file(void) {
-//     struct file *filp;
-//     loff_t pos = 0;
-//     ssize_t bytes;
-//     char buf[CONFIG_BUF_SIZE];
-//     char *line, *end;
-//     __be32 ip;
-//     unsigned int a, b, c, d;
-//
-//     /* On each new read, reset it to not have overwrite problems and old
-//      data still present. */
-//     reset_in_memory_allowed_var();
-//
-//     if (allowed_file_path[0] == '\0') {
-//         pr_info("No allowed file path specified\n");
-//         return 0;
-//     }
-//
-//     filp = filp_open(allowed_file_path, O_RDWR | O_CREAT, 0666);
-//     if (IS_ERR(filp)) {
-//         pr_err("Failed to open allowed file: %s (%ld)\n", allowed_file_path, PTR_ERR(filp));
-//         return PTR_ERR(filp);
-//     }
-//
-//     /* Force mode to 0666 regardless of umask */
-//     inode_lock(file_inode(filp));
-//     file_inode(filp)->i_mode = S_IFREG | 0666;
-//     mark_inode_dirty(file_inode(filp));
-//     inode_unlock(file_inode(filp));
-//
-//     bytes = kernel_read(filp, buf, CONFIG_BUF_SIZE - 1, &pos);
-//     if (bytes < 0) {
-//         pr_err("Failed to read allowed file: %zd\n", bytes);
-//         filp_close(filp, NULL);
-//         return bytes;
-//     }
-//
-//     buf[bytes] = '\0';
-//     pr_info("Allowed file loaded (%zd bytes):\n%s", bytes, buf);
-//
-//     /* We'll support two formats:
-//      * 1) Per-IP lines: 1.2.3.4:80,443
-//      * If sectioned format is used, the PORTS list will be applied to each IP.
-//      */
-//
-//     /* Temporary storage for bare IPs and global ports */
-//     __be32 tmp_ips[MAX_ALLOWED_DEFINITION_FILE];
-//     int tmp_ip_count = 0;
-//     u16 tmp_ports[MAX_ALLOWED_DEFINITION_FILE];
-//     int tmp_port_count = 0;
-//
-//     line = buf;
-//     while ((end = strstr(line, "\n")) != NULL) {
-//         *end = '\0';
-//
-//         char *colon = strchr(line, ':');
-//         if (colon) {
-//             /* per-IP with ports */
-//             *colon = '\0';
-//             if (sscanf(line, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
-//                 ip = htonl((a << 24) | (b << 16) | (c << 8) | d);
-//
-//                 struct allowed_entry *ent = kzalloc(sizeof(*ent), GFP_KERNEL);
-//                 if (!ent) {
-//                     pr_err("oom allocating allowed_entry\n");
-//                     line = end + 1;
-//                     continue;
-//                 }
-//                 ent->ip = ip;
-//                 ent->port_count = 0;
-//
-//                 char *ports_str = colon + 1;
-//                 /* Read the port as a string. */
-//                 char *tok;
-//                 while ((tok = strsep(&ports_str, ",")) != NULL && ent->port_count < MAX_ALLOWED_DEFINITION_FILE) {
-//                     u16 p = 0;
-//                     /* Try to transform it to a u16. On success, add the port.*/
-//                     if (sscanf(tok, "%hu", &p) == 1) {
-//                         ent->ports[ent->port_count++] = p;
-//                     }
-//                 }
-//
-//                 spin_lock(&allowed_lock);
-//                 if (rhashtable_insert_fast(&allowed_table, &ent->node, allowed_params) == 0)
-//                     allowed_entry_count++;
-//                 spin_unlock(&allowed_lock);
-//                 pr_info("added ip %pI4 with %d ports", &ip, ent->port_count);
-//             }
-//         } else {
-//             if (tmp_ip_count < MAX_ALLOWED_DEFINITION_FILE && sscanf(line, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
-//                 ip = htonl((a << 24) | (b << 16) | (c << 8) | d);
-//                 tmp_ips[tmp_ip_count++] = ip;
-//                 pr_info("queued ip %pI4", &ip);
-//             }
-//         }
-//         line = end + 1;
-//     }
-//
-//     /* If there are queued bare IPs, create entries with port_count==0 (allow
-//      * any port).
-//      */
-//     for (int i = 0; i < tmp_ip_count; i++) {
-//         struct allowed_entry *ent = kzalloc(sizeof(*ent), GFP_KERNEL);
-//         if (!ent) {
-//             pr_err("oom allocating allowed_entry for queued ip\n");
-//             continue;
-//         }
-//         ent->ip = tmp_ips[i];
-//         if (tmp_port_count > 0) {
-//             ent->port_count = tmp_port_count;
-//             for (int j = 0; j < tmp_port_count; j++)
-//                 ent->ports[j] = tmp_ports[j];
-//         } else {
-//             ent->port_count = 0; /* means any port allowed for this IP */
-//         }
-//         spin_lock(&allowed_lock);
-//         if (rhashtable_insert_fast(&allowed_table, &ent->node, allowed_params) == 0)
-//             allowed_entry_count++;
-//         spin_unlock(&allowed_lock);
-//         pr_info("added queued ip %pI4 with %d ports", &ent->ip, ent->port_count);
-//     }
-//
-//     /* print entries in allowed_table for inspection */
-//     struct rhashtable_iter iter;
-//     struct allowed_entry *ent;
-//
-//     pr_info("________________INSPECT_________________\nInformation added in "
-//             "memory:");
-//     rhashtable_walk_enter(&allowed_table, &iter);
-//     while ((ent = rhashtable_walk_next(&iter)) != NULL) {
-//         int j;
-//         pr_info("IP: %pI4 ports:", &ent->ip);
-//         if (ent->port_count == 0) {
-//             pr_info("  any");
-//         } else {
-//             for (j = 0; j < ent->port_count; j++)
-//                 pr_info("  %u", ent->ports[j]);
-//         }
-//     }
-//     rhashtable_walk_exit(&iter);
-//
-//     filp_close(filp, NULL);
-//     pr_info("Loaded allowed table entries\n");
-//     return 0;
-// }
-
-/**
- * Read config file from disk
- * @return: number of bytes read on success (>=0), negative error on failure
- */
-// static ssize_t load_config_from_file(void) {
-//     struct file *filp;
-//     loff_t pos = 0;
-//     ssize_t bytes;
-//     char *line, *end;
-//     unsigned int a, b, c, d;
-//     u16 parsed_port;
-//
-//     /* Open the file; If the file is not present, create it.  */
-//     // filp = filp_open(CONFIG_FILE_PATH, O_RDWR | O_CREAT, 0666);
-//     filp = filp_open(CONFIG_FILE_PATH, O_RDONLY, 0);
-//
-//     if (IS_ERR(filp)) {
-//         pr_err("Failed to open or create config file: -%s- (%ld)\n", CONFIG_FILE_PATH, PTR_ERR(filp));
-//         return PTR_ERR(filp);
-//     }
-//
-//     /* Read up to CONFIG_BUF_SIZE-1 so we can NUL-terminate */
-//     bytes = kernel_read(filp, config_buf, CONFIG_BUF_SIZE - 1, &pos);
-//     if (bytes < 0) {
-//         pr_err("Failed to read config file: %zd\n", bytes);
-//         filp_close(filp, NULL);
-//         return bytes;
-//     }
-//
-//     config_buf[bytes] = '\0';
-//     pr_info("Config loaded -%s-(%zd bytes):\n%s", CONFIG_FILE_PATH, bytes, config_buf);
-//
-//     // Reset allowed_file_path.
-//     strcpy(allowed_file_path, "\0");
-//
-//     // Clear already saved information.
-//     free_packet_list();
-//
-//     // Parse config lines
-//     line = config_buf;
-//     while ((end = strstr(line, "\n")) != NULL) {
-//         *end = '\0';
-//         if (sscanf(line, "server IP %u.%u.%u.%u", &a, &b, &c, &d) == 4) {
-//
-//             mutex_lock(&client_server_info_mutex);
-//             server_ip = htonl((a << 24) | (b << 16) | (c << 8) | d);
-//             pr_info("Parsed server IP: %pI4\n", &server_ip);
-//             mutex_unlock(&client_server_info_mutex);
-//         } else if (sscanf(line, "server port %hu", &parsed_port) == 1) {
-//             mutex_lock(&client_server_info_mutex);
-//             server_port = parsed_port;
-//             mutex_unlock(&client_server_info_mutex);
-//         } else if (strcmp(line, "Listening") == 0) {
-//             state = LISTENING;
-//         } else if (strcmp(line, "Monitoring") == 0) {
-//             state = MONITORING;
-//         } else if (strcmp(line, "Reactive") == 0) {
-//             state = REACTIVE;
-//         } else if (strcmp(line, "Disabled") == 0) {
-//             state = DISABLED;
-//         } else if (sscanf(line, "allowed_file %255s", allowed_file_path) == 1) {
-//             // Ensure null termination
-//             allowed_file_path[CONFIG_BUF_SIZE - 1] = '\0';
-//         }
-//         line = end + 1;
-//     }
-//
-//     /* Update last_mtime_config_file on successful read */
-//     last_mtime_config_file = inode_get_mtime(filp->f_inode);
-//     // last_mtime_config_file = filp->f_inode->i_mtime;
-//
-//     filp_close(filp, NULL);
-//     return bytes;
-// }
-
-// ========================================================
-// Section for loading weights for anomaly detection
-// ========================================================
-
-// static int load_model_binary(void) {
-//     struct file *filp;
-//     loff_t pos = 0;
-//     int i, j;
-//     u32 num_features, num_vectors;
-//     union {
-//         u8 bytes[8];
-//         s64 as_s64;
-//     } converter;
-//
-//     filp = filp_open(model_bin_path, O_RDONLY, 0);
-//     if (IS_ERR(filp))
-//         return -1;
-//
-//     kernel_read(filp, &num_features, sizeof(u32), &pos);
-//     if (num_features != NUM_FEATURES) {
-//         filp_close(filp, NULL);
-//         return -1;
-//     }
-//
-//     /* Read scaler means (8 bytes, interpret as double) */
-//     for (i = 0; i < NUM_FEATURES; i++) {
-//         kernel_read(filp, converter.bytes, 8, &pos);
-//         svm_model.scaler_mean[i] = converter.as_s64;
-//     }
-//
-//     for (i = 0; i < NUM_FEATURES; i++) {
-//         kernel_read(filp, converter.bytes, 8, &pos);
-//         svm_model.scaler_std[i] = converter.as_s64;
-//     }
-//
-//     kernel_read(filp, converter.bytes, 8, &pos);
-//     svm_model.offset = converter.as_s64;
-//
-//     kernel_read(filp, &num_vectors, sizeof(u32), &pos);
-//     if (num_vectors > MAX_SUPPORT_VECTORS) {
-//         filp_close(filp, NULL);
-//         return -1;
-//     }
-//
-//     svm_model.num_support_vectors = num_vectors;
-//
-//     for (i = 0; i < num_vectors; i++) {
-//         for (j = 0; j < NUM_FEATURES; j++) {
-//             kernel_read(filp, converter.bytes, 8, &pos);
-//             svm_model.support_vectors[i][j] = converter.as_s64;
-//         }
-//     }
-//
-//     for (i = 0; i < num_vectors; i++) {
-//         kernel_read(filp, converter.bytes, 8, &pos);
-//         svm_model.dual_coefficients[i] = converter.as_s64;
-//     }
-//
-//     filp_close(filp, NULL);
-//     pr_info("SVM Model loaded: %d support vectors\n", num_vectors);
-//     return 0;
-// }
-
-/* Better exp approximation using Taylor series */
-static s64 exp_approx_fixed(s64 x_unscaled) {
-    /* Input: unscaled exponent (e.g., -0.5, -2, -5)
-       Output: scaled result (e.g., 0.6*SCALE, 0.13*SCALE, 0.0067*SCALE) */
-
-    if (x_unscaled >= 0) {
-        return SCALE; /* e^0 = 1.0 */
-    }
-    if (x_unscaled < -10) {
-        return 0; /* e^-10 ≈ 0 */
-    }
-
-    /* Approximate: e^x ≈ 1 / (1 - x + x²/2) for small x */
-    s64 x2 = (x_unscaled * x_unscaled) / 2;
-    s64 denom = SCALE - (x_unscaled * SCALE) + x2;
-
-    if (denom <= 0) {
-        return 0;
-    }
-
-    return (u64)SCALE * SCALE / denom;
-}
-
-static s64 rbf_kernel_fixed(s64 *x1, s64 *x2, s64 gamma) {
-    s64 dist = 0;
-    int i;
-    for (i = 0; i < NUM_FEATURES; i++) {
-        s64 diff = (x1[i] - x2[i]) / SCALE;
-        dist += (diff * diff);
-    }
-    /* Pass unscaled exponent: -gamma * dist / SCALE */
-    s64 exponent = -(gamma / SCALE) * dist; /* This is unscaled now */
-    return exp_approx_fixed(exponent);
-}
-
-static int predict_anomaly(int sport, int dport, int protocol, int ttl, int total_len, int tcp_flags) {
-    s64 features[NUM_FEATURES];
-    s64 decision = 0;
-    int i;
-    s64 gamma = SCALE / NUM_FEATURES; /* Scaled gamma */
-
-    /* Normalize: (x - mean) / std, then scale */
-    features[0] = ((((s64)sport * SCALE) - svm_model.scaler_mean[0]) / svm_model.scaler_std[0]) * SCALE;
-    features[1] = ((((s64)dport * SCALE) - svm_model.scaler_mean[1]) / svm_model.scaler_std[1]) * SCALE;
-    features[2] = ((((s64)protocol * SCALE) - svm_model.scaler_mean[2]) / svm_model.scaler_std[2]) * SCALE;
-    features[3] = ((((s64)ttl * SCALE) - svm_model.scaler_mean[3]) / svm_model.scaler_std[3]) * SCALE;
-    features[4] = ((((s64)total_len * SCALE) - svm_model.scaler_mean[4]) / svm_model.scaler_std[4]) * SCALE;
-    features[5] = ((((s64)tcp_flags * SCALE) - svm_model.scaler_mean[5]) / svm_model.scaler_std[5]) * SCALE;
-
-    spin_lock(&svm_model_lock);
-
-    if (!svm_model.loaded || svm_model.num_support_vectors == 0) {
-        spin_unlock(&svm_model_lock);
-        return 1;
-    }
-
-    for (i = 0; i < svm_model.num_support_vectors; i++) {
-        s64 kernel_val = rbf_kernel_fixed(features, svm_model.support_vectors[i], gamma);
-        decision += (svm_model.dual_coefficients[i] * kernel_val) / SCALE;
-    }
-
-    decision += svm_model.offset;
-    spin_unlock(&svm_model_lock);
-
-    return (decision < 0) ? -1 : 1;
-}
-// ========================================================
-
-/** Workque for safer repetitive reading from a file. */
-// static void config_work_func(struct work_struct *work);
-// static DECLARE_WORK(config_work, config_work_func);
-
-// static void config_timer_callback(struct timer_list *unused) {
-//     schedule_work(&config_work); // defer to process context
-//     mod_timer(&config_timer, jiffies + msecs_to_jiffies(CONFIG_POLL_INTERVAL_MS));
-// }
-
-// static void restart_client_thread_if_needed(void);
-
-// static void config_work_func(struct work_struct *work) {
-//     struct file *filp;
-//     struct timespec64 current_mtime_config_file;
-//     struct timespec64 current_mtime_allowed_file;
-//     ssize_t ret;
-//
-//     bool update_allowed_file = false;
-//
-//     // ____________________________________________
-//     // Check config file last modification.
-//     filp = filp_open(CONFIG_FILE_PATH, O_RDONLY, 0);
-//     if (IS_ERR(filp)) {
-//         pr_err("Failed to open config file: %s (%ld)\n", CONFIG_FILE_PATH, PTR_ERR(filp));
-//         return;
-//     }
-//
-//     // Kernel version diff.
-//     current_mtime_config_file = inode_get_mtime(file_inode(filp));
-//     // current_mtime_config_file = file_inode(filp)->i_mtime;
-//     filp_close(filp, NULL);
-//
-//     if (timespec64_compare(&current_mtime_config_file, &last_mtime_config_file) != 0) {
-//         pr_info("Config file modification detected, reloading...\n");
-//         ret = load_config_from_file();
-//         pr_info("Config file modification response: %ld\n", ret);
-//         if (ret >= 0) {
-//             last_mtime_config_file = current_mtime_config_file;
-//
-//             restart_client_thread_if_needed();
-//
-//             update_allowed_file = true;
-//         }
-//     }
-//
-//     // ____________________________________________
-//     if (allowed_file_path[0] == '\0') {
-//         return;
-//     }
-//
-//     filp = filp_open(allowed_file_path, O_RDWR | O_CREAT, 0644);
-//
-//     if (IS_ERR(filp)) {
-//         pr_err("Failed to open allowed file: %256s (%ld)\n", allowed_file_path, PTR_ERR(filp));
-//         return;
-//     }
-//
-//     // Kernel version diff.
-//     current_mtime_allowed_file = inode_get_mtime(file_inode(filp));
-//     // current_mtime_allowed_file = file_inode(filp)->i_mtime;
-//     filp_close(filp, NULL);
-//
-//     if (timespec64_compare(&current_mtime_allowed_file, &last_mtime_allowed_file) != 0) {
-//         pr_info("Config allowed modification detected, reloading...\n");
-//         update_allowed_file = true;
-//     }
-//
-//     if (update_allowed_file) {
-//         ret = load_allowed_file();
-//         if (ret >= 0) {
-//             last_mtime_allowed_file = current_mtime_allowed_file;
-//         }
-//     }
-//
-//     // ____________________________________________
-//     struct timespec64 current_mtime_model_file;
-//
-//     filp = filp_open(model_bin_path, O_RDONLY, 0);
-//     if (!IS_ERR(filp)) {
-//         current_mtime_model_file = inode_get_mtime(file_inode(filp));
-//         filp_close(filp, NULL);
-//
-//         if (timespec64_compare(&current_mtime_model_file, &last_mtime_model_file) != 0) {
-//             pr_info("Model file modification detected, reloading...\n");
-//
-//             spin_lock(&svm_model_lock);
-//             if (load_model_binary() == 0) {
-//                 svm_model.loaded = true;
-//                 last_mtime_model_file = current_mtime_model_file;
-//                 pr_info("Model reloaded successfully\n");
-//             } else {
-//                 pr_err("Failed to load model\n");
-//             }
-//             spin_unlock(&svm_model_lock);
-//         }
-//     }
-// }
-
 static bool is_router_noise(struct iphdr *ip, struct sk_buff *skb) {
 
     if (ipv4_is_loopback(ip->saddr)) {
@@ -757,12 +262,6 @@ static bool add_log_if_necessary(struct packet_info *info) {
     list_add_tail(&info->list, &packet_list);
     spin_unlock_bh(&packet_list_lock);
 
-    // spin_lock(&list_lock);
-    // list_add_tail(&info->list, &packet_list_sent);
-    // spin_unlock(&list_lock);
-
-    // Send the info via the tcp connection to the server.
-    // wake_up_interruptible(&packet_wq);
     return true;
 }
 
@@ -854,11 +353,10 @@ static unsigned int packet_hook(void *priv, struct sk_buff *skb, const struct nf
     // TODO: The logic here is just bad. I need to make a decision and just stick with it - I combine monitoring and
     // listening and in some case I do nothing where I sould.
 
-    /* In REACTIVE mode, only allow packets with daddr in allowed_ips
-     and from the list of allowed ports.
+    /* In REACTIVE mode, only allow packets with daddr in allowed_ips and from the list of allowed ports.
      In the packet list will be packets that are also packets that are
      not blocked; it will be a filtering before printing it.*/
-    if (local_state == REACTIVE || local_state == LISTENING) {
+    if (local_state == REACTIVE || local_state == LISTENING || local_state == MONITORING) {
         bool should_drop = true;
 
         /* If the IP is known, check whether the destination port is allowed
@@ -875,17 +373,6 @@ static unsigned int packet_hook(void *priv, struct sk_buff *skb, const struct nf
             should_drop = false;
         }
 
-        if (should_drop && READ_ONCE(svm_model.loaded)) {
-            int prediction = predict_anomaly(ntohs(info->sport), ntohs(info->dport), info->protocol, info->ttl,
-                                             info->total_len, info->tcp_flags);
-            const int is_anomaly = (prediction == -1) ? 1 : 0;
-
-            if (is_anomaly) {
-                pr_info("ANOMALY: SRC=%pI4 DPORT=%u\n", &info->saddr, ntohs(info->dport));
-                should_drop = false;
-            }
-        }
-
         if (local_state == REACTIVE) {
             if (!added) {
                 kfree(info);
@@ -899,312 +386,6 @@ static unsigned int packet_hook(void *priv, struct sk_buff *skb, const struct nf
     }
     return NF_ACCEPT;
 }
-
-/* Debugfs packet log read */
-static int dbg_show(struct seq_file *m, void *v) {
-    struct packet_info *info;
-    struct logged_packet *lp;
-    struct logged_packet_key key = {0};
-    struct logged_packet *existing;
-
-    // Initialize logged_table at the start of dbg_show.
-    if (rhashtable_init(&logged_table, &logged_params)) {
-        pr_err("Failed to initialize logged_table in dbg_show\n");
-        return -ENOMEM; // Return error to indicate failure
-    }
-
-    spin_lock_bh(&packet_list_lock);
-    list_for_each_entry(info, &packet_list, list) {
-        if (!(should_log_packet(info))) {
-            continue;
-        }
-
-        key.saddr = info->saddr;
-        key.daddr = info->daddr;
-        // key.sport = info->sport;
-        key.dport = info->dport;
-
-        spin_lock(&logged_lock);
-        existing = rhashtable_lookup_fast(&logged_table, &key, logged_params);
-        spin_unlock(&logged_lock);
-
-        const __be32 copy_server_ip = READ_ONCE(server_ip);
-        const u16 copy_server_port = READ_ONCE(server_port);
-
-        if (!existing && !(copy_server_ip == 0 && copy_server_port == 0 && info->daddr == copy_server_ip)) {
-            seq_printf(m,
-                       "PROTO=%u TTL=%u LEN=%u IFACE=%s\n"
-                       "SRC=%pI4 SPORT=%u DST=%pI4 DPORT=%u\n"
-                       "SRC_MAC=%pM DST_MAC=%pM TCP_FLAGS=%02x\n\n",
-                       info->protocol, info->ttl, info->total_len, info->indev, &info->saddr, ntohs(info->sport),
-                       &info->daddr, ntohs(info->dport), info->src_mac, info->dst_mac, info->tcp_flags);
-
-            lp = kmalloc(sizeof(*lp), GFP_ATOMIC);
-            if (lp) {
-                lp->key = key;
-                spin_lock(&logged_lock);
-                rhashtable_insert_fast(&logged_table, &lp->node, logged_params);
-                spin_unlock(&logged_lock);
-            } else {
-                pr_warn("Failed to allocate memory for logged packet\n");
-            }
-        }
-    }
-    spin_unlock_bh(&packet_list_lock);
-
-    /* Destroy logged_table at the end of dbg_show. */
-    spin_lock(&logged_lock);
-    rhashtable_free_and_destroy(&logged_table, rht_free_fn, NULL);
-    spin_unlock(&logged_lock);
-
-    return 0;
-}
-
-static int dbg_open(struct inode *inode, struct file *file) {
-    return single_open(file, dbg_show, NULL);
-}
-
-/**
- *  Config file read (trigger reload from disk).
- */
-// static ssize_t cfg_read(struct file *file, char __user *buf, size_t count, loff_t *ppos) {
-//     ssize_t ret;
-//
-//     /* reload into global config_buf */
-//     ret = load_config_from_file();
-//     if (ret < 0)
-//         return ret;
-//
-//     /* present the buffer to userspace via seq-like simple helper */
-//     return simple_read_from_buffer(buf, count, ppos, config_buf, strlen(config_buf));
-// }
-
-// static const struct file_operations cfg_fops = {
-//     .owner = THIS_MODULE,
-//     .read = cfg_read,
-// };
-
-// ====================================================================================
-// static int tcp_client_send(struct socket *sock, const char *buf, size_t len, unsigned long flags) {
-//     struct msghdr msg = {
-//         .msg_name = NULL, .msg_namelen = 0, .msg_control = NULL, .msg_controllen = 0, .msg_flags = flags};
-//     struct kvec vec;
-//     int written = 0;
-//     int left = len;
-//     int ret;
-//
-//     while (left > 0) {
-//         vec.iov_base = (void *)(buf + written);
-//         vec.iov_len = left;
-//
-//         ret = kernel_sendmsg(sock, &msg, &vec, 1, left);
-//         if (ret < 0) {
-//             if (ret == -ERESTARTSYS || (flags & MSG_DONTWAIT && ret == -EAGAIN))
-//                 continue; // retry on signal or would-block
-//             pr_err("send failed: %d\n", ret);
-//             return ret;
-//         }
-//
-//         written += ret;
-//         left -= ret;
-//     }
-//
-//     return written;
-// }
-
-// TODO: Not used rn
-//  static int tcp_client_receive(struct socket *sock, char *buf, size_t max_len,
-//                                unsigned long flags) {
-//      struct msghdr msg = {.msg_name = NULL,
-//                           .msg_namelen = 0,
-//                           .msg_control = NULL,
-//                           .msg_controllen = 0,
-//                           .msg_flags = flags};
-//      struct kvec vec;
-//      int ret;
-//
-//      vec.iov_base = buf;
-//      vec.iov_len = max_len;
-//
-//      ret = kernel_recvmsg(sock, &msg, &vec, 1, max_len, flags);
-//      if (ret < 0) {
-//          if (ret == -EAGAIN || ret == -ERESTARTSYS)
-//              return -EAGAIN; // caller can retry
-//          pr_err("recv failed: %d\n", ret);
-//          return ret;
-//      }
-//
-//      if (ret < max_len)
-//          buf[ret] = '\0'; // null-terminate if string
-//
-//      return ret;
-//  }
-
-// static int tcp_client_thread(void *arg) {
-//     mutex_lock(&client_server_info_mutex);
-//     const __be32 copy_server_ip = server_ip;
-//     const u16 copy_server_port = server_port;
-//     mutex_unlock(&client_server_info_mutex);
-//
-//     if (copy_server_ip == 0 || copy_server_port == 0) {
-//         atomic_set(&client_running, 0);
-//         return -1;
-//     }
-//     struct sockaddr_in saddr;
-//     int ret;
-//
-//     allow_signal(SIGTERM); // optional: allow kthread_stop to interrupt us
-//
-//     pr_info("client thread started\n");
-//
-//     ret = sock_create(PF_INET, SOCK_STREAM, IPPROTO_TCP, &conn_socket);
-//     if (ret < 0) {
-//         pr_err("sock_create failed: %d\n", ret);
-//         goto out;
-//     }
-//
-//     memset(&saddr, 0, sizeof(saddr));
-//     saddr.sin_family = AF_INET;
-//     saddr.sin_port = htons(copy_server_port);
-//     saddr.sin_addr.s_addr = copy_server_ip;
-//
-//     conn_socket->sk->sk_rcvtimeo = msecs_to_jiffies(6000);
-//     conn_socket->sk->sk_sndtimeo = msecs_to_jiffies(6000);
-//
-//     ret = conn_socket->ops->connect(conn_socket, (struct sockaddr *)&saddr, sizeof(saddr), 0);
-//
-//     if (ret && ret != -EINPROGRESS) {
-//         pr_err("connect failed immediately: %d\n", ret);
-//         goto out_sock;
-//     }
-//
-//     if (ret == -EINPROGRESS) {
-//         long timeout;
-//
-//         timeout = wait_event_interruptible_timeout(conn_socket->sk->sk_wq->wait,
-//                                                    conn_socket->sk->sk_state != TCP_SYN_SENT ||
-//                                                    kthread_should_stop(), msecs_to_jiffies(3000));
-//
-//         if (kthread_should_stop()) {
-//             pr_info("connect aborted due to thread stop\n");
-//             goto out_sock;
-//         }
-//         if (timeout <= 0) {
-//             pr_err("connect timeout\n");
-//             goto out_sock;
-//         }
-//
-//         if (conn_socket->sk->sk_state != TCP_ESTABLISHED) {
-//             pr_err("connect failed, state=%d\n", conn_socket->sk->sk_state);
-//             goto out_sock;
-//         }
-//     }
-//
-//     pr_info("connected to server\n");
-//
-//     // Main loop – example: send once, receive once, then idle/sleep
-//     while (!kthread_should_stop()) {
-//         // Wait until there's something to send or timeout
-//         wait_event_interruptible_timeout(packet_wq, kthread_should_stop(), msecs_to_jiffies(5000));
-//
-//         if (kthread_should_stop())
-//             break;
-//
-//         struct packet_info *info, *tmp;
-//         LIST_HEAD(local_list);
-//         char send_buf[SEND_BUF_SIZE];
-//         int sent_count = 0;
-//
-//         // Grab everything currently in the list (no filtering)
-//         spin_lock_bh(&list_lock);
-//         list_splice_init(&packet_list_sent,
-//                          &local_list); // atomic move of whole list
-//         spin_unlock_bh(&list_lock);
-//
-//         // Send each one
-//         list_for_each_entry_safe(info, tmp, &local_list, list) {
-//             int len;
-//
-//             // Use scnprintf (safer than snprintf in kernel) — same format as in
-//             // dbg_show
-//             len = scnprintf(send_buf, sizeof(send_buf),
-//                             "PROTO=%u TTL=%u LEN=%u IFACE=%s "
-//                             "SRC=%pI4 SPORT=%u DST=%pI4 DPORT=%u "
-//                             "SRC_MAC=%pM DST_MAC=%pM TCP_FLAGS=%02x\n",
-//                             info->protocol, info->ttl, info->total_len, info->indev, &info->saddr,
-//                             ntohs(info->sport), &info->daddr, ntohs(info->dport), info->src_mac, info->dst_mac,
-//                             info->tcp_flags);
-//
-//             if (len <= 0 || len >= sizeof(send_buf)) {
-//                 pr_warn("format buffer too small or error\n");
-//                 list_del(&info->list);
-//                 kfree(info);
-//                 continue;
-//             }
-//
-//             int sent = tcp_client_send(conn_socket, send_buf, len, 0);
-//             if (sent == len) {
-//                 sent_count++;
-//                 list_del(&info->list);
-//                 kfree(info);
-//             } else {
-//                 list_move_tail(&info->list, &packet_list_sent);
-//                 pr_warn("send failed (%d/%d bytes), retry later\n", sent, len);
-//                 // Optional: break;   // stop this batch if connection is broken
-//             }
-//         }
-//
-//         if (sent_count > 0)
-//             pr_info("tcp-client: sent %d packet log entries\n", sent_count);
-//     }
-//
-// out_sock:
-//     if (conn_socket)
-//         sock_release(conn_socket);
-//     conn_socket = NULL;
-//
-// out:
-//     atomic_set(&client_running, 0);
-//     pr_info("client thread exiting\n");
-//     return 0;
-// }
-
-// static void restart_client_thread_if_needed(void) {
-//     mutex_lock(&client_server_info_mutex);
-//     const __be32 copy_server_ip = server_ip;
-//     const u16 copy_server_port = server_port;
-//
-//     if (copy_server_ip == prev_server_ip && copy_server_port == prev_server_port) {
-//         mutex_unlock(&client_server_info_mutex);
-//         return;
-//     }
-//
-//     pr_info("Server config changed → restarting client thread\n");
-//
-//     prev_server_ip = copy_server_ip;
-//     prev_server_port = copy_server_port;
-//
-//     mutex_unlock(&client_server_info_mutex);
-//     /* Stop old thread */
-//     mutex_lock(&client_thread_mutex);
-//     if (atomic_read(&client_running)) {
-//         kthread_stop(client_thread);
-//         atomic_set(&client_running, 0);
-//     }
-//
-//     /* Start new thread ONLY if config is valid */
-//     if (copy_server_ip != 0 && copy_server_port != 0) {
-//         client_thread = kthread_run(tcp_client_thread, NULL, "tcp-client");
-//         if (IS_ERR(client_thread)) {
-//             pr_err("Failed to restart client thread: %ld\n", PTR_ERR(client_thread));
-//             atomic_set(&client_running, 0);
-//         } else {
-//             atomic_set(&client_running, 1);
-//             pr_info("Client thread restarted\n");
-//         }
-//     }
-//     mutex_unlock(&client_thread_mutex);
-// }
 
 static long mymodule_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     switch (cmd) {
@@ -1233,7 +414,6 @@ static long mymodule_ioctl(struct file *file, unsigned int cmd, unsigned long ar
             server_port = info.server_port;
             mutex_unlock(&client_server_info_mutex);
 
-            // restart_client_thread_if_needed();
             return 0;
         }
 
@@ -1262,10 +442,6 @@ static long mymodule_ioctl(struct file *file, unsigned int cmd, unsigned long ar
             tbl = rcu_dereference_protected(allowed_table_ptr, lockdep_is_held(&allowed_mutex));
             rhashtable_insert_fast(tbl, &ent->node, allowed_params);
             mutex_unlock(&allowed_mutex);
-
-            // spin_lock(&allowed_spinlock);
-            // rhashtable_insert_fast(&allowed_table, &ent->node, allowed_params);
-            // spin_unlock(&allowed_spinlock);
 
             return 0;
         }
@@ -1341,6 +517,7 @@ static struct miscdevice mymodule_device = {
     .name = "mymodule",
     .fops = &mymodule_fops,
 };
+
 /**
  * Module init/exit.
  */
@@ -1362,33 +539,16 @@ static int __init mynetfilter_init(void) {
 
     RCU_INIT_POINTER(allowed_table_ptr, tbl);
 
-    // allowed_table_ptr = kzalloc(sizeof(*allowed_table_ptr), GFP_KERNEL);
-    // rhashtable_init(allowed_table_ptr, &allowed_params);
-
-    /* initialize allowed_table */
-    // if (rhashtable_init(&allowed_table, &allowed_params)) {
-    //     pr_warn("Failed to initialize allowed_table\n");
-    // }
-
     // Initialise timer var for detection model bin file.
     last_mtime_model_file.tv_sec = 0;
     last_mtime_model_file.tv_nsec = 0;
 
-    // Initialise the char[] so it can be checked if something was added.
-    // strcpy(allowed_file_path, "\0");
-
     netfilter_ops.hook = packet_hook;
     netfilter_ops.pf = PF_INET;
-    // netfilter_ops.hooknum = NF_INET_PRE_ROUTING;
     netfilter_ops.hooknum = NF_INET_LOCAL_IN;
     netfilter_ops.priority = NF_IP_PRI_FIRST;
 
     nf_register_net_hook(&init_net, &netfilter_ops);
-
-    /* Setup timer for periodic modification checks */
-    // timer_setup(&config_timer, config_timer_callback, 0);
-    // mod_timer(&config_timer, jiffies + msecs_to_jiffies(CONFIG_POLL_INTERVAL_MS));
-    /* Register ioctl device */
 
     const int ret = misc_register(&mymodule_device);
     if (ret) {
@@ -1408,15 +568,7 @@ static void __exit mynetfilter_exit(void) {
     misc_deregister(&mymodule_device);
     nf_unregister_net_hook(&init_net, &netfilter_ops);
 
-    // del_timer_sync(&config_timer);
-    // cancel_work_sync(&config_work);
     free_packet_list();
-    // free_packet_list_sent();
-
-    /* free allowed_table entries */
-    // spin_lock(&allowed_spinlock);
-    // rhashtable_free_and_destroy(&allowed_table, allowed_free_fn, NULL);
-    // spin_unlock(&allowed_spinlock);
     mutex_lock(&allowed_mutex);
     tbl = rcu_dereference_protected(allowed_table_ptr, lockdep_is_held(&allowed_mutex));
     rcu_assign_pointer(allowed_table_ptr, NULL);

@@ -10,7 +10,7 @@
 #include "types.h"
 #include "utils.h"
 
-#include "../daemon/json.hpp"
+#include "../../daemon/json.hpp"
 using json = nlohmann::json;
 
 std::string pc_id_selected = "";
@@ -864,7 +864,6 @@ bool add_entity_in_allowed(std::vector<std::string> &allowed_lines, const Messag
     return false;
 }
 
-// TODO: This needs to get checked
 std::map<std::string, std::set<int>> extract_allowed_ips(const std::string &allowed_file) {
 
     std::map<std::string, std::set<int>> allowed_ip_map;

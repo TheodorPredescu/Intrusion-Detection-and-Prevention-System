@@ -12,3 +12,4 @@ admin_licenta/NodeEditor.json
 *.db-shm
 *.db-wal
 .venv
+venv

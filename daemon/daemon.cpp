@@ -476,6 +476,7 @@ class ConfigDaemon {
         curl_easy_cleanup(curl);
     }
 
+    // TODO: Remained here.
     bool send_configuration_profile(const bool config_changed, const bool allowed_changed) {
 
         if (config_changed == false && allowed_changed == false) {

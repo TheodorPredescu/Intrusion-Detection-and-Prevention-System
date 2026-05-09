@@ -7,7 +7,7 @@
 #include <iostream>
 #include <sstream>
 
-#include "../daemon/json.hpp"
+#include "../../daemon/json.hpp"
 using json = nlohmann::json;
 
 void HostDetail::reset_config_modifications() {
@@ -317,7 +317,6 @@ int HostDetail::draw(const double &current_time) {
         } else {
             std::string new_allwed_file = "";
             if (msg_struct_info_map && !pc_id_selected.empty()) {
-                // TODO: I can change the merge function to look more to the one from main page
                 const auto entry = msg_struct_info_map->find(pc_id_selected);
                 if (entry != msg_struct_info_map->end()) {
                     new_allwed_file = merge_allowed_with_topology(entry->second, allowed_lines);
