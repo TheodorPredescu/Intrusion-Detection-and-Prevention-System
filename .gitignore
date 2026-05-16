@@ -5,9 +5,6 @@ kernel_module/.*
 Module.symvers
 modules.order
 
-admin_licenta/application
-admin_licenta/NodeEditor.json
-
 *.db
 *.db-shm
 *.db-wal
