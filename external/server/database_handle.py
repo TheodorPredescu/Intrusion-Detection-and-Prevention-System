@@ -5,7 +5,6 @@ import base64
 from datetime import datetime
 
 DATABASE = "network_logs.db"
-
 DEFAULT_ICON_PATH: str = "default_icon.png"
 
 
@@ -372,23 +371,3 @@ class Database:
         finally:
             if conn:
                 conn.close()
-
-    # def export_for_training(self, limit: int = 100000) -> Optional[pd.DataFrame]:
-    #     """Export data for ML training"""
-    #     try:
-    #         conn = self.get_connection()
-    #
-    #         query = """
-    #             SELECT src_port, dst_port, protocol, ttl, packet_len, tcp_flags
-    #             FROM connections
-    #             LIMIT ?
-    #         """
-    #
-    #         df = pd.read_sql_query(query, conn, params=(limit,))
-    #         conn.close()
-    #
-    #         return df if len(df) > 0 else None
-    #
-    #     except Exception as e:
-    #         print(f"[DB] Failed to export data: {e}")
-    #         return None

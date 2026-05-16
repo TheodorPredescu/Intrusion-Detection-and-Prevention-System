@@ -385,6 +385,27 @@ bool reset_topology_connections() {
 #ifdef _WIN32
 #include <windows.h>
 #endif
+// Generate dot
+// std::string dot = "digraph G {\nrankdir=LR;\nnode [shape=box];\n";
+// dot += "graph [overlap=false];\n";
+// for (const auto &ip : all_ips) {
+//     dot += "  \"" + ip + "\";\n";
+// }
+// for (const auto &[src, dests] : connections) {
+//     for (const auto &dst : dests) {
+//         dot += "  \"" + src + "\" -> \"" + dst + "\";\n";
+//     }
+// }
+// dot += "}\n";
+
+// dot += "graph [overlap=false];\n";
+
+// Run graphviz (quote paths for Windows)
+// #ifdef _WIN32
+//     std::string cmd = "neato -Tplain \"" + dot_file_path + "\" -o \"" + txt_file_path + "\"";
+// #else
+//     std::string cmd = "neato -Tplain " + dot_file_path + " -o " + txt_file_path + " 2>/dev/null";
+// #endif
 
 std::map<std::string, ImVec2> compute_graph_layout(const std::set<std::string> &all_ips,
                                                    const std::map<std::string, std::set<std::string>> &connections) {
@@ -404,30 +425,15 @@ std::map<std::string, ImVec2> compute_graph_layout(const std::set<std::string> &
     std::string txt_file_path = temp_dir + "graph.txt";
 
     // Generate dot
-    // std::string dot = "digraph G {\nrankdir=LR;\nnode [shape=box];\n";
-    // dot += "graph [overlap=false];\n";
-    // for (const auto &ip : all_ips) {
-    //     dot += "  \"" + ip + "\";\n";
-    // }
-    // for (const auto &[src, dests] : connections) {
-    //     for (const auto &dst : dests) {
-    //         dot += "  \"" + src + "\" -> \"" + dst + "\";\n";
-    //     }
-    // }
-    // dot += "}\n";
-
-    // Generate dot
-    std::string dot = "graph G {\n"; // digraph -> graph (undirected)
+    std::string dot = "graph G {\n";
     dot += "node [shape=box];\n";
-    // dot += "graph [overlap=false];\n";
     dot += "graph [overlap=false, sep=\"1\", K=0.1];\n";
-    // removed rankdir=LR — that's dot-specific and meaningless for neato/fdp
     for (const auto &ip : all_ips) {
         dot += "  \"" + ip + "\";\n";
     }
     for (const auto &[src, dests] : connections) {
         for (const auto &dst : dests) {
-            dot += "  \"" + src + "\" -- \"" + dst + "\";\n"; // -> becomes --
+            dot += "  \"" + src + "\" -- \"" + dst + "\";\n";
         }
     }
     dot += "}\n";
@@ -435,13 +441,6 @@ std::map<std::string, ImVec2> compute_graph_layout(const std::set<std::string> &
     std::ofstream dot_file(dot_file_path);
     dot_file << dot;
     dot_file.close();
-
-    // Run graphviz (quote paths for Windows)
-    // #ifdef _WIN32
-    //     std::string cmd = "neato -Tplain \"" + dot_file_path + "\" -o \"" + txt_file_path + "\"";
-    // #else
-    //     std::string cmd = "neato -Tplain " + dot_file_path + " -o " + txt_file_path + " 2>/dev/null";
-    // #endif
 
 #ifdef _WIN32
     std::string cmd = "fdp -Tplain -Gstart=2 \"" + dot_file_path + "\" -o \"" + txt_file_path + "\"";

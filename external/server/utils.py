@@ -2,7 +2,9 @@ from typing import Dict, List
 import models
 
 
-def topology_extraction(connection_map: Dict[str, models.TopologyEntry], packetList: List[models.PacketData], pc_id: str):
+def topology_extraction(
+    connection_map: Dict[str, models.TopologyEntry], packetList: List[models.PacketData], pc_id: str
+):
 
     entity = connection_map.setdefault(pc_id, models.TopologyEntry())
 
@@ -12,9 +14,6 @@ def topology_extraction(connection_map: Dict[str, models.TopologyEntry], packetL
 
         connection = entity.connection_dict.setdefault(packetEntity.saddr, models.ConnectionStats())
 
-        # connection.address = packetEntity.saddr
-        # connection.port_int = packetEntity.dport
-        # connection.port_out = packetEntity.sport
         connection.ports_in.add(packetEntity.dport)
         connection.ports_out.add(packetEntity.sport)
         connection.protocols.add(packetEntity.protocol)
