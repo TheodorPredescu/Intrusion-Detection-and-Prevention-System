@@ -46,7 +46,7 @@
 #define REACTIVE 2
 #define DISABLED 3
 
-static u8 state = 3;
+static u8 state = DISABLED;
 
 struct packet_info {
     __be32 saddr, daddr;
@@ -109,27 +109,6 @@ static DEFINE_MUTEX(client_server_info_mutex);
 /** Used for lookups */
 static DEFINE_MUTEX(allowed_mutex);
 // ============================================================
-
-struct socket *conn_socket = NULL;
-static struct task_struct *client_thread;
-static atomic_t client_running = ATOMIC_INIT(0);
-static DEFINE_MUTEX(client_thread_mutex);
-#define SEND_BUF_SIZE 512
-// ============================================================
-#define MAX_SUPPORT_VECTORS 10000
-#define NUM_FEATURES 6
-#define SCALE 1000000      /* 6 decimal places */
-typedef s64 fixed_point_t; /* 64-bit fixed point */
-
-struct SVMModel {
-    s64 scaler_mean[NUM_FEATURES];
-    s64 scaler_std[NUM_FEATURES];
-    s64 offset;
-    int num_support_vectors;
-    s64 support_vectors[MAX_SUPPORT_VECTORS][NUM_FEATURES];
-    s64 dual_coefficients[MAX_SUPPORT_VECTORS];
-    bool loaded;
-};
 
 static struct timespec64 last_mtime_model_file;
 
@@ -398,7 +377,7 @@ static long mymodule_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 
             // Actualizează variabila kernel
             pr_info("[IOCTL] State: %u → %u\n", READ_ONCE(state), new_state);
-            WRITE_ONCE(state, new_state); // ← Forces write to memory
+            WRITE_ONCE(state, new_state);
             pr_info("[IOCTL] ✓ State changed\n");
             return 0;
         }
@@ -578,12 +557,6 @@ static void __exit mynetfilter_exit(void) {
 
     rhashtable_free_and_destroy(tbl, allowed_free_fn, NULL);
     kfree(tbl);
-    mutex_lock(&client_server_info_mutex);
-    if (atomic_read(&client_running)) {
-        kthread_stop(client_thread);
-        atomic_set(&client_running, 0);
-    }
-    mutex_unlock(&client_server_info_mutex);
 
     pr_info("Netfilter module unloaded\n");
 }
