@@ -110,8 +110,6 @@ static DEFINE_MUTEX(client_server_info_mutex);
 static DEFINE_MUTEX(allowed_mutex);
 // ============================================================
 
-static struct timespec64 last_mtime_model_file;
-
 static void allowed_free_fn(void *head, void *arg) {
     kfree(container_of(head, struct allowed_entry, node));
 }
@@ -517,10 +515,6 @@ static int __init mynetfilter_init(void) {
     }
 
     RCU_INIT_POINTER(allowed_table_ptr, tbl);
-
-    // Initialise timer var for detection model bin file.
-    last_mtime_model_file.tv_sec = 0;
-    last_mtime_model_file.tv_nsec = 0;
 
     netfilter_ops.hook = packet_hook;
     netfilter_ops.pf = PF_INET;
