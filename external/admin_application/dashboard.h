@@ -18,7 +18,8 @@ class Dashboard {
 
     std::map<std::string, PCInfo> *pc_map = nullptr;
     std::vector<MessageReceived> *msg_history_vector = nullptr;
-    PCInfo const *pc_context_menu_selected = nullptr;
+    std::string pc_context_menu_id_selected;
+    // PCInfo const *pc_context_menu_selected = nullptr;
 
     std::unique_ptr<std::map<std::string, TopologyEntry>> training_topology_map = nullptr;
     std::map<std::string, int> training_pc_mode_before;

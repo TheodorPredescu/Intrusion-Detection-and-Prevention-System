@@ -132,7 +132,8 @@ void Dashboard::draw_pc(const PCInfo &pc, const bool blink_visible) {
             pc_id_selected = pc.pc_id;
             page = Page::ClientDetail;
         } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-            pc_context_menu_selected = &pc;
+            // pc_context_menu_selected = &pc;
+            pc_context_menu_id_selected = pc.pc_id;
             ImGui::OpenPopup("pc_context_menu");
         }
     }
@@ -176,27 +177,38 @@ void Dashboard::draw(const double &current_time) {
 
     // Popup on right click on a pc component.
     if (ImGui::BeginPopup("pc_context_menu")) {
-        ImGui::Text("PC: %s", pc_context_menu_selected->pc_id.c_str());
-        ImGui::Separator();
+        const PCInfo *ctx_pc = nullptr;
+        if (!pc_context_menu_id_selected.empty()) {
+            auto it = pc_map->find(pc_context_menu_id_selected);
+            if (it != pc_map->end()) {
+                ctx_pc = &it->second;
+            }
+        }
 
-        if (ImGui::MenuItem("View Details")) {
-            pc_id_selected = pc_context_menu_selected->pc_id;
-            page = Page::ClientDetail;
-            ImGui::CloseCurrentPopup();
-        }
-        if (ImGui::MenuItem("Edit Config")) {
-            pc_id_selected = pc_context_menu_selected->pc_id;
-            page = Page::ClientDetail;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::Separator();
-        if (ImGui::MenuItem("Restart")) {
-            std::cout << "Restart " << pc_context_menu_selected->pc_id << "\n";
-            ImGui::CloseCurrentPopup();
-        }
-        if (ImGui::MenuItem("Delete")) {
-            std::cout << "Delete " << pc_context_menu_selected->pc_id << "\n";
-            ImGui::CloseCurrentPopup();
+        if (ctx_pc) {
+
+            ImGui::Text("PC: %s", ctx_pc->pc_id.c_str());
+            ImGui::Separator();
+
+            // if (ImGui::MenuItem("View Details")) {
+            //     pc_id_selected = pc_context_menu_selected->pc_id;
+            //     page = Page::ClientDetail;
+            //     ImGui::CloseCurrentPopup();
+            // }
+            if (ImGui::MenuItem("Edit Config")) {
+                pc_id_selected = ctx_pc->pc_id;
+                page = Page::ClientDetail;
+                ImGui::CloseCurrentPopup();
+            }
+            // ImGui::Separator();
+            // if (ImGui::MenuItem("Restart")) {
+            //     std::cout << "Restart " << ctx_pc->pc_id << "\n";
+            //     ImGui::CloseCurrentPopup();
+            // }
+            // if (ImGui::MenuItem("Delete")) {
+            //     std::cout << "Delete " << ctx_pc->pc_id << "\n";
+            //     ImGui::CloseCurrentPopup();
+            // }
         }
 
         ImGui::EndPopup();
@@ -204,7 +216,8 @@ void Dashboard::draw(const double &current_time) {
         // Popup is open this frame
         is_context_menu_opened = true;
     } else if (is_context_menu_opened) {
-        pc_context_menu_selected = nullptr;
+        // pc_context_menu_selected = nullptr;
+        pc_context_menu_id_selected.clear();
         is_context_menu_opened = false;
     }
 
