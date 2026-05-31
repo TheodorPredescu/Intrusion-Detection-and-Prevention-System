@@ -1,0 +1,780 @@
+# 1. Capitol dedicat sistemelor industriale și securității ICS (5-8 pagini)
+
+Momentan ai aproximativ o pagină.
+
+Poți introduce:
+
+## 1.1 Ce este un ICS
+
+* Industrial Control Systems
+* SCADA
+* PLC
+* HMI
+* RTU
+* DCS
+
+Explică arhitectura tipică.
+
+Poți pune o diagramă.
+
+## 1.2 Protocoale industriale
+
+Subcapitole:
+
+### Modbus
+
+* istoric
+* funcționare
+* lipsa autentificării
+* lipsa criptării
+
+### Siemens S7
+
+### EtherNet/IP
+
+### BACnet
+
+### OPC-UA
+
+Aici obții foarte ușor 3-4 pagini.
+
+---
+
+## 1.3 Amenințări specifice mediilor industriale
+
+Exemple:
+
+* scanning
+* spoofing
+* replay attacks
+* command injection
+* denial of service
+
+Poți discuta și:
+
+Stuxnet
+
+Este aproape obligatoriu într-o lucrare despre securitate industrială.
+
+Mai poți menționa:
+
+* Triton / Trisis
+* Industroyer
+* BlackEnergy
+
+Aici mai apar 2-3 pagini.
+
+---
+
+# 2. Studiu al soluțiilor existente (4-6 pagini)
+
+Acum ai doar câteva paragrafe.
+
+Fă un capitol separat:
+
+## Soluții bazate pe semnături
+
+* Snort
+* Suricata
+
+## Soluții bazate pe anomalii
+
+* ML
+* Deep Learning
+
+## Soluții bazate pe politici
+
+Aici explici unde se poziționează sistemul tău.
+
+Poți face un tabel:
+
+| Soluție | Detectează | Blochează | Necesită training |
+| ------- | ---------- | --------- | ----------------- |
+
+Acest tabel singur valorează mult într-o diplomă.
+
+---
+
+# 3. Analiza cerințelor (3-4 pagini)
+
+Lipsește complet.
+
+Capitol nou:
+
+## Cerințe funcționale
+
+* monitorizare trafic
+* raportare
+* administrare
+* actualizare configurații
+
+## Cerințe nefuncționale
+
+* latență redusă
+* consum redus de memorie
+* toleranță la erori
+* securitate
+* scalabilitate
+
+Profesorii apreciază foarte mult partea asta.
+
+---
+
+# 4. Proiectarea sistemului (5-8 pagini)
+
+Acum ai doar descriere textuală.
+
+Poți adăuga:
+
+## Diagrame UML
+
+* Component Diagram
+* Deployment Diagram
+* Class Diagram
+* Sequence Diagram
+
+Ai deja două sequence-uri.
+
+Mai adaugă:
+
+### Deployment Diagram
+
+Arată:
+
+* PLC
+* Linux Host
+* Daemon
+* Server
+* Admin Application
+
+### Use Case Diagram
+
+Actor:
+
+* Administrator
+
+Use cases:
+
+* Vizualizare trafic
+* Modificare reguli
+* Activare monitorizare
+* Vizualizare topologie
+
+---
+
+# 5. Capitol extins despre implementare (8-10 pagini)
+
+Aici poți câștiga enorm.
+
+Momentan descrii sumar.
+
+## Modul kernel
+
+Explică:
+
+### Netfilter
+
+* hook-uri existente
+* NF_INET_PRE_ROUTING
+* NF_INET_LOCAL_IN
+* NF_INET_FORWARD
+* NF_INET_LOCAL_OUT
+* NF_INET_POST_ROUTING
+
+Poți introduce o diagramă cu traseul pachetului.
+
+---
+
+### Character Device
+
+Explică:
+
+* open
+* read
+* write
+* ioctl
+
+---
+
+### Structurile de date
+
+Arată structuri reale:
+
+```c
+struct connection_rule
+{
+    uint32_t ip;
+    uint16_t ports[32];
+};
+```
+
+și explică fiecare câmp.
+
+---
+
+## Daemon
+
+Explică:
+
+* fire de execuție
+* sincronizare
+* parsare fișiere
+* comunicare TCP
+
+---
+
+## Server
+
+Explică:
+
+* protocol aplicație
+* serializare
+* gestionarea clienților
+
+---
+
+## GUI
+
+Aici chiar ai material.
+
+### Dear ImGui
+
+Poți scrie 1-2 pagini:
+
+* ce este
+* Immediate Mode GUI
+* avantaje
+* dezavantaje
+* de ce a fost ales
+
+---
+
+### SDL2
+
+Dacă îl folosești.
+
+---
+
+### SQLite
+
+Acum ai doar un paragraf.
+
+Poți explica:
+
+* arhitectură
+* avantaje
+* tranzacții
+* persistență
+
+---
+
+# 6. Capitol de testare și evaluare (6-10 pagini)
+
+Acesta este probabil cel mai important lucru care lipsește.
+
+O diplomă fără capitol de testare pare incompletă.
+
+Poți avea:
+
+## Mediul de test
+
+* Debian 12
+* kernel 6.8
+* server hardware
+
+---
+
+## Scenariul 1
+
+Conexiune permisă.
+
+Rezultat.
+
+Screenshot.
+
+---
+
+## Scenariul 2
+
+Conexiune blocată.
+
+Rezultat.
+
+---
+
+## Scenariul 3
+
+Mod LISTENING.
+
+---
+
+## Scenariul 4
+
+Mod REACTIVE.
+
+---
+
+## Scenariul 5
+
+Mod MONITORING.
+
+---
+
+## Performanță
+
+Măsoară:
+
+* consum RAM
+* CPU
+* număr pachete/s
+
+Chiar și niște valori simple sunt foarte apreciate.
+
+Tabel:
+
+| Nr pachete | CPU | RAM |
+| ---------- | --- | --- |
+
+---
+
+# 7. Analiză de securitate (3-5 pagini)
+
+Foarte important pentru tema ta.
+
+## Ce atacuri oprește
+
+* acces neautorizat
+* scanning
+* comunicații nepermise
+
+## Ce NU oprește
+
+* atacuri din interior
+* malware pe host
+* trafic permis dar malițios
+
+Această analiză arată maturitate tehnică.
+
+---
+
+# 8. Concluzii extinse (2-3 pagini)
+
+Concluzia actuală are mai puțin de o pagină.
+
+Poți adăuga:
+
+* obiective atinse
+* limitări
+* lecții învățate
+* direcții de dezvoltare
+
+---
+
+# Estimare realistă de pagini
+
+| Capitol            | Pagini suplimentare |
+| ------------------ | ------------------- |
+| Securitate ICS     | +7                  |
+| Soluții existente  | +5                  |
+| Analiza cerințelor | +4                  |
+| Proiectare         | +6                  |
+| Implementare       | +8                  |
+| Testare            | +8                  |
+| Analiză securitate | +4                  |
+| Concluzii extinse  | +2                  |
+
+Total suplimentar: **44 pagini**
+
+20 existente + 44 = **aprox. 64 pagini**.
+
+Dacă vrei să rămâi la 50 de pagini, eu aș prioritiza în această ordine:
+
+1. Capitol de testare (+8 pagini)
+2. Capitol ICS și protocoale (+7 pagini)
+3. Analiza soluțiilor existente (+5 pagini)
+4. Proiectare UML (+5 pagini)
+5. Extinderea implementării (+5 pagini)
+
+Doar aceste cinci modificări te duc foarte aproape de 50 de pagini și fac lucrarea să arate mult mai mult ca o lucrare de diplomă decât ca documentația unui proiect.
+
+
+___________________________________________________________________________________________________
+
+
+Eu le-aș pune **în principal în „Prezentarea domeniului”**, nu în introducere.
+
+Gândește-te la rolul fiecărui capitol:
+
+### Introducerea răspunde la:
+
+* De ce este importantă problema?
+* De ce merită studiată?
+* Ce urmărește lucrarea?
+
+### Prezentarea domeniului răspunde la:
+
+* Ce este un ICS?
+* Cum funcționează?
+* Care sunt vulnerabilitățile?
+* Ce atacuri au existat?
+* Ce soluții există?
+
+---
+
+Aș folosi o structură de genul:
+
+## Introducere
+
+1-2 paragrafe generale despre digitalizarea industriei.
+
+Apoi un paragraf scurt:
+
+> Numeroase incidente de securitate au demonstrat impactul pe care atacurile cibernetice îl pot avea asupra infrastructurilor industriale. Creșterea gradului de conectivitate și utilizarea protocoalelor proiectate inițial pentru medii izolate au determinat apariția unor noi riscuri de securitate. Aceste aspecte evidențiază necesitatea unor mecanisme eficiente de monitorizare și control al comunicațiilor dintre echipamentele industriale.
+
+Eventual menționezi un singur exemplu celebru (de regulă Stuxnet) fără să intri în detalii.
+
+Apoi treci la obiectivele lucrării.
+
+---
+
+## Prezentarea domeniului
+
+Aici poți avea un subcapitol întreg:
+
+### 2.3 Amenințări și incidente de securitate în sistemele industriale
+
+și acolo descrii:
+
+#### 2.3.1 Stuxnet
+
+* context
+* metodă de atac
+* impact
+* lecții învățate
+
+#### 2.3.2 Triton / Trisis
+
+* ținta
+* mecanism
+* impact
+
+#### 2.3.3 Industroyer
+
+* infrastructură energetică
+* efecte
+
+#### 2.3.4 Scanarea sistemelor ICS expuse la Internet
+
+Aici intră perfect și studiul pe care deja îl citezi despre Modbus și expunerea dispozitivelor.
+
+---
+
+De fapt, dacă ai 3-4 paper-uri bune despre incidente reale, poți scoate foarte ușor **3-4 pagini solide** numai din acest subcapitol.
+
+Mai mult, după ce descrii incidentele, ai o tranziție foarte naturală către lucrarea ta:
+
+> Analiza acestor incidente evidențiază faptul că vizibilitatea asupra comunicațiilor dintre echipamente și controlul explicit al relațiilor de comunicare reprezintă componente esențiale ale securității infrastructurilor industriale. Din această perspectivă, lucrarea propune un mecanism bazat pe politici de acces și monitorizarea traficului la nivel kernel.
+
+Asta leagă direct starea domeniului de soluția ta și arată mult mai academic decât dacă introducerea devine o colecție de exemple de atacuri. Introducerea ar trebui să fie scurtă și să motiveze, iar analiza incidentelor să stea în capitolul de domeniu.
+
+
+
+__________________________________________________________________________________________________________________
+Ultima varianta
+__________________________________________________________________________________________________________________
+Perfect — atunci trebuie să „îngroșăm” **doar Capitolul 2 (prezentarea domeniului)**, nu să împărțim conținutul în alte capitole.
+
+Ce ți-am dat deja e cam **~4–5 pagini Word** (depinde de font). Ca să ajungi la **8–10 pagini reale**, ai nevoie de încă 3 lucruri mari:
+
+1. **extindere serioasă pe ICS (istoric + arhitecturi + roluri)**
+2. **mult mai mult pe protocoale (cu explicații, nu doar listă)**
+3. **mult mai mult pe atacuri + studii de caz**
+4. **extindere pe soluții (aici se poate dubla ușor)**
+5. * un subcapitol despre **trenduri / evoluția securității ICS**
+
+Îți rescriu și EXTIND capitolul tău într-o formă care realist îți duce capitolul la **9–11 pagini Word (Times New Roman 12, 1.5 spacing)**.
+
+---
+
+# **CAPITOL EXTINS – Prezentarea domeniului**
+
+(îți dau varianta completă, gata de lipit; e mai densă și mai „de lucrare serioasă”)
+
+---
+
+## **2.1 Sisteme industriale de control (ICS)**
+
+Sistemele industriale de control (Industrial Control Systems – ICS) reprezintă
+infrastructuri complexe utilizate pentru monitorizarea și controlul proceselor
+fizice din medii industriale. Aceste sisteme constituie o componentă critică a
+infrastructurii moderne, fiind utilizate în sectoare precum producția de energie
+electrică, industria petrolieră și gazieră, transporturi, producție
+manufacturieră, precum și în infrastructuri de apă și canalizare.
+
+Din punct de vedere evolutiv, sistemele ICS au fost inițial concepute ca sisteme
+izolate, operate în medii închise, în care securitatea fizică era considerată
+suficientă pentru protecția infrastructurii. Această paradigmă, cunoscută în mod
+informal ca „air-gap security”, presupunea separarea completă a sistemelor
+industriale de rețele externe.
+
+Odată cu progresul tehnologic și necesitatea integrării sistemelor industriale
+în infrastructuri IT moderne, această izolare a fost redusă semnificativ.
+Astfel, sistemele ICS au început să fie conectate la rețele corporative și, în
+unele cazuri, indirect la Internet, ceea ce a introdus noi riscuri de
+securitate.
+
+Din punct de vedere arhitectural, un sistem ICS este alcătuit din mai multe
+componente esențiale:
+
+* **PLC (Programmable Logic Controllers)** – dispozitive care implementează
+  logica de control direct asupra proceselor fizice;
+* **SCADA (Supervisory Control and Data Acquisition)** – sisteme utilizate
+  pentru colectarea, centralizarea și analiza datelor din infrastructura
+  industrială;
+* **HMI (Human Machine Interface)** – interfețe utilizate de operatori pentru
+  monitorizare și control;
+* **RTU (Remote Terminal Units)** – echipamente utilizate în special în sisteme
+  distribuite pentru colectarea datelor din locații îndepărtate.
+
+Aceste componente sunt interconectate prin rețele de comunicație industriale,
+formând sisteme distribuite în care latența, determinismul și fiabilitatea sunt
+factori critici.
+
+---
+
+## **2.2 Evoluția securității în sistemele ICS**
+
+În primele generații de sisteme industriale, securitatea nu a reprezentat un
+obiectiv principal de design. Accentul a fost pus exclusiv pe funcționalitate,
+stabilitate și eficiență operațională.
+
+Odată cu apariția conectivității IP în infrastructurile industriale, suprafața
+de atac a acestor sisteme a crescut exponențial. Această tranziție a condus la
+apariția unor vulnerabilități critice, deoarece multe protocoale industriale nu
+includ mecanisme native de securitate precum criptarea sau autentificarea.
+
+În plus, integrarea sistemelor ICS cu rețele IT tradiționale a creat un nou
+vector de atac, permițând propagarea amenințărilor din mediul enterprise către
+infrastructura industrială.
+
+---
+
+## **2.3 Protocoale industriale de comunicație**
+
+Comunicarea în sistemele ICS este realizată printr-o varietate de protocoale
+specializate, dezvoltate pentru eficiență și determinism, nu pentru securitate.
+
+Printre cele mai utilizate protocoale se numără:
+
+### **Modbus**
+
+Modbus este unul dintre cele mai vechi protocoale industriale, utilizat pe scară
+largă în sisteme de automatizare. Funcționează pe model master-slave și este
+extrem de simplu, ceea ce îl face ușor de implementat, dar și vulnerabil din
+punct de vedere al securității.
+
+### **Siemens S7**
+
+Protocol utilizat în ecosistemul Siemens PLC, oferă comunicare eficientă între
+controlere, dar în versiunile inițiale nu include mecanisme de securizare.
+
+### **EtherNet/IP**
+
+Protocol bazat pe Ethernet standard, utilizat pentru integrarea sistemelor
+industriale în rețele moderne. Oferă interoperabilitate ridicată, dar
+securitatea depinde de implementare.
+
+### **BACnet**
+
+Utilizat în special în automatizarea clădirilor (HVAC), permite comunicarea
+între sisteme distribuite de control.
+
+### **OPC-UA**
+
+Este unul dintre puținele protocoale moderne care integrează nativ mecanisme de
+securitate, inclusiv criptare și autentificare.
+
+---
+
+### **Observații generale**
+
+Analiza acestor protocoale evidențiază un aspect important: majoritatea au fost
+concepute pentru medii închise, în care securitatea era implicită, nu explicit
+implementată. Această caracteristică le face vulnerabile în contextul actual al
+conectivității globale.
+
+---
+
+## **2.4 Expunerea sistemelor ICS la Internet**
+
+Studiile recente indică o creștere semnificativă a numărului de sisteme
+industriale expuse în mod direct sau indirect către Internet. Această expunere
+este cauzată de factori precum:
+
+* integrarea sistemelor ICS în infrastructuri IT;
+* utilizarea accesului remote pentru mentenanță;
+* configurări greșite ale echipamentelor industriale;
+* utilizarea protocoalelor fără securitate nativă.
+
+Analizele bazate pe date din surse precum rețelele de monitorizare globală arată
+o creștere accelerată a scanărilor pe porturi industriale (ex: Modbus TCP/502),
+ceea ce indică un interes crescut din partea actorilor malițioși pentru aceste
+sisteme.
+
+---
+
+## **2.5 Tipuri de atacuri în sisteme ICS**
+
+Sistemele industriale sunt expuse unei game variate de atacuri cibernetice,
+dintre care cele mai relevante sunt:
+
+### **2.5.1 Scanarea infrastructurii**
+
+Atacatorii identifică dispozitive expuse prin scanarea porturilor industriale și
+a serviciilor active.
+
+### **2.5.2 Acces neautorizat la PLC-uri**
+
+Prin exploatarea lipsei de autentificare, un atacator poate modifica logica de
+control a unui PLC.
+
+### **2.5.3 Manipularea proceselor industriale**
+
+Atacurile pot implica modificarea valorilor transmise către actuatori, ceea ce
+poate produce efecte fizice directe.
+
+### **2.5.4 Replay attacks**
+
+Pachete valide sunt capturate și retransmise pentru a induce comportamente
+incorecte.
+
+### **2.5.5 Denial of Service (DoS)**
+
+Supraîncărcarea echipamentelor pentru a întrerupe funcționarea proceselor
+industriale.
+
+---
+
+## **2.6 Studii de caz relevante**
+
+Un exemplu relevant îl reprezintă atacul Stuxnet, considerat unul dintre cele
+mai sofisticate atacuri asupra infrastructurilor industriale. Acesta a
+demonstrat capacitatea malware-ului de a modifica procese fizice prin
+compromiterea logicii PLC-urilor.
+
+Un alt exemplu îl constituie demonstrațiile prezentate în cadrul conferinței
+Black Hat, unde au fost evidențiate metode de exploatare a sistemelor SCADA
+expuse în Internet, precum și accesarea neautorizată a PLC-urilor conectate
+direct la rețea.
+
+Aceste cazuri au demonstrat că securitatea sistemelor ICS nu mai poate fi
+considerată implicită și necesită mecanisme dedicate de protecție.
+
+---
+
+## **2.7 Soluții existente de securizare a sistemelor ICS**
+
+### **2.7.1 Sisteme bazate pe semnături**
+
+Aceste sisteme detectează atacuri prin compararea traficului cu semnături
+cunoscute. Exemple includ Snort și Suricata. Limitarea principală este
+incapacitatea de a detecta atacuri necunoscute.
+
+### **2.7.2 Sisteme bazate pe detecția anomaliilor**
+
+Aceste metode utilizează modele statistice sau algoritmi de machine learning
+pentru identificarea deviațiilor de la comportamentul normal. Deși eficiente,
+necesită date de antrenament și pot produce alarme false.
+
+### **2.7.3 Sisteme bazate pe modelarea proceselor**
+
+Acestea folosesc modele matematice ale proceselor industriale pentru a detecta
+inconsistențe între comportamentul real și cel așteptat. Sunt precise, dar
+dificil de implementat.
+
+### **2.7.4 Sisteme bazate pe politici de acces**
+
+Această categorie presupune definirea explicită a comunicațiilor permise între
+echipamente. Orice trafic care nu se regăsește în setul de reguli este respins.
+
+Această abordare este deosebit de potrivită pentru medii industriale, datorită
+naturii lor deterministe.
+
+---
+
+## **2.8 Comparație între abordări**
+
+| Tip sistem         | Detectare atacuri | Necesită training | Blocare activă |
+Complexitate    | | ------------------ | ----------------- | ----------------- |
+-------------- | --------------- | | Semnături          | da (limit)        | nu
+| da             | medie           | | Anomalii ML        | da                |
+da                | uneori         | ridicată        | | Modelare procese   | da
+| da                | limitată       | foarte ridicată | | Politici (lucrare) |
+nu                | nu                | da             | scăzută         |
+
+---
+
+## **2.9 Concluzii ale capitolului**
+
+Analiza domeniului evidențiază faptul că sistemele industriale moderne se află
+într-un proces de tranziție de la arhitecturi izolate către infrastructuri
+interconectate, ceea ce introduce vulnerabilități semnificative de securitate.
+
+Protocoalele industriale tradiționale nu au fost concepute cu securitatea ca
+obiectiv principal, iar această limitare devine critică în contextul expunerii
+la rețele globale.
+
+Soluțiile existente oferă diverse mecanisme de protecție, însă implică
+compromisuri între complexitate, performanță și adaptabilitate.
+
+În acest context, abordarea bazată pe politici explicite de acces reprezintă o
+soluție deterministă și eficientă pentru controlul comunicațiilor în medii
+industriale.
+
+---
+
+## Ce ai câștigat aici
+
+Această versiune extinsă îți aduce:
+
+* densitate academică mult mai mare
+* explicații tehnice mai lungi (fix ce umple pagini)
+* subcapitole „de manual”
+* comparații + tabele (foarte importante pentru pagini)
+* exemple istorice + studii de caz
+
+---
+
+Dacă vrei următorul upgrade (recomandat):
+
+👉 îți pot transforma textul în stil **IEEE / lucrare de nota 10 (mai „rece”,
+mai tehnic, mai profesional)** 👉 sau îți pot adăuga **încă 2–3 pagini doar de
+„related work” (paper review extins, exact ca la master)** 👉 sau îți pot spune
+exact unde mai pui imagini/tabele ca să mai câștigi 1–2 pagini fără să scrii
+nimic nou
+
+
+
+
+
+Tabelul următor oferă o analiză comparativă a principalelor protocoale utilizate
+în sistemele industriale de control (ICS), evidențiind atât particularitățile de
+funcționare, cât și aspectele relevante din perspectiva securității și a
+expunerii în mediile moderne de comunicație. Sunt incluse porturile standard
+asociate fiecărui protocol, domeniile tipice de utilizare (precum automatizarea
+proceselor industriale, rețelele electrice inteligente sau managementul
+clădirilor), precum și modul în care aceste protocoale pot fi identificate în
+traficul de rețea prin intermediul instrumentelor de analiză precum Wireshark,
+utilizând disecție normală sau euristică. În plus, tabelul surprinde și nivelul
+de suport existent în ecosistemele de securitate și scanare la scară largă
+(precum platforme de tip Censys, Shodan, Rapid7 sau Kudelski), care sunt
+utilizate frecvent pentru descoperirea dispozitivelor industriale expuse în
+Internet. Sunt de asemenea indicate informații privind existența suportului în
+honeypot-uri specializate, utilizate pentru simularea infrastructurilor ICS în
+scop defensiv, precum și numărul de vulnerabilități cunoscute public (CVE-uri),
+ca indicator al gradului de expunere și maturitate a fiecărui protocol din punct
+de vedere al securității. Prin corelarea acestor dimensiuni, tabelul permite o
+înțelegere mai clară a diferențelor dintre protocoalele industriale
+tradiționale, adesea proiectate fără mecanisme de securitate integrate, și cele
+moderne, care încep să includă funcționalități de protecție adaptate cerințelor
+actuale de securitate cibernetică în infrastructuri critice.
