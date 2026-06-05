@@ -1,0 +1,62 @@
+	Merg mutate in PREZENTAREA DOMENIULUI
+Într-un studiu al protocoalelor folosite în mediul industrial — Printre aceste protocoale analizate se numără Modbus, Siemens S7, EthernetIP, BACnet, OMRON FINS, Codesys — s-a constatat faptul că acestea au fost proiectate pentru medii izolate, fără a include mecanisme de securitate precum criptarea sau autentificarea. [10]
+Analiza traficului industrial de control (ICS) arată o creștere semnificativă a expunerii echipamentelor tehnice la Internet. Studii bazate pe date din „CAIDA/UCSD network telescope” arată faptul că traficul asociat protocolului Modbus (TCP/502) nu a înregistrat variații semnificative până la începutul anului 2014, dar ulterior a fost observată o creștere bruscă de aproximativ trei ordine de mărime în numărul de adrese IP scanate și aproximativ un ordin de mărime în numărul de surse ce scanează activ Internetul.
+Creșterea aceasta este corelată cu apariția și popularizarea instrumentelor de scanare la scară largă, precum și interesul crescut al comunității de cercetare și expunerea publică a infrastructurilor publice. Acestea evidențiază faptul că ecosistemul ICS devine din ce în ce mai expus în mediul Internet global, ceea ce impune necesitatea unor metode riguroase de identificare și filtrare a traficului ICS.
+Aplicația prezentată în această lucrare propune o soluție de securizare împotriva acestor factori externi, prin utilizarea unui sistem de control bazat pe politici. Soluția permite monitorizarea și filtrarea traficului dintre echipamente, oferind posibilitatea definirii clare a conexiunilor permise. Această abordare este destinată în special mediilor industriale, unde relațiile de comunicare dintre componente sunt bine definite și necesită un nivel ridicat de control și predictibilitate.
+
+- după clasele de echipamente si pasajul dupa ele
+Pe măsura creșterii în complexitate a ecosistemului digital, securitatea aplicațiilor și a serviciilor ia forme tot mai complexe, devenind tot mai dificilă și mai importantă. Pentru a funcționa în mod eficient și a fi utilizate la capacitate maximă, aceste servicii necesită un nivel ridicat de securitate, capabil să protejeze împotriva numeroaselor tipuri de atacuri.
+
+
+
+
+Lucrările recente din domeniul securității sistemelor industriale se concentrează predominant pe detectarea anomaliilor prin metode statistice și de învățare automată. Jonguk Kim, Jeong-Han Yun și  Hyoung Chun Kim [4] propun o metodă de detecție bazată pe rețele neuronale de tip sequence-to-sequence, antrenate pe date operaționale normale, care identifică abateri prin analiza erorilor de predicție. Luyao Wang et al. [5] extinde această direcție, prezentând tehnici de transfer learning și clustering, adresând problema variației distribuției traficului între scenarii diferite. Deși eficiente în detectarea comportamentelor anormale, ambele abordări sunt în esență reactive și dependente de seturi de date reprezentative, informații ce se pot dovedi dificil de obținut în medii industriale reale. 
+
+
+
+__ those should be moved down
+
+Lucrarea de față adoptă o perspectivă diferită asupra problemei. În locul unui model care învață să distingă traficul normal de cel anormal, soluția propusă se bazează pe un mecanism de control explicit, în care conexiunile permise sunt definite în mod direct de administratorul sistemului. Filtrarea traficului se realizează la nivel kernel, oferind o reacție superioară de răspuns și un grad ridicat de control asupra comunicațiilor din rețea. Această abordare elimină dependența de date de antrenament și reduce ambiguitatea specifică modelelor probabilistice, oferind în același timp moduri de funcționare flexibile care permit adaptarea dinamică a politicilor de acces în funcție de cerințele operaționale.
+Componenta designată echipamentelor monitorizate utilizează mecanisme de inspecție și filtrare în spațiul de rulare kernel specifice sistemelor de operare de tip Linux. Soluția presupune interceptarea și preluarea informațiilor de interes a pachetelor de date în puncte critice ale fluxului acestora, urmată de o filtrare eficientă și rapidă. Informații despre pachetele analizate sunt apoi transmise unei unități centrale pentru o inspecție generală.
+Filtrarea acestora se realizează pe baza unei liste definite de utilizator ce se regăsește în memoria nevolatilă a unității (pe disc), care specifică atât adresele autorizate pentru comunicare, cât și porturile pe care acestea le pot folosi. 
+
+__ nush daca mi place concluzia asta___
+Cele trei cazuri prezentate ilustrează evoluția amenințărilor la adresa sistemelor ICS: de la atacuri sofisticate, sponsorizate de state naționale cu obiective geopolitice precise, la incidente mai puțin complexe tehnic, cu potențial de impact imediat asupra siguranței publice. Această diversitate a actorilor și motivațiilor confirmă că securitatea sistemelor industriale repreznită o problemă de interes general, care depășește cadrul strict al securității informatice și se extinde în sfera siguranței fizice și a infrastructurilor critice.
+
+
+-ce tipuri de intruziuni pot sa apară
+-intruziuni cunoscute
+
+-solutii asemanatoare/cunoscute/anternative de rezolvare a problemei
+Soluții bazate pe semnături: Snort, Suricata
+Soluții bazate pe anomalii: ML, Deep Learning
+Soluții bazate pe politici - Aici explici unde se poziționează sistemul tău.
+| Soluție | Detectează | Blochează | Necesită training |
+
+
+
+Serviciile de securitate sunt supuse unor cerințe în continuă creștere, dorindu-se adaptarea atât la complexitatea amenințărilor, cât și la volumul tot mai mare de trafic generat de creșterea numărului de utilizatori și a dispozitivelor conectate. 
+În mod particular, mediile industriale impun cerințe suplimentare de securitate, datorită infrastructurilor critice și necesității funcționării stabile. În aceste scenarii, schimbul de date  dintre echipamente este strict regulat și supus unui nivel de control ridicat, pentru a preveni degradarea performanței sau chiar oprirea funcționării echipamentelor. Din acest motiv, soluțiile de securitate destinate mediilor industriale trebuie să ofere mecanisme eficiente de monitorizare, filtrare și control al comunicațiilor dintre dispozitive.
+
+	TODO: statistici mai detaliate despre intruziuni
+
+Un serviciu de securitate are rolul de a proteja sistemele împotriva acțiunilor nedorite și a actorilor malițioși, prin identificarea și remedierea vulnerabilităților existente. În acest context, mecanismele de protecție trebuie să funcționeze în mod riguros și continuu, acoperind un spectru cât mai larg de puncte slabe. În sens contrar, compromiterea sistemelor poate fi realizată prin exploatarea unei singure vulnerabilități neidentificate sau tratate insuficient. Această realitate evidențiază necesitatea menținerii unui standardul ridicat pentru mecanismele de securizare, ceea ce impune dezvoltarea unor soluții eficiente, adaptabile și capabile să răspundă în timp real la evoluția amenințărilor.
+
+
+
+
+
+
+Această componentă reprezintă un agent local, „daemon”, ce rulează în spațiul utilizatorului. Limbajul ales pentru crearea acestei componente a fost C++, pentru a utiliza componente cu un grad de abstractizare mai mare, păstrând totodată o putere și viteză ridicată de procesare. Agentul este responsabil de trimiterea informațiilor extrase de către componenta de filtrare spre unitatea centrală. 
+O sarcină cu același nivel de prioritate a componentei este aceea de informare a componentei de filtrare asupra noilor configurații și reguli ce au fost modificate sau adăugate de către componenta de administrare. Această componentă face sincronizarea de informații prezente în aplicația desktop și natura curentă de funcționare a echipamentelor.
+De asemenea, componenta este responsabilă de stocarea locală a configurației componentei, actualizarea acesteia și transmiterea acestor informații la începutul rulării programului. Aceste informații se vor regăsi în trei fișiere.
+La activarea procesului, agentul începe prin citirea fișierului de configurații principal, „mymodule.conf”. În acest fișier se vor regăsi informații generale esențiale conectării la componenta centrală (adresa IP a serverului și portul prin care se va face comunicarea cu acesta), precum și informații referitoare la natura filtrării pe care modulul kernel trebuie sa o respecte (modul curent de rulare: LISTENING, MONITORING, REACTIVE, DISABLED). De asemenea, fișierul cuprinde locația fișierului designat definirii dispozitivelor permise.
+Formatul folosit pentru stocarea acestor informații este simplist, accentul fiind pe facilitarea citirii cât mai rapide de către procesul designat. În acest fișier, fiecare linie va cuprinde o adresă a cărui acces este permis, existând posibilitatea de a specifica în continuarea adreselor o listă de porturi specifice. Pentru a restricționa comunicarea unei adrese IP la un număr de porturi, adresa va fi continuată de porturile permise: a); iar pentru a oferi abilitatea de comunicare pe orice port, lista porturilor va fi omisă, fiind necesară doar adresa dispozitivului extern: b).
+
+192.168.0.111: 80, 81, 1234	a)
+192.168.0.111	b)
+
+Informațiile referitoare la modul curent de rulare și lista utilizatorilor permiși sunt transmise în continuare modulului kernel. La modificărilor de configurare făcute de către administrator, noile reguli vor ajunge la daemon prin intermediul serverului, urmând ca aceste informații să fie rescrise în fișiere și retransmise componentei de filtrare.
+Similar transmiterii de informații descriptive, programul trimite periodic mesaje către server pentru a verifica apariția modificărilor produse de către administrator, caz în care se activează secvența de actualizare a informațiilor de configurare.
+Pentru distingerea dispozitivelor în urma posibilelor modificări interne, componenta centrală este responsabilă de acordarea unui UUID generat automat la momentul primei comunicări cu acesta. ID-ul generat va fi stocat într-un fișier separat celui de configurații general, și anume în „mymodule_id”, fiind responsabil de a oferi acest identificator odată cu transmiterea informațiilor referitoare la pachetele raportate.
+
