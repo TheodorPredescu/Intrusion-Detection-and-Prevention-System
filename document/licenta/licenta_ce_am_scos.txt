@@ -60,3 +60,159 @@ Informațiile referitoare la modul curent de rulare și lista utilizatorilor per
 Similar transmiterii de informații descriptive, programul trimite periodic mesaje către server pentru a verifica apariția modificărilor produse de către administrator, caz în care se activează secvența de actualizare a informațiilor de configurare.
 Pentru distingerea dispozitivelor în urma posibilelor modificări interne, componenta centrală este responsabilă de acordarea unui UUID generat automat la momentul primei comunicări cu acesta. ID-ul generat va fi stocat într-un fișier separat celui de configurații general, și anume în „mymodule_id”, fiind responsabil de a oferi acest identificator odată cu transmiterea informațiilor referitoare la pachetele raportate.
 
+
+
+Aceasta gestionează conexiunile active dintre toate dispozitivele din rețea, asigurând astfel fluxul continuu de informații și funcționalitatea corectă a întregului sistem. 
+Unul dintre rolurile principale pe care le îndeplinește componenta centrală este acela de colectare și centralizare a datelor primite de la componentele de intermediere. Informațiile recepționate sunt procesate și reformate într-o structură simplificată, astfel încât să poată fi interpretate și utilizate eficient de componenta de administrare pentru monitorizare, analiză și configurare.
+De asemenea, componenta centrală are responsabilitatea de a distribui către echipamente modificările de configurare ce au fost făcute prin aplicația desktop. Configurațiile selectate de utilizator sunt preluate, procesate și transformate în instrucțiuni compatibile cu dispozitivele țintă, după care sunt transmise către acestea pentru actualizarea modului de funcționare. Prin acest mecanism se asigură sincronizarea permanentă dintre setările definite în interfața de administrare și comportamentul efectiv al echipamentelor din sistem.
+Informațiile ce trec prin această componentă sunt stocate într-o bază de date pentru a putea fi inspectate ulterior de către administrator, reprezentând o metodă simplistă de „vizualizare  a istoricului”. Pentru crearea și menținerea bazei de date s-a utilizat biblioteca SQLite. SQLite este o bibliotecă software care implementează un motor de baze de date SQL definit de consumul redus de resurse, natura tranzacțională, fără server dedicat ce oferă atât viteză ridicată de acces și scriere a datelor, cât și portabilitate și ușurință de integrare cu aplicația.
+Odată cu ajungerea datelor în componenta centrală, acestea sunt salvate în baza de date. La pornire, aplicația verifică existența în directorul curent a bazei de date cu numele „network_logs.db”, iar în cazul în care aceasta nu este găsită, este creată automat, împreună cu cele două tabele SQL aferente
+
+
+
+
+
+ Aceasta va oferi flexibilitate în modificarea configurațiilor echipamentelor. Prin aceasta, administratorul rețelei poate altera atât modul de rulare, cat și regulile de acces a conexiunilor. De asemenea, aplicația oferă posibilitatea de vizualizare sub forma unui graf a dispozitivelor și a traficului de date a acestora.
+	TODO: Mai lungeste aici
+	Vorbeste si despre Imgui
+	Lungeste toate liburile folosite
+Această funcționalitate este creată cu ajutorul utilitarului open-source specializat vizualizărilor grafice  Graphviz [7], versiunea 2.43.0 (0), prin intermediul algoritmului „fdp” (Force-Directed Placement), destinat generării automate a grafurilor pe baza relațiilor dintre noduri. Conexiunile dintre echipamente sunt transformate într-un fișier temporar în format DOT, format standard utilizat de Graphviz pentru descrierea grafurilor. Ulterior, aplicația execută procesul de generare a pozițiilor nodurilor și citește coordonatele rezultate pentru afișarea topologiei în interfața grafică [Fragment de cod 2. Generare graf].
+
+    // Preluare locația fișierelor temporale
+    std::string temp_dir;
+#ifdef _WIN32
+    char temp_path[MAX_PATH];
+    GetTempPathA(MAX_PATH, temp_path);
+    temp_dir = temp_path;
+#elif __linux__
+    temp_dir = "/tmp/";
+#endif
+
+    std::string dot_file_path = temp_dir + "graph.dot";
+    std::string txt_file_path = temp_dir + "graph.txt";
+
+    // Generare dot_file
+    std::string dot = "graph G {\n";
+    dot += "node [shape=box];\n";
+    dot += "graph [overlap=false, sep=\"1\", K=0.1];\n";
+
+...
+
+#ifdef _WIN32
+    std::string cmd = "fdp -Tplain -Gstart=2 \"" + dot_file_path + "\" -o \"" + txt_file_path + "\"";
+#else
+    std::string cmd = "fdp -Tplain -Gstart=2 " + dot_file_path + " -o " + txt_file_path + " 2>/dev/null";
+#endif
+    system(cmd.c_str());
+Fragment de cod 2. Generare graf
+
+Utilizarea algoritmului „fdp” permite distribuirea automată și echilibrată a nodurilor, reducând suprapunerile și îmbunătățind lizibilitatea reprezentării grafice.
+
+Aplicația este compusă din patru componente logice distribuite pe trei medii de execuție distincte: componenta de filtrare și componenta de intermediere rulează la nivelul echipamentului ce va fi monitorizat, componenta centrală care funcționează ca server, iar componenta de administrare, care reprezintă interfața utilizată pentru configurarea și monitorizarea sistemului. Relația dintre aceste medii de execuție este descrisă de diagrama de componente [Imagine 1. Diagramă de componente].
+ 
+Imagine 1. Diagramă de componente
+
+Pentru a evidenția procesul de transmitere a datelor în cadrul aplicației, au fost realizate două diagrame secvențiale. Prima diagramă ilustrează traseul parcurs de informațiile asociate pachetelor interceptate de componenta de filtrare [Imagine 2. Diagramă secvențială - informații pachete]. 
+
+
+
+
+
+
+
+Clasa Dashboard implementează pagina principală a aplicației. Aceasta oferă o vedere centralizată a întregii stări a rețelei monitorizate. La fiecare interval de împrospătare sunt solicitate de la componenta centrală două liste: prin funcția get_pc_info se va cere lista tuturor echipamentelor înregistrate și istoricul recent al evenimentelor globale, iar prin get_message_history un scurt istoric al celor mai recente evenimente globale petrecute.
+Fiecare echipament din listă este randat ca și un dreptunghi cu dimensiune fixă, a cărui culoare de fundal reflectă modul curent de funcționare al echipamentului. Această personalizare a culorii se face prin funcția get_mode_background_color. Pentru modurile MONITORING și REACTIVE, funcția este de asemenea responsabilă de realizarea efectului de clipire pentru a atrage atenția utilizatorului asupra echipamentele aflate în aceste stări. Acest efect este realizat prin alternarea opacității fundalului între două valori la fiecare jumătate de secundă, calculată pe baza variabilei blink_time ce cronometrează timpul trecut cu ajutorul variabilei DeltaTime furnizat de biblioteca ImGui, variabilă ce reprezintă timpul trecut de la un frame la altul. În interiorul dreptunghiului este de asemenea afișată iconița reprezentativă echipamentului ca și textură OpenGL, alături de informații de identificare  și modul curent, afișate în manieră textuală. Fiecare element reprezentativ echipamentului este interactiv, recunoscând acțiunea de click stânga și click stânga. La apăsarea clickului stânga ce va face navigarea către pagina individuală a echipamentului, iar la cel dreapta se va deschide un meniu contextual cu opțiunea de editare a configurației.
+În aceeași pagină este afișat și un flux cronologic al evenimentelor raportate de toate echipamentele, limitat la primele 20 a celor mai recente. Fiecare eveniment este randat ca o linie de text colorată conform modului de funcționare activ la modul raportării, afișând un marcaj de timp, alături de adresele IP, porturile implicate la comunicare și protocolul identificat prin nume ((TCP, UDP, ICMP etc.), formatate de funcția transform_messages_to_str.
+Funcționalitatea de antrenare incrementală globală, activată printr-un buton Train, iterează prin toate echipamentele din pc_map și trimite fiecăruia o configurație a cărui mod de funcționare este schimbat la MONITORING, salvând mai întâi modul curent al fiecărui echipament într-un dicționar. La dezactivarea antrenării, datele de topologie acumulate pe durata sesiunii sunt procesate prin funcția merge_allowed_with_ports_map, care este responsabilă de combinarea intrărilor existente din fișierul de conexiuni permise cu porturile noi observate, generând astfel un fișier actualizat al conexiunilor permise. Acest fișier, împreună cu modul de funcționare prezent înainte de antrenare, este transmis fiecărui echipament prin send_config_via_api.
+Pagina individuală a echipamentului – HostDetail
+Clasa HostDetail implementează pagina reprezentativă unui echipament, ce se diferențiază de cea generală flexibilitatea de a edita și vizualiza în întregime configurațiile echipamentului. Datorită posibilității de modificare, starea pagini este distribuită pe mai multe categorii: informații originale, reprezentative configurației ce se găsește și pe echipament, a căror informații se reîmprospătează periodic; informații nesalvate, ce va cuprinde totalitatea modificărilor pe care utilizator le va aduce, și care vor fi transmise către componenta centrală când se dorește salvarea modificărilor aduse. Aceste tipuri de informații sunt împărțite în continuare în funcție de tipul informației reținute: informațiile fișierului de configurații, a fișierului de conexiuni permise și a informațiilor generale. În momentul modificării datelor unui tip de informații, acea zonă este marcată ca și „diferită” prin câmpurile booleene: changed_config_checker, changed_allowed_file_checker, changed_general_checker.
+La navigarea către un echipament nou sau la solicitarea explicită de reîmprospătare, metoda update_new_frame este apelată cu parametrul force_update, ce declanșează resetarea tuturor câmpurilor modificabile și reîncărcarea datelor de la server. Datele primite sunt parcurse din formatul JSON, iar câmpurile relevante sunt extrase și distribuite corespunzător. Modul curent de funcționare este extras din conținutul fișieruliu de configurare prin funcția extract_current_state, care caută textual una dintre valorile LISTENING, MONITORING, REACTIVE sau DISABLED, insensibil la capitalizare. Iconița este decodată din formatul base64, decomprimată prin stb_image și incărcată ca textură OpenGL.
+Secțiunea de configurare a fișierului mymodule.conf prezintă câmpuri de input pentru adresa IP a serverului, portul de comunicare și calea fișierului de conexiuni permise, toate cu validare imediată. Portul este validat la modificare pentru a se încadra în intervalul 1-65535, intervalul reprezentativ porturilor în Linux, cu eșuarea salvării în caz contrar. Modul de funcționare este selectabil printr-un control dropdown în care fiecare opțiune este afișată cu fundal reprezentativ modului reprezentat.
+Lista conexiunilor permise este afișată ca o colecție editabilă de intrări, fiecare cu butoane individuale de editare și ștergere. Orice modificare a listei schimbă valoarea booleanului changed_allowed_file_checker. Un indicator vizual UNSAVED CHANGES apare în colțul din dreapta sus al secțiunii de configurare atunci când oricare dintre flag-urile de modificare este activ, informând astfel administratorul că există modificări neaplicate.
+Prin confirmarea salvării modificațiilor, metoda create_config_info_string reconstruiește conținutul fișierului mymodule.conf din valorile curente ale câmpurilor, iar lista conexiunilor permise este parcursă linie cu linie și salvată în formatul așteptat de daemon. Toate datele sunt transmise serverului prin funcția send_config_via_api, care construiește un obiect JSON cu câmpurile modificate și efectuează un POST la endpoin-ul /config/admin.
+Funcția de antrenare la nivel de echipament este disponibilă din această pagină. Logica aplicată este aceeași ca și în cazul global, cu distincția că operează exclusiv pe echipamentul curent. La activate, configurarea curentă este salvată și echipamentul este trecut în modul MONITORING, urmând ca la dezactivare, datele de topologie acumulate să fie integrate în lista de conexiuni permise iar modul de funcționare inițial să fie restaurat.
+Pagina topologiei rețelei – Topology
+ Clasa Topology oferă o reprezentare grafică a conexiunilor din rețeaua locală. Aceasta este construită pe baza datelor primite prin get_pc_info și get_topology. Fiecare participant la comunicație este reprezentat ca și un nod: echipamentele
+
+
+
+
+Aceasta va oferi flexibilitate în modificarea configurațiilor echipamentelor. Prin aceasta, administratorul rețelei poate altera atât modul de rulare, cat și regulile de acces a conexiunilor. De asemenea, aplicația oferă posibilitatea de vizualizare sub forma unui graf a dispozitivelor și a traficului de date a acestora.
+	TODO: Mai lungeste aici
+	Vorbeste si despre Imgui
+	Lungeste toate liburile folosite
+Această funcționalitate este creată cu ajutorul utilitarului open-source specializat vizualizărilor grafice  Graphviz [44], versiunea 2.43.0 (0), prin intermediul algoritmului „fdp” (Force-Directed Placement), destinat generării automate a grafurilor pe baza relațiilor dintre noduri. Conexiunile dintre echipamente sunt transformate într-un fișier temporar în format DOT, format standard utilizat de Graphviz pentru descrierea grafurilor. Ulterior, aplicația execută procesul de generare a pozițiilor nodurilor și citește coordonatele rezultate pentru afișarea topologiei în interfața grafică [Fragment de cod 3. Generare graf].
+
+
+
+
+Aplicația este compusă din patru componente logice distribuite pe trei medii de execuție distincte: componenta de filtrare și componenta de intermediere rulează la nivelul echipamentului ce va fi monitorizat, componenta centrală care funcționează ca server, iar componenta de administrare, care reprezintă interfața utilizată pentru configurarea și monitorizarea sistemului. Relația dintre aceste medii de execuție este descrisă de diagrama de componente [Imagine 1. Diagramă de componente].
+ 
+Imagine 1. Diagramă de componente
+
+Pentru a evidenția procesul de transmitere a datelor în cadrul aplicației, au fost realizate două diagrame secvențiale. Prima diagramă ilustrează traseul parcurs de informațiile asociate pachetelor interceptate de componenta de filtrare [Imagine 2. Diagramă secvențială - informații pachete]. 
+
+ 
+Imagine 2. Diagramă secvențială - informații pachete
+
+Cea de a  doua diagramă prezintă fluxul de actualizare și propagare a configurației echipamentelor [Imagine 3. Diagramă secvențială – configurații]. 
+
+
+
+
+Experiența utilizatorului
+
+Pentru asigurarea rulării corecte a aplicației, se recomandă utilizarea pe echipament a unei distribuții Linux (pentru testare s-a folosit Debian) cu versiunea de kernel 6.8.0-51.
+Pentru utilizarea aplicației pe dispozitivele vizate pentru monitorizare, sunt necesari patru pași:
+1.	Crearea fișierelor de configurare, proces realizat prin definirea fișierului de configurare și de definire a conexiunilor dorite. Pentru configurare, aplicația va căuta fișierul „mymodule.conf”, în locația „/etc/”. În acest fișier [Fragment de cod 4. mymodule.conf] va fi definită adresa de IP locală a serverului căruia i se vor trimite informațiile referitoare la pachete, portul pe care acesta va trebui să în folosească în comunicarea cu serverul, locația fișierului ce va fi utilizat în definirea conexiunilor permise și modul de funcționare a aplicației pe dispozitivul suport.
+# Pentru a comenta o linie, se poate folosi 
+# caracterul „#”
+
+# exemplu de adresă - 192.168.0.112
+server IP <adresa ip a serverului>
+
+# portul trebuie regăsit în valoare numerică
+server port <port>
+
+# se dorește locația globală a fișierului
+allowed file <locația fișierului de definiții>
+
+<mod>
+# Modul de rulare este procesat fără diferențiere între 
+# majuscule și minuscule.
+# se acceptă – listening, Listening, LISTENING, LIstEnInG
+Fragment de cod 4. mymodule.conf
+
+2.	Compilarea modulului kernel se realizează prin rularea comenzii  „make”. Această comandă utilizează fișierul de configurare Makefile [Fragment de cod 5. Makefile]:
+
+obj-m += kernel_module.o
+
+KDIR := /lib/modules/$(shell uname -r)/build
+PWD  := $(shell pwd)
+
+all:
+        $(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+        $(MAKE) -C $(KDIR) M=$(PWD) clean
+Fragment de cod 5. Makefile
+
+3.	Adăugarea modulului în spațiul kernel realizată prin rularea comenzii „sudo insmod kernel_module.ko”.
+4.	Rularea daemonului se face prin executarea binarului cu privilegii elevate: „sudo ./daemon”.
+Aplicația desktop va porni din fereastra principală [Error! Reference source not found.]. Aceasta oferă posibilitatea de a vizualiza dispozitivele ce au modulul kernel activ și care sunt în comunicare cu serverul.
+În partea de sus a interfeței grafice există un meniu de mutare între paginile aplicației. Primul buton face trimiterea către pagina principală, iar cel de al doilea buton, către pagina de vizualizare grafică a conexiunilor începute în rețeaua locală – inspecția Topologiei Rețelei. Acest meniu va rămâne prezent indiferent de pagina curentă a aplicației.
+În secțiunea principală a paginii se va regăsi o listă cu toate dispozitivele curente. Fiecare dispozitiv poate fi însoțit de o iconiță modificabilă reprezentativă componentei, un nume oferit acestuia, informații legat de ultima dată de comunicare cu acest dispozitiv, și modul curent de rulare a acestuia. Culoarea de fundal a fiecărui element este reprezentativă modului curent de rulare:
+1.	Roșu – REACTIVE
+2.	Verde – LISTENING
+3.	Albastru - MONITORING
+4.	Gri – DISABLED
+Partea inferioară a paginii este desemnată informării legat de evenimentele recent petrecute în rețea. Aceste evenimente reprezintă conexiuni ce au fost raportate de dispozitive, ce sunt afișate în ordine descrescătoare a datei de raportare.
+ 
+În această pagină exisă de asemenea opțiunea de antrenare automată (ce se activează prin apăsarea butonului „Train”). În urma activării, echipamentele din rețeaua locală sunt trecute în modul de funcționare MONITORING. În acest mod conexiunile raportate sunt adăugate automat în lista de conexiuni permise. Acest mod este util pentru stabilirea automată a relațiilor dintre dispozitive, permițând construirea progresivă a unei liste de conexiuni permise pe baza traficului observat în rețea. Această antrenare se dezactivează prin reapăsarea aceluiași buton.
+Selectând pictograma unui echipament, utilizatorul este direcționat către pagina privată a acestuia [Error! Reference source not found.], unde poate vizualiza și edita atât setările de configurare, cât și informațiile asociate. În prima secțiune se regăsesc informații generale: identificatorul unic al echipamentului generat de aplicație, data de la ultima comunicare cu acest echipament, numele și iconița oferită dispozitivului. În această secțiune pot fi modificate numele și iconița echipamentului. Mai jos se regăsesc informațiile de funcționare ale dispozitivului. Primul bloc afișează configurația fișierului „mymodule.conf”, care include adresa IP a componentei centrale, portul de comunicare, modul de execuție curent al echipamentului și locația fișierului cu adresele permise. În următorul bloc se regăsesc adresele conexiunilor permise, sub formă de listă editabilă.
+Pagina se încheie cu o secțiune asemănătoare paginii principale, având ca și conținut un scurt istoric al celor mai recente conexiuni, dar care este limitată la informații în conexiune cu echipamentul.
+ 
+În urma aplicării unor modificări, informația este salvată și aplicată prin apăsarea butonului „Update”.
+Pagina Topologiei rețelei [Error! Reference source not found.] permite vizualizarea grafică de ansamblu a conexiunilor din rețeaua locală. În această pagină, fiecare echipament este reprezentat printr-un nod distinct, iar legăturile dintre acestea ilustrează conexiunile active din rețea. Nodurile afișează fie adresa IP a dispozitivului (în cazul în care acesta nu este un echipament controlat), fie numele acestuia, oferind o imagine clară asupra structurii rețelei. Pagina include și un buton de resetare a vizualizării, util în situațiile în care reprezentarea devine aglomerată din cauza numărului mare de elemente.
+ 
+
