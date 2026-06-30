@@ -242,10 +242,17 @@ static bool add_log_if_necessary(struct packet_info *info) {
     return true;
 }
 
+static atomic64_t total_processing_time = ATOMIC64_INIT(0);
+static atomic64_t packets_processed = ATOMIC64_INIT(0);
+
 /**
  * Packet logging hook.
  */
 static unsigned int packet_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *hook_state) {
+
+    // Pentru testare
+    u64 start_ns = ktime_get_ns();
+
     const u8 local_state = READ_ONCE(state);
     struct ethhdr *eth;
     struct iphdr *ip;
@@ -361,6 +368,11 @@ static unsigned int packet_hook(void *priv, struct sk_buff *skb, const struct nf
     if (!added) {
         kfree(info);
     }
+
+    u64 elapsed = ktime_get_ns() - start_ns;
+    atomic64_inc(&packets_processed);
+    atomic64_add(elapsed, &total_processing_time);
+
     return NF_ACCEPT;
 }
 
@@ -536,6 +548,10 @@ static int __init mynetfilter_init(void) {
 }
 
 static void __exit mynetfilter_exit(void) {
+
+    u64 mean = atomic64_read(&total_processing_time) / atomic64_read(&packets_processed);
+    pr_info("mean: %llu\n", mean);
+
     struct rhashtable *tbl;
 
     misc_deregister(&mymodule_device);
